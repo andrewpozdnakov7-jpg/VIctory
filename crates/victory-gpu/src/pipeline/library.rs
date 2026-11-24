@@ -169,9 +169,10 @@ fn pipeline_in(
     }
     // SAFETY: a live pipeline; a name already stored (a description that
     // differs) is refused, which leaves the library as it was.
-    if unsafe { l.library.StorePipeline(PCWSTR(wide.as_ptr()), &pso) }.is_ok() {
-        l.added += 1;
+    if unsafe { l.library.StorePipeline(PCWSTR(wide.as_ptr()), &pso) }.is_err() {
+        return Ok(pso);
     }
+    l.added += 1;
     if kept.load(Ordering::Relaxed) == UNKNOWN {
         let again = load(&l.library, PCWSTR(wide.as_ptr()));
         kept.store(if again.is_ok() { YES } else { NO }, Ordering::Relaxed);
@@ -279,6 +280,8 @@ pub(crate) fn note_used(key: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows::Win32::Graphics::Direct3D::{Fxc::D3DCompile, ID3DBlob};
+    use windows::core::s;
 
     #[test]
     fn names_change_with_what_goes_into_the_pipeline() {
@@ -314,8 +317,6 @@ mod tests {
     fn in_flight_compile_does_not_store_a_rejected_kind() {
         use std::sync::Barrier;
         use windows::Win32::Foundation::E_INVALIDARG;
-        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
-        use windows::core::s;
 
         let Some(device) = crate::host::host().and_then(|h| h.device.cast::<ID3D12Device1>().ok())
         else {
@@ -323,42 +324,10 @@ mod tests {
         };
         let library = Mutex::new(open(&device, Vec::new()).expect("pipeline library"));
         let kept = AtomicU8::new(UNKNOWN);
-        let mut code = None;
-        let source = br#"[RootSignature("")] [numthreads(1,1,1)] void main() {}"#;
-        // SAFETY: a fixed valid HLSL source and a live output pointer.
-        unsafe {
-            D3DCompile(
-                source.as_ptr().cast(),
-                source.len(),
-                s!("library-test"),
-                None,
-                None,
-                s!("main"),
-                s!("cs_5_1"),
-                0,
-                0,
-                &mut code,
-                None,
-            )
-        }
-        .unwrap();
-        let code = code.unwrap();
-        // SAFETY: the compiler blob and root signature live through PSO creation.
-        let pso: ID3D12PipelineState = unsafe {
-            let bytes =
-                std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
-            let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes).unwrap();
-            device
-                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
-                    pRootSignature: std::mem::transmute_copy(&root),
-                    CS: D3D12_SHADER_BYTECODE {
-                        pShaderBytecode: bytes.as_ptr().cast(),
-                        BytecodeLength: bytes.len(),
-                    },
-                    ..Default::default()
-                })
-                .unwrap()
-        };
+        let shader = compute_shader(&device, 1);
+        let desc = compute_desc(&shader);
+        // SAFETY: the shader's blob and root signature live through the call.
+        let pso: ID3D12PipelineState = unsafe { device.CreateComputePipelineState(&desc) }.unwrap();
         let ready = Barrier::new(2);
         let resume = Barrier::new(2);
         let refuse = |_: &ID3D12PipelineLibrary1, _: PCWSTR| {
@@ -384,5 +353,88 @@ mod tests {
         });
         assert_eq!(kept.load(Ordering::Relaxed), NO);
         assert_eq!(library.lock().unwrap().added, 1);
+    }
+
+    #[test]
+    fn stale_name_does_not_disable_pipeline_caching() {
+        let Some(device) = crate::host::host().and_then(|h| h.device.cast::<ID3D12Device1>().ok())
+        else {
+            return; // no host GPU here
+        };
+        let old = compute_shader(&device, 1);
+        let current = compute_shader(&device, 2);
+        let old_desc = compute_desc(&old);
+        let desc = compute_desc(&current);
+        // SAFETY: the two shader descriptions point to live blobs and signatures.
+        let old_pso: ID3D12PipelineState =
+            unsafe { device.CreateComputePipelineState(&old_desc) }.unwrap();
+        let library = Mutex::new(open(&device, Vec::new()).expect("pipeline library"));
+        let kept = AtomicU8::new(UNKNOWN);
+        let name = HSTRING::from("stale");
+        let load = |library: &ID3D12PipelineLibrary1, name| {
+            // SAFETY: the name lives through the call, as do the code and root.
+            unsafe { library.LoadComputePipeline(name, &desc) }
+        };
+        // SAFETY: the name and PSO live through the call.
+        unsafe { library.lock().unwrap().library.StorePipeline(PCWSTR(name.as_ptr()), &old_pso) }
+            .unwrap();
+        assert!(load(&library.lock().unwrap().library, PCWSTR(name.as_ptr())).is_err());
+        // SAFETY: the current shader's blob and signature are live.
+        let make = || unsafe { device.CreateComputePipelineState(&desc) };
+        pipeline_in(Some(&library), &kept, "stale", "compute", load, make).unwrap();
+        assert_eq!(kept.load(Ordering::Relaxed), UNKNOWN);
+
+        pipeline_in(Some(&library), &kept, "new", "compute", load, make).unwrap();
+        assert_eq!(kept.load(Ordering::Relaxed), YES);
+        let library = library.lock().unwrap();
+        assert_eq!(library.added, 1);
+        let name = HSTRING::from("new");
+        assert!(load(&library.library, PCWSTR(name.as_ptr())).is_ok());
+    }
+
+    fn compute_shader(device: &ID3D12Device1, threads: u32) -> (ID3DBlob, ID3D12RootSignature) {
+        let source = format!(r#"[RootSignature("")] [numthreads({threads},1,1)] void main() {{}}"#);
+        let mut code = None;
+        // SAFETY: valid source and out pointer within this call.
+        unsafe {
+            D3DCompile(
+                source.as_ptr().cast(),
+                source.len(),
+                s!("library-test"),
+                None,
+                None,
+                s!("main"),
+                s!("cs_5_1"),
+                0,
+                0,
+                &mut code,
+                None,
+            )
+        }
+        .unwrap();
+        let code = code.unwrap();
+        // SAFETY: the bytes belong to the live compiler blob.
+        let root = unsafe {
+            let bytes =
+                std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
+            device.CreateRootSignature(0, bytes).unwrap()
+        };
+        (code, root)
+    }
+
+    /// The caller holds the blob and root for every use of the description.
+    fn compute_desc(shader: &(ID3DBlob, ID3D12RootSignature)) -> D3D12_COMPUTE_PIPELINE_STATE_DESC {
+        let (code, root) = shader;
+        // SAFETY: copy only the borrowed COM interface and the blob's metadata.
+        unsafe {
+            D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(root),
+                CS: D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: code.GetBufferPointer(),
+                    BytecodeLength: code.GetBufferSize(),
+                },
+                ..Default::default()
+            }
+        }
     }
 }
