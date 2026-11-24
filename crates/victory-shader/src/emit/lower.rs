@@ -7207,15 +7207,71 @@ impl<'a> Lower<'a> {
         })
     }
 
+    /// The two dwords of a binary64 source, with abs/neg applied to its sign bit.
+    fn class_src64(&mut self, inst: &Inst) -> Result<(V, V), Why> {
+        let Fields::Valu(v) = &inst.fields else {
+            unreachable!()
+        };
+        if v.sdwa.is_some() {
+            return Err("a binary64 compare with SDWA");
+        }
+        let op = *v.src.first().ok_or("a missing operand")?;
+        let (lo, mut hi) = match op {
+            Operand::Vector { reg, .. } => {
+                let next = inst.read(Reg::V(reg + 1)).ok_or("an unread operand")?;
+                (self.operand(inst, &op)?, self.i32_of(next)?)
+            }
+            Operand::Scalar { code, .. } if code != NULL => {
+                let next = inst.read(Reg::S(code + 1)).ok_or("an unread operand")?;
+                (self.operand(inst, &op)?, self.i32_of(next)?)
+            }
+            Operand::Const(code @ 240..=248) => {
+                const INLINE: [f64; 9] = [
+                    0.5,
+                    -0.5,
+                    1.0,
+                    -1.0,
+                    2.0,
+                    -2.0,
+                    4.0,
+                    -4.0,
+                    f64::from_bits(0x3fc4_5f30_6dc9_c882),
+                ];
+                let bits = INLINE[usize::from(code - 240)].to_bits();
+                (self.s.m.i32(bits as u32), self.s.m.i32((bits >> 32) as u32))
+            }
+            Operand::Literal(bits) => (self.s.m.i32(0), self.s.m.i32(bits)),
+            _ => {
+                let hi = if matches!(op, Operand::Const(193..=208)) {
+                    u32::MAX
+                } else {
+                    0
+                };
+                (self.operand(inst, &op)?, self.s.m.i32(hi))
+            }
+        };
+        if v.abs & 1 != 0 {
+            let magnitude = self.s.m.i32(0x7fff_ffff);
+            hi = self.s.m.bin(self.cur, Bin::And, hi, magnitude);
+        }
+        if v.neg & 1 != 0 {
+            let sign = self.s.m.i32(0x8000_0000);
+            hi = self.s.m.bin(self.cur, Bin::Xor, hi, sign);
+        }
+        Ok((lo, hi))
+    }
+
     fn compare(&mut self, inst: &Inst, rest: &str) -> Result<(), Why> {
         let (op, ty) = rest.rsplit_once('_').ok_or("a compare")?;
         let c = self.cur;
         let r = match ty {
-            "f32" | "f16" if op == "class" => {
+            "f64" | "f32" | "f16" if op == "class" => {
                 // Bit k of src1 tests class k: signalling NaN, quiet NaN,
                 // -inf, -normal, -denormal, -0, +0, +denormal, +normal, +inf.
-                let f16 = ty == "f16";
-                let x = if f16 {
+                let (x, lo) = if ty == "f64" {
+                    let (lo, hi) = self.class_src64(inst)?;
+                    (hi, Some(lo))
+                } else if ty == "f16" {
                     let Fields::Valu(v) = &inst.fields else {
                         unreachable!()
                     };
@@ -7228,17 +7284,17 @@ impl<'a> Lower<'a> {
                         let s = self.s.m.i32(0x8000);
                         h = self.s.m.bin(c, Bin::Xor, h, s);
                     }
-                    h
+                    (h, None)
                 } else {
                     let x = self.fsrc(inst, 0)?;
-                    self.as_int(x)
+                    (self.as_int(x), None)
                 };
                 let mask = self.src(inst, 1)?;
                 let k = |l: &mut Self, v: u32| l.s.m.i32(v);
-                let (exp_sh, sign_sh, exp_mask, mant_mask, quiet_bit) = if f16 {
-                    (10, 15, 0x1F, 0x03FF, 0x0200)
-                } else {
-                    (23, 31, 0xFF, 0x7F_FFFF, 0x40_0000)
+                let (exp_sh, sign_sh, exp_mask, mant_mask, quiet_bit) = match ty {
+                    "f64" => (20, 31, 0x7FF, 0xF_FFFF, 0x8_0000),
+                    "f16" => (10, 15, 0x1F, 0x03FF, 0x0200),
+                    _ => (23, 31, 0xFF, 0x7F_FFFF, 0x40_0000),
                 };
                 let (k_exp, k_sign, k_emax, mant, quiet) = (
                     k(self, exp_sh),
@@ -7249,7 +7305,10 @@ impl<'a> Lower<'a> {
                 );
                 let e = self.s.m.bin(c, Bin::LShr, x, k_exp);
                 let e = self.s.m.bin(c, Bin::And, e, k_emax);
-                let m = self.s.m.bin(c, Bin::And, x, mant);
+                let mut m = self.s.m.bin(c, Bin::And, x, mant);
+                if let Some(lo) = lo {
+                    m = self.s.m.bin(c, Bin::Or, m, lo);
+                }
                 let neg = self.s.m.bin(c, Bin::LShr, x, k_sign);
                 let zero = k(self, 0);
                 let (e0, emax) = (
