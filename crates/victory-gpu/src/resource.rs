@@ -1602,6 +1602,120 @@ mod tests {
         assert_eq!(t, u64::MAX, "no second subresource");
     }
 
+    /// An explicit 1D array RTV clears one mip of one layer of the 2D host copy.
+    #[cfg(windows)]
+    #[test]
+    fn one_d_array_rtv_clears_its_host_subresource() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let null = std::ptr::null();
+        let desc = ResourceDesc {
+            dimension: 2,
+            depth_or_array_size: 2,
+            flags: 1, // ALLOW_RENDER_TARGET
+            ..texture(8, 1, 28, 2)
+        };
+        let mut image = null;
+        assert_eq!(
+            create_committed(
+                null,
+                &PROPERTIES,
+                0,
+                &desc,
+                0x4,
+                null.cast(),
+                &RESOURCE_IIDS[0],
+                &mut image,
+            ),
+            S_OK
+        );
+        let host_image = host_resource(image).unwrap();
+        let mut view = [0u64; 16];
+        let handle = view.as_mut_ptr() as u64;
+        crate::descriptor::create_rtv(null, image, &[28, 3, 1, 1, 1, 0], handle);
+        let view = crate::descriptor::rtv_record(handle).unwrap().desc().unwrap();
+        // Do not hand an invalid baseline view to the GPU.
+        assert_eq!(view.ViewDimension, D3D12_RTV_DIMENSION_TEXTURE2DARRAY);
+        let fresh = host.rtv(host_image, Some(&view));
+
+        let list = host.new_list().unwrap();
+        let mut out = None;
+        let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+        let mut total = 0;
+        const SUBRESOURCE: u32 = 3; // layer 1, mip 1
+        // SAFETY: the resources, buffer footprint and RTV are live through submission.
+        unsafe {
+            let desc = host_image.GetDesc();
+            host.device.GetCopyableFootprints(
+                &desc,
+                SUBRESOURCE,
+                1,
+                0,
+                Some(&mut footprint),
+                None,
+                None,
+                Some(&mut total),
+            );
+            let heap = D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_READBACK,
+                ..Default::default()
+            };
+            let readback = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: total,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                SampleDesc: desc.SampleDesc,
+                ..Default::default()
+            };
+            host.device
+                .CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &readback,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    None,
+                    &mut out,
+                )
+                .unwrap();
+            list.list.ClearRenderTargetView(fresh, &[1.0, 0.5, 0.25, 1.0], None);
+        }
+        let out: ID3D12Resource = out.unwrap();
+        crate::list::ensure_state(&list, image, 0x800); // COPY_SOURCE
+        // SAFETY: the resources and command list remain live until the copy completes.
+        unsafe {
+            let from = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(host_image),
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    SubresourceIndex: SUBRESOURCE,
+                },
+            };
+            let to = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&out),
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    PlacedFootprint: footprint,
+                },
+            };
+            list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None);
+            list.close();
+            host.execute(&[&list]);
+            let mut data = std::ptr::null_mut();
+            out.Map(0, None, Some(&mut data)).unwrap();
+            assert_eq!(
+                std::slice::from_raw_parts(data.cast::<[u8; 4]>(), 4),
+                &[[255, 128, 64, 255]; 4],
+            );
+            out.Unmap(0, None);
+        }
+        crate::object::release(image);
+    }
+
     /// A 4x4 texture filled from a title buffer through our list and queue,
     /// then read back from the host GPU.
     #[cfg(windows)]

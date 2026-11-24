@@ -200,8 +200,34 @@ impl RtvRecord {
     pub(crate) fn desc(
         &self,
     ) -> Option<windows::Win32::Graphics::Direct3D12::D3D12_RENDER_TARGET_VIEW_DESC> {
-        const TEXTURE_2D: u32 = 4;
-        self.host_desc(TEXTURE_2D)
+        use windows::Win32::Graphics::Direct3D12::*;
+        let mut view: D3D12_RENDER_TARGET_VIEW_DESC =
+            self.host_desc(D3D12_RTV_DIMENSION_TEXTURE2D.0 as u32)?;
+        // The host represents a title 1D texture with a height-one 2D texture.
+        match view.ViewDimension {
+            D3D12_RTV_DIMENSION_TEXTURE1D => {
+                // SAFETY: the original view dimension names this union member.
+                let from = unsafe { view.Anonymous.Texture1D };
+                view.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+                view.Anonymous.Texture2D = D3D12_TEX2D_RTV {
+                    MipSlice: from.MipSlice,
+                    PlaneSlice: 0,
+                };
+            }
+            D3D12_RTV_DIMENSION_TEXTURE1DARRAY => {
+                // SAFETY: the original view dimension names this union member.
+                let from = unsafe { view.Anonymous.Texture1DArray };
+                view.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DARRAY;
+                view.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_RTV {
+                    MipSlice: from.MipSlice,
+                    FirstArraySlice: from.FirstArraySlice,
+                    ArraySize: from.ArraySize,
+                    PlaneSlice: 0,
+                };
+            }
+            _ => {}
+        }
+        Some(view)
     }
 
     /// The depth view description in the host's type (the same layout).
@@ -209,8 +235,16 @@ impl RtvRecord {
     pub(crate) fn depth_desc(
         &self,
     ) -> Option<windows::Win32::Graphics::Direct3D12::D3D12_DEPTH_STENCIL_VIEW_DESC> {
-        const TEXTURE_2D: u32 = 3;
-        self.host_desc(TEXTURE_2D)
+        use windows::Win32::Graphics::Direct3D12::*;
+        let mut view: D3D12_DEPTH_STENCIL_VIEW_DESC =
+            self.host_desc(D3D12_DSV_DIMENSION_TEXTURE2D.0 as u32)?;
+        // The corresponding 1D and 2D DSV union members share the layout.
+        view.ViewDimension = match view.ViewDimension {
+            D3D12_DSV_DIMENSION_TEXTURE1D => D3D12_DSV_DIMENSION_TEXTURE2D,
+            D3D12_DSV_DIMENSION_TEXTURE1DARRAY => D3D12_DSV_DIMENSION_TEXTURE2DARRAY,
+            other => other,
+        };
+        Some(view)
     }
 
     /// The description words as a host type, the format as the host has it.
@@ -670,6 +704,61 @@ static FUNCTIONS: Table<24> = {
 mod tests {
     use super::*;
     use crate::object::{S_OK, slot};
+
+    #[cfg(windows)]
+    #[test]
+    fn one_d_output_views_keep_their_subresources() {
+        use windows::Win32::Graphics::Direct3D12::*;
+
+        let one_d_rtv = RtvRecord {
+            tag: RTV_TAG,
+            described: 1,
+            resource: std::ptr::null(),
+            desc: [28, 2, 2, u32::MAX, 0, 0],
+        };
+        let rtv = one_d_rtv.desc().unwrap();
+        assert_eq!(rtv.ViewDimension, D3D12_RTV_DIMENSION_TEXTURE2D);
+        // SAFETY: the dimension assertion identifies the union member.
+        let rt = unsafe { rtv.Anonymous.Texture2D };
+        assert_eq!((rt.MipSlice, rt.PlaneSlice), (2, 0));
+
+        let array_rtv = RtvRecord {
+            desc: [28, 3, 2, 3, 4, u32::MAX],
+            ..one_d_rtv
+        }
+        .desc()
+        .unwrap();
+        assert_eq!(array_rtv.ViewDimension, D3D12_RTV_DIMENSION_TEXTURE2DARRAY);
+        // SAFETY: the dimension assertion identifies the union member.
+        let rt = unsafe { array_rtv.Anonymous.Texture2DArray };
+        assert_eq!(
+            (rt.MipSlice, rt.FirstArraySlice, rt.ArraySize, rt.PlaneSlice),
+            (2, 3, 4, 0),
+        );
+
+        let one_d_dsv = RtvRecord {
+            desc: [40, 1, 1, 2, 0, 0],
+            ..one_d_rtv
+        }
+        .depth_desc()
+        .unwrap();
+        assert_eq!(one_d_dsv.ViewDimension, D3D12_DSV_DIMENSION_TEXTURE2D);
+        assert_eq!(one_d_dsv.Flags, D3D12_DSV_FLAG_READ_ONLY_DEPTH);
+        // SAFETY: the dimension assertion identifies the union member.
+        let ds = unsafe { one_d_dsv.Anonymous.Texture2D };
+        assert_eq!(ds.MipSlice, 2);
+        let array_dsv = RtvRecord {
+            desc: [40, 2, 1, 2, 3, 4],
+            ..one_d_rtv
+        }
+        .depth_desc()
+        .unwrap();
+        assert_eq!(array_dsv.ViewDimension, D3D12_DSV_DIMENSION_TEXTURE2DARRAY);
+        assert_eq!(array_dsv.Flags, D3D12_DSV_FLAG_READ_ONLY_DEPTH);
+        // SAFETY: the dimension assertion identifies the union member.
+        let ds = unsafe { array_dsv.Anonymous.Texture2DArray };
+        assert_eq!((ds.MipSlice, ds.FirstArraySlice, ds.ArraySize), (2, 3, 4));
+    }
 
     /// What newer titles pass; tests use it throughout, so that reading the
     /// placement stays inside the value.
