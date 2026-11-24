@@ -3249,42 +3249,48 @@ impl<'a> Lower<'a> {
     /// f32 is the 24 bits of that stream from its leading 1, plus 1 when the
     /// 25th is set (never a tie: the stream doesn't end).
     fn norm_bits(&mut self, k: V, n: u32) -> V {
+        debug_assert!((1..=16).contains(&n));
         let c = self.cur;
-        let i64t = self.s.m.int(64);
-        self.s.flags |= flags::INT64;
-        // The stream: as many copies of `k` as fit in 64 bits, the first at
-        // the top.
-        let copies = 64 / n;
-        let repeat = (0..copies).fold(0u64, |r, j| r | 1 << (j * n)) << (64 - copies * n);
-        let wide = self.s.m.cast(c, Cast::ZExt, k, i64t);
-        let r = self.s.m.int_const(i64t, repeat as i64);
-        let stream = self.s.m.bin(c, Bin::Mul, wide, r);
-        // `k` as an f32 is exact (`k < 2^24`); its exponent field `e` is
-        // 126 + the bit length of `k`, which puts the result's at `e - n`.
-        let kf = self.s.m.cast(c, Cast::UiToFp, k, self.s.t.f32);
-        let kb = self.as_int(kf);
-        let k23 = self.s.m.i32(23);
-        let e = self.s.m.bin(c, Bin::LShr, kb, k23);
-        // The leading 1 to bit 63, then its 25 bits from the top.
-        let lead = self.s.m.i32(n + 126);
-        let sh = self.s.m.bin(c, Bin::Sub, lead, e);
-        let m63 = self.s.m.i32(63);
-        let sh = self.s.m.bin(c, Bin::And, sh, m63);
-        let sh = self.s.m.cast(c, Cast::ZExt, sh, i64t);
-        let top = self.s.m.bin(c, Bin::Shl, stream, sh);
-        let k39 = self.s.m.int_const(i64t, 39);
-        let t = self.s.m.bin(c, Bin::LShr, top, k39);
-        let t = self.s.m.cast(c, Cast::Trunc, t, self.s.t.i32);
-        // Rounded to 24 bits; their leading 1 (or the carry out of them) adds
-        // 1 to the exponent field below it.
         let one = self.s.m.i32(1);
-        let t = self.s.m.bin(c, Bin::Add, t, one);
-        let sig = self.s.m.bin(c, Bin::LShr, t, one);
+        let zero = self.s.m.i32(0);
+        let k23 = self.s.m.i32(23);
+
+        // The float exponent gives the leading bit of k exactly. Set bit 0
+        // for this query so the rotation shifts also stay in range for zero.
+        let nonzero = self.s.m.bin(c, Bin::Or, k, one);
+        let kf = self.s.m.cast(c, Cast::UiToFp, nonzero, self.s.t.f32);
+        let kb = self.as_int(kf);
+        let e = self.s.m.bin(c, Bin::LShr, kb, k23);
+        let lead = self.s.m.i32(n + 126);
+        let left = self.s.m.bin(c, Bin::Sub, lead, e);
+        let width = self.s.m.i32(n);
+        let right = self.s.m.bin(c, Bin::Sub, width, left);
+
+        // Rotate within one period so its leading 1 is at the top. Repeat
+        // that period only as far as the 25 bits used for rounding.
+        let mask = self.s.m.i32((1 << n) - 1);
+        let high = self.s.m.bin(c, Bin::Shl, k, left);
+        let high = self.s.m.bin(c, Bin::And, high, mask);
+        let low = self.s.m.bin(c, Bin::LShr, k, right);
+        let mut stream = self.s.m.bin(c, Bin::Or, high, low);
+        let mut bits = n;
+        while bits < 25 {
+            let append = bits.min(25 - bits);
+            let trim = self.s.m.i32(bits - append);
+            let prefix = self.s.m.bin(c, Bin::LShr, stream, trim);
+            let shift = self.s.m.i32(append);
+            stream = self.s.m.bin(c, Bin::Shl, stream, shift);
+            stream = self.s.m.bin(c, Bin::Or, stream, prefix);
+            bits += append;
+        }
+
+        let rounded = self.s.m.bin(c, Bin::Add, stream, one);
+        let sig = self.s.m.bin(c, Bin::LShr, rounded, one);
+        // Adding the leading bit (or a rounding carry) advances the exponent.
         let below = self.s.m.i32(n + 1);
         let ex = self.s.m.bin(c, Bin::Sub, e, below);
         let ex = self.s.m.bin(c, Bin::Shl, ex, k23);
         let bits = self.s.m.bin(c, Bin::Add, ex, sig);
-        let zero = self.s.m.i32(0);
         let is0 = self.s.m.cmp(c, pred::EQ, k, zero);
         self.s.m.select(c, is0, zero, bits)
     }

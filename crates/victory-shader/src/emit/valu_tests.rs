@@ -970,6 +970,15 @@ fn run_typed_loads(
     // The harness stores v0 to dword 0 last: keep the input there.
     body.push(vop1(0x001, 0, vgpr(1)));
     let shader = build_valu_cs(&body);
+    let container = crate::Container::parse(&shader.dxil).unwrap();
+    let features = container.part(crate::FourCC::SFI0).unwrap();
+    let flags = u64::from_le_bytes(features.data[..8].try_into().unwrap());
+    const INT64_SHADER_OPS: u64 = 0x8000;
+    assert_eq!(
+        flags & INT64_SHADER_OPS,
+        0,
+        "typed-load normalization requires Int64ShaderOps"
+    );
     let dwords = 4 * (formats.len() as u32 + 1);
     let mut ran = 0;
     for (label, warp) in [("hardware", false), ("warp", true)] {
