@@ -273,32 +273,6 @@ impl HostHeap {
         Some(self.count + first as u32)
     }
 
-    /// Recycles `n` dynamic slots in ring-buffer fashion when the dynamic pool
-    /// is otherwise exhausted, preventing draw/dispatch drops.
-    pub(crate) fn recycle_dynamic(&self, n: u32) -> Option<u32> {
-        if self.sampler || n == 0 || n > self.dynamic {
-            return None;
-        }
-        let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        let (next, taken) = &mut *guard;
-        let n = n as usize;
-        static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| {
-            tracing::warn!(
-                n,
-                dynamic = self.dynamic,
-                "dynamic descriptor pool exhausted: recycling slots in ring-buffer fashion"
-            );
-        });
-        let mut candidate = *next as usize;
-        if candidate + n > self.dynamic as usize {
-            candidate = 0;
-        }
-        taken[candidate..candidate + n].fill(true);
-        *next = ((candidate + n) % self.dynamic as usize) as u32;
-        Some(self.count + candidate as u32)
-    }
-
     /// The title slots this heap has host slots for; fewer than the title's
     /// when the host caps its size.
     pub(crate) fn count(&self) -> u32 {
@@ -1018,24 +992,6 @@ mod tests {
         heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
-    }
-
-    /// When dynamic slots are exhausted, recycling provides a ring-buffer fallback
-    /// instead of dropping the draw.
-    #[test]
-    fn dynamic_descriptor_recycling_survives_pool_exhaustion() {
-        let Some(heap) = HostHeap::new(false, 4) else {
-            return; // no host GPU
-        };
-        let full = heap.dynamic(heap.dynamic).unwrap();
-        assert_eq!(full, 4);
-        // Standard allocation fails because the pool is full.
-        assert_eq!(heap.dynamic(10), None);
-        // Recycling succeeds and wraps cleanly within dynamic bounds.
-        let recycled = heap.recycle_dynamic(10).unwrap();
-        assert_eq!(recycled, 4);
-        let recycled2 = heap.recycle_dynamic(10).unwrap();
-        assert_eq!(recycled2, 14);
     }
 
     /// Contiguous spans that cross the search cursor are found.
