@@ -1156,10 +1156,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             }
             const BUFFER: u32 = 1;
             if resource[0] != BUFFER {
-                // shortcut: unordered access to a texture the title placed
-                // itself is not mirrored; give it a resource as shader
-                // views of such textures get when a dispatch writes one.
-                once!(dimension = resource[0], "placed unordered texture view not mirrored");
+                once!(dimension = resource[0], unordered = *unordered, "placed texture view not mirrored");
                 return None;
             }
             // The resource description's width, after the alignment.
@@ -1180,19 +1177,23 @@ fn is_placed_texture(view: &View) -> bool {
     matches!(view, View::Placed(_, resource, _) if resource[0] != 1)
 }
 
-/// A shader view of a texture the title placed in memory itself, as a view
-/// of the resource made for that memory (on first use).
+/// Resolves a placed texture's SRV or UAV to the resource created at its address.
 pub(crate) fn placed_texture(view: &View) -> Option<View> {
     const BUFFER: u32 = 1;
-    let View::Placed(false, resource, desc) = view else {
+    let View::Placed(unordered, resource, desc) = view else {
         return None;
     };
     if resource[0] == BUFFER {
         return None;
     }
     let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
-    let texture = crate::resource::texture_at(address, resource)?;
-    Some(View::Shader(texture as usize, desc[..10].try_into().ok()))
+    let texture = crate::resource::texture_at(address, resource)? as usize;
+    let desc = desc[..10].try_into().ok();
+    Some(if *unordered {
+        View::Unordered(texture, 0, desc)
+    } else {
+        View::Shader(texture, desc)
+    })
 }
 
 /// A null view of the kind `view` is, for a slot whose view the host
