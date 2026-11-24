@@ -288,6 +288,15 @@ fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline>
     None
 }
 
+fn unsupported_wave_size(
+    required: Option<u32>,
+    limits: Option<(u32, u32)>,
+) -> Option<(u32, u32, u32)> {
+    let required = required?;
+    let (min, max) = limits?;
+    (!(min..=max).contains(&required)).then_some((required, min, max))
+}
+
 impl HostPipeline {
     /// A host pipeline for vertex and pixel shaders with the graphics
     /// state `g`, or for one compute shader.
@@ -419,14 +428,13 @@ impl HostPipeline {
         };
         if let Some(cs) = compute {
             let required_wave = cs.translated().and_then(|t| t.host.required_wave_size());
-            if let (Some(req), Some((_, max))) = (required_wave, host.wave_lanes)
-                && req > max
-            {
+            if let Some((req, min, max)) = unsupported_wave_size(required_wave, host.wave_lanes) {
                 tracing::warn!(
                     ?shaders,
                     required_wave = req,
+                    device_min = min,
                     device_max = max,
-                    "compute shader requires wave{req} but host GPU supports up to wave{max}: skipping pipeline creation"
+                    "compute shader requires wave{req} outside the host range {min}..={max}"
                 );
                 return None;
             }
@@ -566,6 +574,27 @@ impl HostPipeline {
             slots: g.slots(),
             inputs: g.elements(),
         })
+    }
+}
+
+#[cfg(test)]
+mod wave_size_tests {
+    use super::unsupported_wave_size;
+
+    #[test]
+    fn rejects_fixed_wave_sizes_outside_host_range() {
+        assert_eq!(
+            unsupported_wave_size(Some(64), Some((32, 32))),
+            Some((64, 32, 32))
+        );
+        assert_eq!(
+            unsupported_wave_size(Some(32), Some((64, 64))),
+            Some((32, 64, 64))
+        );
+        assert_eq!(unsupported_wave_size(Some(32), Some((32, 64))), None);
+        assert_eq!(unsupported_wave_size(Some(64), Some((32, 64))), None);
+        assert_eq!(unsupported_wave_size(None, Some((32, 32))), None);
+        assert_eq!(unsupported_wave_size(Some(64), None), None);
     }
 }
 
