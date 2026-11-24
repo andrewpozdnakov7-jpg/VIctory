@@ -5506,7 +5506,7 @@ impl<'a> Lower<'a> {
                 };
                 float(self, r)
             }
-            "v_movrels_b32" | "v_movreld_b32" | "v_movrelsd_b32" => {
+            "v_movrels_b32" | "v_movreld_b32" | "v_movrelsd_b32" | "v_movrelsd_2_b32" => {
                 // M0 indexes the source (movrels), the destination (movreld)
                 // or both, from the encoded register up to the program's
                 // VGPR count (the registers the instruction reads or writes).
@@ -5518,6 +5518,17 @@ impl<'a> Lower<'a> {
                 else {
                     return Err("an M0-relative move");
                 };
+                // The split move takes M0[9:0] for the source and
+                // M0[25:16] for the destination.
+                let (src_offset, dst_offset) = if name == "v_movrelsd_2_b32" {
+                    let mask = self.s.m.i32(0x3ff);
+                    let k16 = self.s.m.i32(16);
+                    let lo = self.s.m.bin(c, Bin::And, m0, mask);
+                    let hi = self.s.m.bin(c, Bin::LShr, m0, k16);
+                    (lo, self.s.m.bin(c, Bin::And, hi, mask))
+                } else {
+                    (m0, m0)
+                };
                 let indexed_src = name != "v_movreld_b32";
                 let value = if indexed_src {
                     let mut r = self.s.m.i32(0);
@@ -5527,7 +5538,7 @@ impl<'a> Lower<'a> {
                         };
                         let x = self.i32_of(x)?;
                         let kk = self.s.m.i32(u32::from(k));
-                        let is = self.s.m.cmp(c, pred::EQ, m0, kk);
+                        let is = self.s.m.cmp(c, pred::EQ, src_offset, kk);
                         r = self.s.m.select(c, is, x, r);
                     }
                     r
@@ -5546,7 +5557,7 @@ impl<'a> Lower<'a> {
                         None => self.s.m.i32(0),
                     };
                     let kk = self.s.m.i32(u32::from(k));
-                    let is = self.s.m.cmp(c, pred::EQ, m0, kk);
+                    let is = self.s.m.cmp(c, pred::EQ, dst_offset, kk);
                     let x = self.s.m.select(c, is, value, old);
                     self.write_placed(inst, Reg::V(dreg + k), x, guard);
                 }
