@@ -1065,7 +1065,7 @@ impl State {
             let (Some(host), Some(index)) = (heap.host(), heap.index(end)) else {
                 continue;
             };
-            if index >= host.count() {
+            if index >= host.count() || host.placed_buffer_binding_changed(index, end) {
                 fresh.push(u.slot);
             }
         }
@@ -1105,6 +1105,12 @@ impl State {
                     let at = table + u64::from(k) * 32;
                     // SAFETY: a descriptor slot in title memory.
                     unsafe { (at as *const [u32; 3]).read_unaligned() }.hash(&mut h);
+                    if let Some(copy) = crate::descriptor::view(at)
+                        .as_ref()
+                        .and_then(crate::descriptor::host::placed_buffer_copy)
+                    {
+                        copy.buffer.as_raw().hash(&mut h);
+                    }
                 }
                 (table, h.finish())
             };
