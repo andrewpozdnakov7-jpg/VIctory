@@ -126,13 +126,91 @@ pub(crate) fn drawn() -> u64 {
 /// The draws traced since the last present (diagnostics builds, with
 /// debug logging for this module): logged when the frame comes out black.
 #[cfg(feature = "diagnostics")]
-static FRAME: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+static FRAME: std::sync::Mutex<FrameTrace> = std::sync::Mutex::new(FrameTrace::new());
 
 /// The draws traced since the last call.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn take_frame() -> Vec<String> {
-    std::mem::take(&mut *FRAME.lock().unwrap_or_else(|e| e.into_inner()))
+    FRAME.lock().unwrap_or_else(|e| e.into_inner()).take()
 }
+
+/// How many of a frame's draws the black-frame trace keeps
+/// (`VICTORY_BLACK_FRAME_DRAWS`, default 256): the first half and the last
+/// half of them.
+#[cfg(feature = "diagnostics")]
+fn frame_limit() -> usize {
+    static LIMIT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        std::env::var("VICTORY_BLACK_FRAME_DRAWS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(256)
+            .max(2)
+    })
+}
+
+/// One frame's draws for the black-frame trace: the first `limit / 2` and
+/// the last `limit - limit / 2`, with a count of those left out between
+/// them. A world frame runs thousands of draws, and keeping only the first
+/// ones (as before) stopped in the geometry passes, before the lighting,
+/// composite and full-screen draws that end the frame and that a black
+/// picture is about.
+#[cfg(any(test, feature = "diagnostics"))]
+struct FrameTrace {
+    head: Vec<String>,
+    tail: std::collections::VecDeque<String>,
+    skipped: u64,
+}
+
+#[cfg(any(test, feature = "diagnostics"))]
+impl FrameTrace {
+    const fn new() -> Self {
+        Self { head: Vec::new(), tail: std::collections::VecDeque::new(), skipped: 0 }
+    }
+
+    fn push(&mut self, line: String, limit: usize) {
+        let head = limit.div_ceil(2);
+        let tail = limit - head;
+        if self.head.len() < head {
+            self.head.push(line);
+        } else if tail == 0 {
+            self.skipped += 1;
+        } else {
+            if self.tail.len() == tail {
+                self.tail.pop_front();
+                self.skipped += 1;
+            }
+            self.tail.push_back(line);
+        }
+    }
+
+    /// The draw pushed last, if it was kept.
+    fn last_mut(&mut self) -> Option<&mut String> {
+        if !self.tail.is_empty() {
+            self.tail.back_mut()
+        } else if self.skipped == 0 {
+            self.head.last_mut()
+        } else {
+            None
+        }
+    }
+
+    /// The kept draws in order, with a line for those left out, and a fresh
+    /// trace for the next frame.
+    fn take(&mut self) -> Vec<String> {
+        let mut out = std::mem::take(&mut self.head);
+        if self.skipped > 0 {
+            out.push(format!("... {} draws not kept here ({SKIP_HINT})", self.skipped));
+        }
+        out.extend(self.tail.drain(..));
+        self.skipped = 0;
+        out
+    }
+}
+
+/// Where a black frame's trace says how to keep more draws.
+#[cfg(any(test, feature = "diagnostics"))]
+const SKIP_HINT: &str = "VICTORY_BLACK_FRAME_DRAWS raises the limit";
 
 /// Draws, mesh dispatches and dispatches recorded but not run on the host
 /// (no host pipeline) since the last call.
@@ -1222,10 +1300,7 @@ impl State {
         if logged {
             tracing::debug!("draw {line}");
         }
-        let mut frame = FRAME.lock().unwrap_or_else(|e| e.into_inner());
-        if frame.len() < 256 {
-            frame.push(line);
-        }
+        FRAME.lock().unwrap_or_else(|e| e.into_inner()).push(line, frame_limit());
     }
 
     /// In a listed frame: each small buffer (64 bytes at most) the draw's
@@ -2491,5 +2566,55 @@ void main(uint3 id : SV_DispatchThreadID) {
         drop(found);
         slots.make_null(0);
         assert!(shown.upgrade().is_none(), "released with the slot");
+    }
+}
+
+#[cfg(test)]
+mod frame_trace_tests {
+    use super::{FrameTrace, SKIP_HINT};
+
+    fn lines(n: usize) -> impl Iterator<Item = String> {
+        (0..n).map(|i| format!("draw {i}"))
+    }
+
+    /// A frame within the limit is kept whole and in order.
+    #[test]
+    fn a_short_frame_is_kept_whole() {
+        let mut t = FrameTrace::new();
+        for l in lines(5) {
+            t.push(l, 8);
+        }
+        assert_eq!(t.take(), lines(5).collect::<Vec<_>>());
+    }
+
+    /// A long frame keeps its first and last draws, says how many were left
+    /// out between them, and starts empty after.
+    #[test]
+    fn a_long_frame_keeps_its_ends() {
+        let mut t = FrameTrace::new();
+        for l in lines(10) {
+            t.push(l, 4);
+        }
+        let skipped = format!("... 6 draws not kept here ({SKIP_HINT})");
+        assert_eq!(t.take(), ["draw 0", "draw 1", skipped.as_str(), "draw 8", "draw 9"]);
+        assert!(t.take().is_empty());
+    }
+
+    /// The draw pushed last is the one a drop is marked on, wherever it was
+    /// kept; one left out is not marked.
+    #[test]
+    fn the_last_draw_is_the_one_marked() {
+        let mut t = FrameTrace::new();
+        t.push("a".into(), 2);
+        t.last_mut().unwrap().push_str(" DROPPED");
+        t.push("b".into(), 2);
+        t.push("c".into(), 2);
+        t.last_mut().unwrap().push_str(" DROPPED");
+        let skipped = format!("... 1 draws not kept here ({SKIP_HINT})");
+        assert_eq!(t.take(), ["a DROPPED", skipped.as_str(), "c DROPPED"]);
+        let mut one = FrameTrace::new();
+        one.push("x".into(), 1);
+        one.push("y".into(), 1);
+        assert!(one.last_mut().is_none());
     }
 }
