@@ -261,6 +261,7 @@ impl State {
         self.fresh_tables.clear();
         self.table_failed = false;
         self.fixed = Fixed::default();
+        self.depth_bounds = None;
     }
 
     /// The title's topology; console-only ones become host lists (see
@@ -3052,6 +3053,7 @@ mod clear_state_tests {
             root_slots: root_slots.into(),
             root_run,
             memory: None,
+            depth_bounds: Some((0.125, 0.875)),
             fixed: Fixed {
                 viewports: Some(vec![D3D12_VIEWPORT {
                     Width: 2.0,
@@ -3086,6 +3088,7 @@ mod clear_state_tests {
         assert_eq!(state.depth, 0);
         assert_eq!(state.topology, 0);
         // A later host-list segment must not replay cleared state.
+        assert!(state.depth_bounds.is_none());
         assert!(!state.fixed.topology);
         assert!(state.fixed.viewports.is_none());
         assert!(state.fixed.scissors.is_none());

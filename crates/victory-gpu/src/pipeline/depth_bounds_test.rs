@@ -179,7 +179,7 @@ fn render_with_depth_bounds(host: &crate::host::Host, shader: Arc<Shader>, ps: O
     };
     let depth_desc = D3D12_RESOURCE_DESC {
         Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
-        Width: 4,
+        Width: 5,
         Height: 1,
         DepthOrArraySize: 1,
         MipLevels: 1,
@@ -219,7 +219,7 @@ fn render_with_depth_bounds(host: &crate::host::Host, shader: Arc<Shader>, ps: O
             slot::<extern "system" fn(This, u32)>(list, 0xa0)(list, 4); // triangle list
         }
         slot::<extern "system" fn(This, u32, *const D3D12_VIEWPORT)>(list, 0xa8)(
-            list, 1, &D3D12_VIEWPORT { Width: 4.0, Height: 1.0, MaxDepth: 1.0, ..Default::default() },
+            list, 1, &D3D12_VIEWPORT { Width: 5.0, Height: 1.0, MaxDepth: 1.0, ..Default::default() },
         );
     };
     let submit = || {
@@ -235,11 +235,15 @@ fn render_with_depth_bounds(host: &crate::host::Host, shader: Arc<Shader>, ps: O
     bounds(list, 0.5, 0.75);
     draw_pixel(2); // Includes the stored depth, excludes the triangle depth.
     bounds(list, 0.0, 0.25);
+    slot::<extern "system" fn(This, This)>(list, 0x58)(list, pso);
+    bind();
+    draw_pixel(3); // ClearState restores the default bounds on the same list.
+    bounds(list, 0.0, 0.25);
     submit();
 
     assert_eq!(slot::<extern "system" fn(This, This, This) -> HRESULT>(list, 0x50)(list, allocator, null), S_OK);
     bind();
-    draw_pixel(3); // Reset restores the default bounds.
+    draw_pixel(4); // Reset restores the default bounds.
     let mut from = D3D12_TEXTURE_COPY_LOCATION {
         Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
         ..Default::default()
@@ -269,15 +273,15 @@ fn render_with_depth_bounds(host: &crate::host::Host, shader: Arc<Shader>, ps: O
     }
     submit();
     let mut mapped = std::ptr::null_mut();
-    // SAFETY: the GPU copy finished and the readback buffer holds at least four floats.
+    // SAFETY: the GPU copy finished and the readback buffer holds at least five floats.
     let actual = unsafe {
-        readback.Map(0, Some(&D3D12_RANGE { Begin: 0, End: 16 }), Some(&mut mapped)).unwrap();
-        let values = mapped.cast::<[f32; 4]>().read();
+        readback.Map(0, Some(&D3D12_RANGE { Begin: 0, End: 20 }), Some(&mut mapped)).unwrap();
+        let values = mapped.cast::<[f32; 5]>().read();
         readback.Unmap(0, Some(&D3D12_RANGE::default()));
         values
     };
-    eprintln!("depth readback (fresh, excluded, included, reset): {actual:?}");
-    assert_eq!(actual, [0.25, if supported { 0.5 } else { 0.25 }, 0.25, 0.25]);
+    eprintln!("depth readback (fresh, excluded, included, cleared, reset): {actual:?}");
+    assert_eq!(actual, [0.25, if supported { 0.5 } else { 0.25 }, 0.25, 0.25, 0.25]);
 
     for object in [list, allocator, pso] {
         assert_eq!(slot::<extern "system" fn(This) -> u32>(object, 0x10)(object), 0);
