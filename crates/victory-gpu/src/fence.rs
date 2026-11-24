@@ -99,9 +99,8 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
 pub(crate) extern "system" fn signal(this: This, value: u64) -> HRESULT {
     let fence = fence(this);
     let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
-    // A fence's value only grows: a lower signal leaves it where it was, so
-    // waiters for values it already passed stay gone.
-    let value = fence.value.fetch_max(value, Ordering::AcqRel).max(value);
+    // New waits check the latest signal value, including after a rewind.
+    fence.value.store(value, Ordering::Release);
     waiters.retain(|&(wanted, event)| {
         let reached = wanted <= value;
         if reached {
@@ -173,22 +172,14 @@ mod tests {
         assert_eq!(slot::<extern "system" fn(This) -> u32>(f, 0x10)(f), 0);
     }
 
-    /// A fence's value only grows; a lower signal changes nothing.
     #[test]
-    fn values_only_grow() {
+    fn signal_can_rewind_the_fence_value() {
         let mut f = std::ptr::null();
         assert_eq!(create(std::ptr::null(), 3, 0, &FENCE_IIDS[0], &mut f), S_OK);
         assert_eq!(signal(f, 5), S_OK);
         assert_eq!(completed(f), 5);
         assert_eq!(signal(f, 2), S_OK);
-        assert_eq!(completed(f), 5, "a lower signal is ignored");
-        // 4 was reached before the lower signal, so waiting for it returns
-        // at once, even with no event to set.
-        assert_eq!(set_event_on_completion(f, 4, std::ptr::null_mut()), S_OK);
-        assert_eq!(
-            set_event_on_completion(f, 6, std::ptr::null_mut()),
-            E_NOTIMPL
-        );
+        assert_eq!(completed(f), 2);
         assert_eq!(release(f), 0);
     }
 
@@ -304,6 +295,11 @@ mod tests {
         assert!(signalled(high), "the waiter for 4");
         // A value that was reached before the wait fires at once.
         assert_eq!(set_event_on_completion(f, 3, low), S_OK);
+        assert!(signalled(low));
+        assert_eq!(signal(f, 1), S_OK);
+        assert_eq!(set_event_on_completion(f, 3, low), S_OK);
+        assert!(!signalled(low), "a new wait checks the rewound value");
+        assert_eq!(signal(f, 3), S_OK);
         assert!(signalled(low));
         // Nothing is left waiting: a later signal sets nothing.
         assert_eq!(signal(f, 9), S_OK);
