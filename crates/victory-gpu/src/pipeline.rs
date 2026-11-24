@@ -23,6 +23,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, PIPELINE, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
 
+#[cfg(all(test, windows, feature = "diagnostics"))]
+mod placed_buffer_tests;
+
 const PIPELINE_IIDS: [Iid; 4] = [
     guid(
         0x765a30f3,

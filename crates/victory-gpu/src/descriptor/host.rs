@@ -378,6 +378,23 @@ impl HostHeap {
         Some(view)
     }
 
+    /// A placed buffer can acquire a registered copy after its descriptor
+    /// was mirrored. Use a fresh table for the new copy so lists already
+    /// using the original slot keep their binding.
+    pub(crate) fn placed_buffer_binding_changed(&self, index: u32, handle: u64) -> bool {
+        let Some(view @ View::Placed(..)) = super::view(handle) else {
+            return false;
+        };
+        if self.made.lock().unwrap_or_else(|e| e.into_inner())[index as usize] == 0 {
+            return false;
+        }
+        let Some(shadow) = placed_buffer_shadow(&view) else {
+            return false;
+        };
+        let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+        kept[index as usize].as_ref() != Some(&shadow.buffer)
+    }
+
     /// The view host slot `index` was made from, in a few words, with the
     /// title and host addresses of a buffer view (diagnostics). "null" for
     /// a slot never made or left null.
@@ -491,6 +508,19 @@ fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
         base + buffer.FirstElement * element,
         u64::from(buffer.NumElements) * element,
     ))
+}
+
+/// The copy a placed buffer view uses for its full declared range.
+pub(crate) fn placed_buffer_shadow(view: &View) -> Option<std::sync::Arc<crate::shadow::Shadow>> {
+    let View::Placed(_, resource, desc) = view else {
+        return None;
+    };
+    if resource[0] != D3D12_RESOURCE_DIMENSION_BUFFER.0 as u32 {
+        return None;
+    }
+    let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+    let len = u64::from(resource[4]) | u64::from(resource[5]) << 32;
+    crate::shadow::find(address, len)
 }
 
 /// The host resource a slot made by [`make`] views, if any.
