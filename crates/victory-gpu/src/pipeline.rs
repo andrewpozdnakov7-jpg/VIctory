@@ -856,3 +856,6 @@ mod tests {
         assert_ne!(unsafe { Prebuild::graphics(&stream) }.key(), title.host.key);
     }
 }
+
+#[cfg(all(test, windows, feature = "diagnostics"))]
+mod placed_buffer_tests;

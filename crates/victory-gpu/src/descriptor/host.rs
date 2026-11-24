@@ -638,6 +638,21 @@ impl HostHeap {
         Some(view)
     }
 
+    /// A placed buffer can acquire a registered copy after the title's
+    /// descriptor was mirrored. Keep the old slot bound for earlier draws.
+    pub(crate) fn placed_buffer_binding_changed(&self, index: u32, handle: u64) -> bool {
+        let Some(view @ View::Placed(_, [1, ..], _)) = super::view(handle) else {
+            return false;
+        };
+        let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+        let Some((buffer, _)) = &kept[index as usize] else {
+            return false;
+        };
+        let buffer = buffer.clone();
+        drop(kept);
+        placed_buffer_copy(&view).is_some_and(|copy| copy.buffer != buffer)
+    }
+
     /// The view host slot `index` was made from, in a few words, with the
     /// title and host addresses of a buffer view (diagnostics). "null" for
     /// a slot never made or left null.
@@ -799,6 +814,14 @@ pub(crate) fn view_copy(view: &View) -> Option<(std::sync::Arc<crate::shadow::Sh
     let (address, len) = buffer_range(view)?;
     let (shadow, _) = crate::shadow::for_view(address, len, u64::from(view_stride(view)))?;
     Some((shadow, address, len))
+}
+
+/// The copy a placed buffer view would use if mirrored now.
+pub(crate) fn placed_buffer_copy(view: &View) -> Option<std::sync::Arc<crate::shadow::Shadow>> {
+    if !matches!(view, View::Placed(_, resource, _) if resource[0] == 1) {
+        return None;
+    }
+    view_copy(view).map(|(copy, _, _)| copy)
 }
 
 /// [`buffer_range`] of an unordered access view of memory at `base`.
