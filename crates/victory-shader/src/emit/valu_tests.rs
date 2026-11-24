@@ -983,6 +983,92 @@ fn v_cvt_f16_u16_and_i16_widen_the_integer_first() {
 }
 
 #[test]
+fn v_ldexp_f32_matches_rdna2() {
+    let vop3_ldexp = |abs: u8, neg: u8, clamp: bool, omod: u8| -> [u32; 2] {
+        [
+            0x35 << 26 | 0x362 << 16 | u32::from(clamp) << 15 | u32::from(abs & 7) << 8,
+            u32::from(neg & 7) << 29
+                | u32::from(omod & 3) << 27
+                | (vgpr(2) as u32) << 9
+                | vgpr(1) as u32,
+        ]
+    };
+    let ldexp = build_valu_cs(&vop3_ldexp(0, 0, false, 0));
+    let cases: &[([u32; 4], u32)] = &[
+        ([1.5f32.to_bits(), 0, 0, 0], 1.5f32.to_bits()),
+        ([1.5f32.to_bits(), 3, 0, 0], 12.0f32.to_bits()),
+        (
+            [(-1.5f32).to_bits(), (-2i32) as u32, 0, 0],
+            (-0.375f32).to_bits(),
+        ),
+        // Large scale spans that would overflow/underflow naive a * exp2(n):
+        ([0x0080_0000, 253, 0, 0], 0x7F00_0000), // 2^-126 * 2^253 = 2^127
+        ([0x7F00_0000, (-253i32) as u32, 0, 0], 0x0080_0000), // 2^127 * 2^-253 = 2^-126
+        // Overflow to signed infinity (including extreme i32::MAX exponent):
+        ([1.0f32.to_bits(), 128, 0, 0], f32::INFINITY.to_bits()),
+        (
+            [(-1.0f32).to_bits(), i32::MAX as u32, 0, 0],
+            f32::NEG_INFINITY.to_bits(),
+        ),
+        // Underflow to signed zero (FTZ, including i32::MIN exponent):
+        ([1.0f32.to_bits(), (-127i32) as u32, 0, 0], 0x0000_0000),
+        ([(-1.0f32).to_bits(), i32::MIN as u32, 0, 0], 0x8000_0000),
+        // Signed zeros and infinities stay unchanged regardless of exponent:
+        ([0x0000_0000, 1000, 0, 0], 0x0000_0000),
+        ([0x8000_0000, 1000, 0, 0], 0x8000_0000),
+        (
+            [f32::INFINITY.to_bits(), i32::MIN as u32, 0, 0],
+            f32::INFINITY.to_bits(),
+        ),
+        (
+            [f32::NEG_INFINITY.to_bits(), (-1000i32) as u32, 0, 0],
+            f32::NEG_INFINITY.to_bits(),
+        ),
+    ];
+    let inputs: Vec<[u32; 4]> = cases.iter().map(|c| c.0).collect();
+    run_cases(&ldexp, &inputs, |backend, i, inp, got| {
+        let want = cases[i].1;
+        assert_eq!(
+            got, want,
+            "{backend}: v_ldexp_f32({:#010x}, {}) = {got:#010x}, want {want:#010x}",
+            inp[0], inp[1] as i32,
+        );
+    });
+
+    // NaN propagates as qNaN.
+    run_cases(
+        &ldexp,
+        &[[0x7F80_0001, 5, 0, 0], [0x7FC0_0000, 0, 0, 0]],
+        |backend, _, inp, got| {
+            assert!(
+                f32::from_bits(got).is_nan() && got & 0x0040_0000 != 0,
+                "{backend}: v_ldexp_f32({:#010x}, {}) = {got:#010x}, want qNaN",
+                inp[0],
+                inp[1] as i32,
+            );
+        },
+    );
+
+    // Source abs/neg and output omod/clamp modifiers.
+    let ldexp_mods = build_valu_cs(&vop3_ldexp(0b01, 0, true, 1)); // clamp(|src0| * 2^src1 * 2.0)
+    run_cases(
+        &ldexp_mods,
+        &[
+            [(-0.25f32).to_bits(), 0, 0, 0], // |-0.25| * 1 * 2 = 0.5
+            [(-0.75f32).to_bits(), 1, 0, 0], // |-0.75| * 2 * 2 = 3.0 -> clamp 1.0
+        ],
+        |backend, i, inp, got| {
+            let want = [0.5f32.to_bits(), 1.0f32.to_bits()][i];
+            assert_eq!(
+                got, want,
+                "{backend}: v_ldexp_f32(|{:#010x}|, {}) mul:2 clamp = {got:#010x}, want {want:#010x}",
+                inp[0], inp[1] as i32,
+            );
+        },
+    );
+}
+
+#[test]
 fn v_sin_and_v_cos_f16_reduce_large_turns() {
     let sin_shader = build_valu_cs(&[vop1(0x060, 0, vgpr(1))]);
     let cos_shader = build_valu_cs(&[vop1(0x061, 0, vgpr(1))]);

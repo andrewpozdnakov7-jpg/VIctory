@@ -5742,6 +5742,50 @@ impl<'a> Lower<'a> {
                 };
                 float(self, r)
             }
+            "v_ldexp_f32" => {
+                // a * 2^n on IEEE-754 f32 (flushing f32 subnormals to signed
+                // zero, matching RDNA2/D3D12 FTZ), without overflowing i32
+                // or requiring INT64.
+                let (a, n) = (f(self, 0)?, s(self, 1)?);
+                let bits = self.as_int(a);
+                let k = |l: &mut Self, x: u32| l.s.m.i32(x);
+                let (sign_mask, exp_mask, mant_mask, qbit) = (
+                    k(self, 0x8000_0000),
+                    k(self, 0xFF),
+                    k(self, 0x007F_FFFF),
+                    k(self, 0x0040_0000),
+                );
+                let (k0, k23, k255, inf_exp) =
+                    (k(self, 0), k(self, 23), k(self, 255), k(self, 0x7F80_0000));
+                let sign = self.s.m.bin(c, Bin::And, bits, sign_mask);
+                let exp = self.s.m.bin(c, Bin::LShr, bits, k23);
+                let exp = self.s.m.bin(c, Bin::And, exp, exp_mask);
+                let mant = self.s.m.bin(c, Bin::And, bits, mant_mask);
+                // Clamp signed exponent to [-512, 512] so exp + n never overflows i32.
+                let (lo_n, hi_n) = (k(self, (-512i32) as u32), k(self, 512));
+                let too_lo = self.s.m.cmp(c, pred::SLT, n, lo_n);
+                let n = self.s.m.select(c, too_lo, lo_n, n);
+                let too_hi = self.s.m.cmp(c, pred::SGT, n, hi_n);
+                let n = self.s.m.select(c, too_hi, hi_n, n);
+                let new_exp = self.s.m.bin(c, Bin::Add, exp, n);
+                let shifted = self.s.m.bin(c, Bin::Shl, new_exp, k23);
+                let normal = self.s.m.bin(c, Bin::Or, sign, shifted);
+                let normal = self.s.m.bin(c, Bin::Or, normal, mant);
+                let under = self.s.m.cmp(c, pred::SLE, new_exp, k0);
+                let r = self.s.m.select(c, under, sign, normal);
+                let over = self.s.m.cmp(c, pred::SGE, new_exp, k255);
+                let signed_inf = self.s.m.bin(c, Bin::Or, sign, inf_exp);
+                let r = self.s.m.select(c, over, signed_inf, r);
+                let is_zero = self.s.m.cmp(c, pred::EQ, exp, k0);
+                let r = self.s.m.select(c, is_zero, sign, r);
+                let is_special = self.s.m.cmp(c, pred::EQ, exp, k255);
+                let is_inf = self.s.m.cmp(c, pred::EQ, mant, k0);
+                let qnan = self.s.m.bin(c, Bin::Or, bits, qbit);
+                let special = self.s.m.select(c, is_inf, bits, qnan);
+                let r = self.s.m.select(c, is_special, special, r);
+                let r = self.as_float(r);
+                float(self, r)
+            }
             "v_cvt_i32_f32" | "v_cvt_u32_f32" | "v_cvt_flr_i32_f32" | "v_cvt_rpi_i32_f32" => {
                 let mut a = f(self, 0)?;
                 let floor = name != "v_cvt_i32_f32" && name != "v_cvt_u32_f32";
