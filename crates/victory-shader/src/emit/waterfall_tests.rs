@@ -16,6 +16,15 @@ use crate::{io, ir, resource, structure};
 /// s0 (textures, or with `buffers` structured buffers of dwords, at entries
 /// 0 and 1, a raw UAV at entry 2) and the table of samplers at s1.
 fn build(words: &[u32], buffers: bool) -> HostShader {
+    build_table_shader(words, buffers, 32, 1)
+}
+
+fn build_table_shader(
+    words: &[u32],
+    buffers: bool,
+    threads: u32,
+    nonuniform_handles: u32,
+) -> HostShader {
     let table = |user_data: u8| RootParam {
         root: RootType::Table,
         table_offset_dwords: 0,
@@ -51,7 +60,7 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
         ],
         io: StageIo::Cs(ComputeIo {
             rsrc2: 2 << 1,
-            threads: [32, 1, 1],
+            threads: [threads, 1, 1],
         }),
         code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
     };
@@ -71,8 +80,7 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
         mesh_stride: 0,
     })
     .expect("lower");
-    // One access with each lane's own heap index, no wave operation.
-    assert_eq!(lowered.nonuniform_handles, 1);
+    assert_eq!(lowered.nonuniform_handles, nonuniform_handles);
     assert!(!lowered.wave_ops);
     let shader = HostShader {
         stage: HwStage::Cs,
@@ -96,8 +104,16 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
 /// hardware GPU and on WARP (each skipped without a device) and returns,
 /// per one that ran, the UAV's 32 dwords.
 fn run(shader: &HostShader, views: &[View]) -> Vec<(&'static str, Vec<u32>)> {
+    run_with_filter(shader, views, D3D12_FILTER_MIN_MAG_MIP_POINT)
+}
+
+fn run_with_filter(
+    shader: &HostShader,
+    views: &[View],
+    filter: D3D12_FILTER,
+) -> Vec<(&'static str, Vec<u32>)> {
     let samplers = [D3D12_SAMPLER_DESC {
-        Filter: D3D12_FILTER_MIN_MAG_MIP_POINT,
+        Filter: filter,
         AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
         AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
         AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
@@ -142,6 +158,63 @@ fn run(shader: &HostShader, views: &[View]) -> Vec<(&'static str, Vec<u32>)> {
         out.push((label, words[0].clone()));
     }
     out
+}
+
+#[test]
+fn sample_gradients_pack_independently_of_coordinates() {
+    let texels = [1.0, 3.0, 5.0, 7.0].map(|r| [r, 0.0, 0.0, 1.0]);
+    let views = [
+        View::Texture(2, 2, &texels),
+        View::Texture(2, 2, &texels), // UAV is the third heap entry.
+        View::RawUav(2),
+    ];
+    for (a16, g16) in [(false, false), (true, false), (false, true), (true, true)] {
+        let mut words = vec![
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xBE86_0301, // s_mov_b32 s6, s1
+            0xBE87_0380, // s_mov_b32 s7, 0
+            0xF40C_0202,
+            0xFA00_0000, // s_load_dwordx8 s[8:15], s[4:5], 0
+            0xF408_0403,
+            0xFA00_0000, // s_load_dwordx4 s[16:19], s[6:7], 0
+            0xF408_0502,
+            0xFA00_0040, // s_load_dwordx4 s[20:23], s[4:5], 64
+        ];
+        for (gradient, byte_offset) in [(0.0f32, 0), (1.0, 4)] {
+            let mut address = if g16 {
+                let half_one = if gradient == 0.0 { 0 } else { 0x3C00 };
+                vec![half_one, half_one << 16] // (dx.u, dx.v), (dy.u, dy.v)
+            } else {
+                vec![gradient.to_bits(), 0, 0, gradient.to_bits()]
+            };
+            if a16 {
+                address.push(0x3900_3900); // (u, v) = (0.625, 0.625) in half precision.
+            } else {
+                address.extend([0.625f32.to_bits(); 2]);
+            }
+            for (i, value) in address.into_iter().enumerate() {
+                words.extend([0x7E00_02FF | ((i as u32 + 2) << 17), value]); // v_mov_b32
+            }
+            words.extend([
+                0xF088_0108 | u32::from(g16), // image_sample_d[_g16], 2D, dmask:1
+                0x0082_0C02 | (u32::from(a16) << 30), // v12, v2..., s[8:15], s[16:19]
+                0xE070_0000 | byte_offset,
+                0x8005_0C00, // buffer_store_dword v12, off, s[20:23], 0
+            ]);
+        }
+        words.push(0xBF81_0000); // s_endpgm
+        let shader = build_table_shader(&words, false, 1, 0);
+        for (label, got) in
+            run_with_filter(&shader, &views, D3D12_FILTER_MIN_POINT_MAG_LINEAR_MIP_POINT)
+        {
+            assert_eq!(
+                got,
+                [5.5f32.to_bits(), 7.0f32.to_bits()],
+                "{label}, a16={a16}, g16={g16}"
+            );
+        }
+    }
 }
 
 /// The red channel each lane sampled from two 1x1 textures, red 1.0 at
