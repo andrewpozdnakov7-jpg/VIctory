@@ -138,9 +138,19 @@ pub(crate) fn pipeline(
     load: impl Fn(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
     create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
 ) -> windows::core::Result<ID3D12PipelineState> {
+    pipeline_in(library(), &KEPT[kind_index(kind)], name, kind, load, create)
+}
+
+fn pipeline_in(
+    library: Option<&Mutex<Library>>,
+    kept: &AtomicU8,
+    name: &str,
+    kind: &str,
+    load: impl Fn(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
+    create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
+) -> windows::core::Result<ID3D12PipelineState> {
     let wide = HSTRING::from(name);
-    let kept = &KEPT[kind_index(kind)];
-    let library = library().filter(|_| kept.load(Ordering::Relaxed) != NO);
+    let library = library.filter(|_| kept.load(Ordering::Relaxed) != NO);
     let Some(library) = library else {
         MADE.fetch_add(1, Ordering::Relaxed);
         return create();
@@ -153,6 +163,10 @@ pub(crate) fn pipeline(
     let pso = create()?;
     MADE.fetch_add(1, Ordering::Relaxed);
     let mut l = library.lock().unwrap_or_else(|e| e.into_inner());
+    // A different worker can disable this kind while we compile.
+    if kept.load(Ordering::Relaxed) == NO {
+        return Ok(pso);
+    }
     // SAFETY: a live pipeline; a name already stored (a description that
     // differs) is refused, which leaves the library as it was.
     if unsafe { l.library.StorePipeline(PCWSTR(wide.as_ptr()), &pso) }.is_ok() {
@@ -294,5 +308,81 @@ mod tests {
         // SAFETY: a plain query on a live library.
         assert!(unsafe { library.library.GetSerializedSize() } > 0);
         assert!(library._blob.is_empty());
+    }
+
+    #[test]
+    fn in_flight_compile_does_not_store_a_rejected_kind() {
+        use std::sync::Barrier;
+        use windows::Win32::Foundation::E_INVALIDARG;
+        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+        use windows::core::s;
+
+        let Some(device) = crate::host::host().and_then(|h| h.device.cast::<ID3D12Device1>().ok())
+        else {
+            return; // no host GPU here
+        };
+        let library = Mutex::new(open(&device, Vec::new()).expect("pipeline library"));
+        let kept = AtomicU8::new(UNKNOWN);
+        let mut code = None;
+        let source = br#"[RootSignature("")] [numthreads(1,1,1)] void main() {}"#;
+        // SAFETY: a fixed valid HLSL source and a live output pointer.
+        unsafe {
+            D3DCompile(
+                source.as_ptr().cast(),
+                source.len(),
+                s!("library-test"),
+                None,
+                None,
+                s!("main"),
+                s!("cs_5_1"),
+                0,
+                0,
+                &mut code,
+                None,
+            )
+        }
+        .unwrap();
+        let code = code.unwrap();
+        // SAFETY: the compiler blob and root signature live through PSO creation.
+        let pso: ID3D12PipelineState = unsafe {
+            let bytes =
+                std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
+            let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes).unwrap();
+            device
+                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: bytes.as_ptr().cast(),
+                        BytecodeLength: bytes.len(),
+                    },
+                    ..Default::default()
+                })
+                .unwrap()
+        };
+        let ready = Barrier::new(2);
+        let resume = Barrier::new(2);
+        let refuse = |_: &ID3D12PipelineLibrary1, _: PCWSTR| {
+            Err(windows::core::Error::from_hresult(E_INVALIDARG))
+        };
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                pipeline_in(Some(&library), &kept, "second", "mesh", refuse, || {
+                    ready.wait();
+                    resume.wait();
+                    Ok(pso.clone())
+                })
+                .unwrap();
+            });
+            ready.wait();
+            // This worker gets a successful store and a refused load while
+            // the other one is still compiling outside the library lock.
+            let stored = pipeline_in(Some(&library), &kept, "first", "mesh", refuse, || {
+                Ok(pso.clone())
+            });
+            resume.wait();
+            stored.unwrap();
+        });
+        assert_eq!(kept.load(Ordering::Relaxed), NO);
+        assert_eq!(library.lock().unwrap().added, 1);
     }
 }
