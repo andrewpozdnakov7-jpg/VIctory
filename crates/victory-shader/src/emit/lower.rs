@@ -5935,6 +5935,40 @@ impl<'a> Lower<'a> {
                     .op(c, "legacyF16ToF32", Attr::ReadNone, self.s.t.f32, 131, &[a]);
                 float(self, r)
             }
+            "v_sat_pk_u8_i16" => {
+                // Each signed i16 half of src0 saturates to an unsigned
+                // byte, packed into the destination's low 16 bits; the
+                // register's high half is kept (the GFX10 partial write,
+                // as v_cvt_f16_f32).
+                if v.opsel != 0 {
+                    return Err("op_sel on v_sat_pk_u8_i16");
+                }
+                let a = s(self, 0)?;
+                let Some(Operand::Vector { reg, .. }) = v.dst else {
+                    return Err("a 16-bit result outside a VGPR");
+                };
+                let (k8, k16, k255, z) = (
+                    self.s.m.i32(8),
+                    self.s.m.i32(16),
+                    self.s.m.i32(255),
+                    self.s.m.i32(0),
+                );
+                let sat = |l: &mut Self, x: V| {
+                    let top = l.s.m.cmp(c, pred::SGT, x, k255);
+                    let x = l.s.m.select(c, top, k255, x);
+                    let bot = l.s.m.cmp(c, pred::SLT, x, z);
+                    l.s.m.select(c, bot, z, x)
+                };
+                let lo = self.s.m.bin(c, Bin::Shl, a, k16);
+                let lo = self.s.m.bin(c, Bin::AShr, lo, k16);
+                let lo = sat(self, lo);
+                let hi = self.s.m.bin(c, Bin::AShr, a, k16);
+                let hi = sat(self, hi);
+                let hi = self.s.m.bin(c, Bin::Shl, hi, k8);
+                let r = self.s.m.bin(c, Bin::Or, lo, hi);
+                let r = self.low_half(inst, reg, r);
+                int(self, r)
+            }
             "v_cndmask_b32" => {
                 let cond = match v.src.get(2) {
                     Some(&Operand::Scalar { code, .. }) => {
