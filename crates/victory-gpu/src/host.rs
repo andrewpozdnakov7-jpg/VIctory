@@ -663,6 +663,8 @@ enum Step {
     /// Brings a texture's staging buffer up to date: once per submission,
     /// whichever lists sample it, until a `Copy` or `Run` intervenes.
     Texture(TextureUpload),
+    /// A copied or resolved texture takes its contents from the host GPU.
+    TextureHostWrite(std::sync::Arc<crate::resource::HostTexture>),
     /// Brings every buffer range a view heap's views reach up to date
     /// (`crate::bindless`).
     Heap(std::sync::Arc<crate::bindless::Viewed>),
@@ -1833,6 +1835,11 @@ impl HostList {
         self.deferred().copies.push(Step::Host(Box::new(work)));
     }
 
+    /// Marks this texture as written when the copy or resolve is submitted.
+    pub(crate) fn defer_texture_write(&self, copy: std::sync::Arc<crate::resource::HostTexture>) {
+        self.deferred().copies.push(Step::TextureHostWrite(copy));
+    }
+
     /// Brings a texture's staging buffer up to date when the list is
     /// submitted, keeping it alive until the list is reset.
     pub(crate) fn defer_texture(
@@ -1860,7 +1867,7 @@ impl HostList {
                     Step::Copy(..) | Step::Fill(..) => C::StepCopyUs,
                     Step::Run(_) | Step::Host(_) => C::StepWorkUs,
                     Step::GpuWrite(..) => C::StepGpuWriteUs,
-                    Step::Texture(_) => C::StepTextureUs,
+                    Step::Texture(_) | Step::TextureHostWrite(_) => C::StepTextureUs,
                     Step::Heap(_) => C::StepHeapUs,
                     Step::Memory(_) => C::StepMemoryUs,
                 },
@@ -1915,8 +1922,15 @@ impl HostList {
                     shadow.writing(*address, *len, *marked);
                     continue;
                 }
+                Step::TextureHostWrite(copy) => {
+                    copy.host_written.store(true, Ordering::Relaxed);
+                    continue;
+                }
                 Step::Texture((staging, copy)) => {
-                    if batch.texture_due(staging) && staging.refresh() {
+                    if !copy.host_written.load(Ordering::Relaxed)
+                        && batch.texture_due(staging)
+                        && staging.refresh()
+                    {
                         uploads.push((staging.clone(), copy.clone()));
                     }
                     continue;
