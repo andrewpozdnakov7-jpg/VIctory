@@ -1573,6 +1573,56 @@ fn v_cmp_class_f16_matches_rdna2() {
     });
 }
 
+#[test]
+fn v_cmp_class_f64_preserves_all_binary64_classes() {
+    let [cmp0, cmp1] = vop3(0x0a8, 6, vgpr(1), vgpr(3), 0);
+    let [select0, select1] = vop3(0x101, 0, 0x80, 0x81, sgpr(6));
+    let shader = build_valu_cs(&[cmp0, cmp1, select0, select1]);
+    let classes = [
+        0x7ff0_0000_0000_0001u64, // signaling NaN, payload in the low word
+        0x7ff8_0000_0000_0000,    // quiet NaN
+        0xfff0_0000_0000_0000,    // negative infinity
+        0xbff0_0000_0000_0000,    // negative normal
+        0x8000_0000_0000_0001,    // negative denormal, payload in the low word
+        0x8000_0000_0000_0000,    // negative zero
+        0x0000_0000_0000_0000,    // positive zero
+        0x0000_0000_0000_0001,    // positive denormal
+        0x3ff0_0000_0000_0000,    // positive normal
+        0x7ff0_0000_0000_0000,    // positive infinity
+    ];
+    let inputs: Vec<_> = classes
+        .into_iter()
+        .enumerate()
+        .flat_map(|(class, bits)| {
+            let (lo, hi) = (bits as u32, (bits >> 32) as u32);
+            let mask = 1 << class;
+            [[lo, hi, mask, 0], [lo, hi, 0x3ff ^ mask, 0]]
+        })
+        .collect();
+    run_cases(&shader, &inputs, |backend, i, _, got| {
+        assert_eq!(
+            got,
+            u32::from(i % 2 == 0),
+            "{backend}: binary64 class {}",
+            i / 2
+        );
+    });
+
+    // SGPR pair with abs then neg. The low payload must still distinguish
+    // signaling NaN from infinity and a denormal from zero.
+    let [cmp0, cmp1] = vop3(0x0a8, 6, sgpr(0), vgpr(3), 0);
+    let modified = build_valu_cs(&[cmp0 | (1 << 8), cmp1 | (1 << 29), select0, select1]);
+    let inputs = [
+        [1, 0x7ff0_0000, 1 << 0, 0],
+        [1, 0x0000_0000, 1 << 4, 0],
+        [0, 0x3ff0_0000, 1 << 3, 0],
+        [0, 0xbff0_0000, 1 << 8, 0],
+    ];
+    run_cases(&modified, &inputs, |backend, i, _, got| {
+        assert_eq!(got, u32::from(i != 3), "{backend}: abs/neg case {i}");
+    });
+}
+
 /// A compute program in an `ACCC` part, as the AMD upscaler's are: `body`
 /// leaves its result in v0, stored to the raw UAV of the table at user data
 /// 4 (root parameter 1). Translated from the container's bytes.
