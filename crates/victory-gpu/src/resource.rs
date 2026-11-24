@@ -134,6 +134,13 @@ pub(crate) fn element(format: u32) -> Option<(u64, u64)> {
     })
 }
 
+/// Packed formats 68/69 occupy a pair of texels along X and one row along Y.
+fn texture_element(format: u32) -> Option<(u64, u64, u64)> {
+    let (bytes, width) = element(format)?;
+    let height = if matches!(format, 68 | 69) { 1 } else { width };
+    Some((bytes, width, height))
+}
+
 /// A texture's layout in console memory, as the console's layout library
 /// gives it (`victory-hle`'s `xg` serves the same): the description's
 /// layout field is `0x100 | swizzle mode`, 1 linear, 0 the library's pick.
@@ -195,7 +202,7 @@ fn footprint(desc: &ResourceDesc) -> Option<AllocationInfo> {
     let bytes = if desc.dimension == BUFFER {
         desc.width
     } else {
-        let (element, block) = element(desc.format)?;
+        let (element, block_width, block_height) = texture_element(desc.format)?;
         let (depth, slices) = if desc.dimension == TEXTURE_3D {
             (u64::from(desc.depth_or_array_size), 1)
         } else {
@@ -205,8 +212,8 @@ fn footprint(desc: &ResourceDesc) -> Option<AllocationInfo> {
         let mips = mip_count(desc);
         let mut chain = 0u64;
         for mip in 0..mips.min(64) {
-            let w = (desc.width >> mip).max(1).div_ceil(block);
-            let h = (height >> mip).max(1).div_ceil(block);
+            let w = (desc.width >> mip).max(1).div_ceil(block_width);
+            let h = (height >> mip).max(1).div_ceil(block_height);
             let d = (depth >> mip).max(1);
             chain = chain.checked_add(w.checked_mul(h)?.checked_mul(d)?.checked_mul(element)?)?;
         }
@@ -333,9 +340,9 @@ pub(crate) struct PlacedFootprint {
 impl PlacedFootprint {
     /// The bytes it spans in a buffer: every row pitched but the last.
     pub(crate) fn bytes(&self) -> Option<u64> {
-        let (element, block) = element(self.format)?;
-        let lines = u64::from(self.height).div_ceil(block) * u64::from(self.depth);
-        let last = u64::from(self.width).div_ceil(block) * element;
+        let (element, block_width, block_height) = texture_element(self.format)?;
+        let lines = u64::from(self.height).div_ceil(block_height) * u64::from(self.depth);
+        let last = u64::from(self.width).div_ceil(block_width) * element;
         Some(u64::from(self.row_pitch) * lines.saturating_sub(1) + last)
     }
 
@@ -343,16 +350,17 @@ impl PlacedFootprint {
     /// region at texel `at` covers: one per row of blocks; `None` if the
     /// format has no size or the region leaves the footprint.
     pub(crate) fn rows(&self, at: [u32; 3], size: [u32; 3]) -> Option<Vec<(u64, u64)>> {
-        let (element, block) = element(self.format)?;
-        let blocks = |texels: u32| u64::from(texels).div_ceil(block);
+        let (element, block_width, block_height) = texture_element(self.format)?;
+        let columns = |texels: u32| u64::from(texels).div_ceil(block_width);
+        let rows = |texels: u32| u64::from(texels).div_ceil(block_height);
         let [x, y, z] = at.map(u64::from);
-        let (w, h, d) = (blocks(size[0]), blocks(size[1]), u64::from(size[2]));
-        let (x, y) = (x / block, y / block);
-        if x + w > blocks(self.width) || y + h > blocks(self.height) || z + d > u64::from(self.depth) {
+        let (w, h, d) = (columns(size[0]), rows(size[1]), u64::from(size[2]));
+        let (x, y) = (x / block_width, y / block_height);
+        if x + w > columns(self.width) || y + h > rows(self.height) || z + d > u64::from(self.depth) {
             return None;
         }
         let pitch = u64::from(self.row_pitch);
-        let slice = pitch * blocks(self.height);
+        let slice = pitch * rows(self.height);
         Some(
             (z..z + d)
                 .flat_map(|k| (y..y + h).map(move |r| (k * slice + r * pitch + x * element, w * element)))
@@ -402,17 +410,17 @@ fn subresource(desc: &ResourceDesc, index: u32) -> Option<(PlacedFootprint, u32,
         (false, 0) => (desc.format, PITCH),
         _ => return None,
     };
-    let (element, block) = element(format)?;
-    let width = (desc.width >> mip).max(1).next_multiple_of(block);
+    let (element, block_width, block_height) = texture_element(format)?;
+    let width = (desc.width >> mip).max(1).next_multiple_of(block_width);
     let height = (u64::from(desc.height) >> mip)
         .max(1)
-        .next_multiple_of(block);
+        .next_multiple_of(block_height);
     let depth = if desc.dimension == TEXTURE_3D {
         (u32::from(desc.depth_or_array_size) >> mip).max(1)
     } else {
         1
     };
-    let row_size = width / block * element;
+    let row_size = width / block_width * element;
     let footprint = PlacedFootprint {
         offset: 0,
         format,
@@ -421,7 +429,7 @@ fn subresource(desc: &ResourceDesc, index: u32) -> Option<(PlacedFootprint, u32,
         depth,
         row_pitch: u32::try_from(row_size.next_multiple_of(pitch_alignment)).ok()?,
     };
-    Some((footprint, u32::try_from(height / block).ok()?, row_size))
+    Some((footprint, u32::try_from(height / block_height).ok()?, row_size))
 }
 
 /// Places subsequent subresources at 512-byte boundaries relative to the
@@ -1809,10 +1817,10 @@ pub(crate) fn alias_source(placed: This) -> Option<This> {
     let b = resource(placed);
     let map = TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner());
     let bytes = |d: &ResourceDesc| {
-        let (size, block) = element(d.format)?;
+        let (size, block_width, block_height) = texture_element(d.format)?;
         let swizzle = texture_layout(d).map_or(d.layout, |t| t.planes[0].layout.desc.swizzle.0);
-        let rows = u64::from(d.height).div_ceil(block);
-        Some((d.dimension, d.width.div_ceil(block) * size, rows, d.depth_or_array_size, d.sample_count, swizzle))
+        let rows = u64::from(d.height).div_ceil(block_height);
+        Some((d.dimension, d.width.div_ceil(block_width) * size, rows, d.depth_or_array_size, d.sample_count, swizzle))
     };
     let want = bytes(&b.desc)?;
     map.get(&(b.data() as u64))?
@@ -2781,6 +2789,12 @@ mod tests {
             assert_eq!((rows[0], sizes[0]), (3, 12), "format {format}");
             assert_eq!(layout[0].row_pitch, 256, "format {format}");
             assert_eq!(total, 524, "format {format}");
+            assert_eq!(layout[0].bytes(), Some(total), "format {format}");
+            assert_eq!(
+                layout[0].rows([0, 0, 0], [5, 3, 1]).as_deref(),
+                Some([(0, 12), (256, 12), (512, 12)].as_slice()),
+                "format {format}"
+            );
         }
 
         let desc = texture(10, 6, 28, 2);
