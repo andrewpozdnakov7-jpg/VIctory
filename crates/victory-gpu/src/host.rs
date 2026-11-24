@@ -194,40 +194,13 @@ fn create() -> windows::core::Result<Host> {
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();
-        let queue: ID3D12CommandQueue = device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
-            Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
-            ..Default::default()
-        })?;
-        let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
-        let event = CreateEventW(None, false, false, None)?;
-        let rtvs: ID3D12DescriptorHeap =
-            device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
-                Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
-                NumDescriptors: RTV_RING,
-                ..Default::default()
-            })?;
-        let rtv_size = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
-        let dsvs: ID3D12DescriptorHeap =
-            device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
-                Type: D3D12_DESCRIPTOR_HEAP_TYPE_DSV,
-                NumDescriptors: RTV_RING,
-                ..Default::default()
-            })?;
-        let dsv_size = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
-        let cpu_views: ID3D12DescriptorHeap =
-            device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
-                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                NumDescriptors: RTV_RING,
-                ..Default::default()
-            })?;
-        let cpu_view_size =
-            device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        let host = Host::from_device(device, messages)?;
         tracing::info!("host D3D12 device ready");
         // The console fuses its multiply-adds (`v_fma_f32`, `v_fmac_f32`,
         // `v_fma_mix*`); the lowering's DXIL `FMad` is fused only where the
         // host chooses (the RX 6700 XT does, WARP does not).
         match (victory_shader::emit::host::Host {
-            device: device.clone(),
+            device: host.device.clone(),
         })
         .fuses_fmad()
         {
@@ -237,24 +210,73 @@ fn create() -> windows::core::Result<Host> {
             ),
             Err(e) => tracing::debug!(error = %e, "multiply-add fusing not checked"),
         }
-        Ok(Host {
-            device,
-            queue,
-            fence,
-            submitted: Mutex::new(0),
-            event,
-            rtvs,
-            rtv_size,
-            dsvs,
-            dsv_size,
-            next_dsv: AtomicU32::new(0),
-            cpu_views,
-            cpu_view_size,
-            next_cpu_view: AtomicU32::new(0),
-            messages,
-            next_rtv: AtomicU32::new(0),
-            presenter: Mutex::new(Presentation::default()),
-        })
+        Ok(host)
+    }
+}
+
+impl Host {
+    fn from_device(
+        device: ID3D12Device,
+        messages: Option<ID3D12InfoQueue>,
+    ) -> windows::core::Result<Self> {
+        // SAFETY: plain D3D12 queue, fence, event and descriptor heap creation.
+        unsafe {
+            let queue: ID3D12CommandQueue = device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                ..Default::default()
+            })?;
+            let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
+            let event = CreateEventW(None, false, false, None)?;
+            let rtvs: ID3D12DescriptorHeap =
+                device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
+                    NumDescriptors: RTV_RING,
+                    ..Default::default()
+                })?;
+            let rtv_size = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+            let dsvs: ID3D12DescriptorHeap =
+                device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_DSV,
+                    NumDescriptors: RTV_RING,
+                    ..Default::default()
+                })?;
+            let dsv_size = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+            let cpu_views: ID3D12DescriptorHeap =
+                device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: RTV_RING,
+                    ..Default::default()
+                })?;
+            let cpu_view_size =
+                device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            Ok(Host {
+                device,
+                queue,
+                fence,
+                submitted: Mutex::new(0),
+                event,
+                rtvs,
+                rtv_size,
+                dsvs,
+                dsv_size,
+                next_dsv: AtomicU32::new(0),
+                cpu_views,
+                cpu_view_size,
+                next_cpu_view: AtomicU32::new(0),
+                messages,
+                next_rtv: AtomicU32::new(0),
+                presenter: Mutex::new(Presentation::default()),
+            })
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_warp() -> Option<Self> {
+        let adapter = warp_adapter().ok()?;
+        let mut device: Option<ID3D12Device> = None;
+        // SAFETY: a verified software WARP adapter.
+        unsafe { D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).ok()? };
+        Self::from_device(device?, None).ok()
     }
 }
 
@@ -640,7 +662,7 @@ enum Step {
     GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize, bool),
     /// Brings a texture's staging buffer up to date: once per submission,
     /// whichever lists sample it, until a `Copy` or `Run` intervenes.
-    Texture(std::sync::Arc<crate::texture::Staging>),
+    Texture(TextureUpload),
     /// Brings every buffer range a view heap's views reach up to date
     /// (`crate::bindless`).
     Heap(std::sync::Arc<crate::bindless::Viewed>),
@@ -649,6 +671,11 @@ enum Step {
     /// brought up to date.
     Memory(usize),
 }
+
+type TextureUpload = (
+    std::sync::Arc<crate::texture::Staging>,
+    std::sync::Arc<crate::resource::HostTexture>,
+);
 
 /// What a list does on the CPU when it is submitted: copies between host
 /// memory regions (title buffers, upload buffers and buffer copies), and
@@ -863,11 +890,11 @@ impl Host {
         let mut firsts = Vec::with_capacity(runs.len());
         let mut batch = Batch::default();
         for list in runs {
-            list.run_deferred(&mut batch);
+            let uploads = list.run_deferred(&mut batch);
             firsts.push(lists.len());
             #[cfg(feature = "diagnostics")]
             let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::PreludeUs);
-            if let Some(prelude) = list.prelude() {
+            if let Some(prelude) = list.prelude(&uploads) {
                 lists.push(Some(prelude));
             }
             lists.push(list.list.cast().ok());
@@ -1476,15 +1503,32 @@ impl HostList {
         self.rebind.swap(false, Ordering::Relaxed)
     }
 
-    /// At submission: the list that moves each texture this list uses from
-    /// its real state to the one the list starts with; the textures' real
-    /// states become those the list ends with.
-    fn prelude(&self) -> Option<ID3D12CommandList> {
+    /// Records a first and last texture state for a native test list.
+    #[cfg(test)]
+    pub(crate) fn expect_texture_state(
+        &self,
+        copy: &std::sync::Arc<crate::resource::HostTexture>,
+        wanted: u32,
+    ) {
+        self.states.lock().unwrap_or_else(|e| e.into_inner())
+            .entry(std::sync::Arc::as_ptr(copy) as usize)
+            .or_insert_with(|| (wanted, wanted, copy.clone()));
+    }
+
+    /// At submission: uploads dirty textures and moves each texture from
+    /// its real state to the state the list expects at its first use.
+    fn prelude(&self, uploads: &[TextureUpload]) -> Option<ID3D12CommandList> {
         // Depth textures and their twins first, from their real states and
         // back: the side each first use needs, made newer.
         let twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
         let copies = crate::twin::at_submission(twins.values());
         drop(twins);
+        let upload_barriers: Vec<_> = uploads.iter().filter_map(|(_, copy)| {
+            let real = copy.state.swap(D3D12_RESOURCE_STATE_COPY_DEST.0 as u32, Ordering::Relaxed);
+            (real != D3D12_RESOURCE_STATE_COPY_DEST.0 as u32).then(|| {
+                transition(&copy.texture, D3D12_RESOURCE_STATES(real as i32), D3D12_RESOURCE_STATE_COPY_DEST)
+            })
+        }).collect();
         let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         let barriers: Vec<D3D12_RESOURCE_BARRIER> = states
             .values()
@@ -1499,7 +1543,7 @@ impl HostList {
                 })
             })
             .collect();
-        if barriers.is_empty() && copies.is_empty() {
+        if barriers.is_empty() && copies.is_empty() && uploads.is_empty() {
             return None;
         }
         let (allocator, list) = &self.prelude;
@@ -1527,6 +1571,12 @@ impl HostList {
                     if !back.is_empty() {
                         list.ResourceBarrier(&back);
                     }
+                }
+                if !upload_barriers.is_empty() {
+                    list.ResourceBarrier(&upload_barriers);
+                }
+                for (staging, copy) in uploads {
+                    staging.record_copies(list, &copy.texture);
                 }
                 if !barriers.is_empty() {
                     list.ResourceBarrier(&barriers);
@@ -1785,16 +1835,21 @@ impl HostList {
 
     /// Brings a texture's staging buffer up to date when the list is
     /// submitted, keeping it alive until the list is reset.
-    pub(crate) fn defer_texture(&self, staging: std::sync::Arc<crate::texture::Staging>) {
-        self.deferred().copies.push(Step::Texture(staging));
+    pub(crate) fn defer_texture(
+        &self,
+        staging: std::sync::Arc<crate::texture::Staging>,
+        copy: std::sync::Arc<crate::resource::HostTexture>,
+    ) {
+        self.deferred().copies.push(Step::Texture((staging, copy)));
     }
 
     /// Runs the list's submission-time steps; refreshes go into `batch`
     /// (the title's big buffers, a 174 MB one among them, are read by most
     /// lists of a submission, through many ranges).
-    fn run_deferred(&self, batch: &mut Batch) {
+    fn run_deferred(&self, batch: &mut Batch) -> Vec<TextureUpload> {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
+        let mut uploads = Vec::new();
         for step in &self.deferred().copies {
             let started = std::time::Instant::now();
             #[cfg(feature = "diagnostics")]
@@ -1860,9 +1915,9 @@ impl HostList {
                     shadow.writing(*address, *len, *marked);
                     continue;
                 }
-                Step::Texture(staging) => {
-                    if batch.texture_due(staging) {
-                        staging.refresh();
+                Step::Texture((staging, copy)) => {
+                    if batch.texture_due(staging) && staging.refresh() {
+                        uploads.push((staging.clone(), copy.clone()));
                     }
                     continue;
                 }
@@ -1878,6 +1933,7 @@ impl HostList {
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
             PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
         }
+        uploads
     }
 }
 
