@@ -473,12 +473,7 @@ pub(crate) fn aligned(address: u64, len: u64) -> Option<Arc<Shadow>> {
         return None;
     }
     let key = (address, len);
-    if let Some(copy) = ALIGNED
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(&key)
-        .and_then(std::sync::Weak::upgrade)
-    {
+    if let Some(copy) = aligned_existing(address, len) {
         return Some(copy);
     }
     // Views hold hundreds of megabytes in the world, and the copy is readable
@@ -489,10 +484,14 @@ pub(crate) fn aligned(address: u64, len: u64) -> Option<Arc<Shadow>> {
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
     let copy = Arc::new(Shadow::new(buffer, data, gpu, address, len));
-    ALIGNED
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(key, Arc::downgrade(&copy));
+    {
+        let mut copies = ALIGNED.lock().unwrap_or_else(|e| e.into_inner());
+        // Another recorder may have published the same range while we allocated.
+        if let Some(existing) = copies.get(&key).and_then(std::sync::Weak::upgrade) {
+            return Some(existing);
+        }
+        copies.insert(key, Arc::downgrade(&copy));
+    }
     tracing::debug!(
         address = format_args!("{address:#x}"),
         len,
@@ -595,6 +594,43 @@ pub(crate) fn near(va: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn concurrent_aligned_views_share_the_copy_refreshed_at_submission() {
+        if crate::host::host().is_none() {
+            return;
+        }
+
+        const THREADS: usize = 8;
+        let values = [[19u32; 14]; 8];
+        for value in &values {
+            let address = value.as_ptr() as u64;
+            let len = size_of_val(value) as u64;
+            let gate = std::sync::Barrier::new(THREADS);
+            let copies = std::thread::scope(|scope| {
+                let jobs: Vec<_> = (0..THREADS)
+                    .map(|_| {
+                        let gate = &gate;
+                        scope.spawn(move || {
+                            gate.wait();
+                            aligned(address, len).expect("aligned host buffer")
+                        })
+                    })
+                    .collect();
+                jobs.into_iter()
+                    .map(|job| job.join().unwrap())
+                    .collect::<Vec<_>>()
+            });
+            let refreshed = aligned_existing(address, len).expect("cached copy");
+            refreshed.update(address as usize, len as usize);
+            for copy in copies {
+                assert!(Arc::ptr_eq(&copy, &refreshed), "slot retained a different copy");
+                // SAFETY: the mapped buffer has 56 bytes and refresh has completed.
+                let first = unsafe { copy.data.cast::<u32>().read_unaligned() };
+                assert_eq!(first, value[0]);
+            }
+        }
+    }
 
     /// A refresh of the aligned copy brings up to date the bytes of the view
     /// that lie inside it, cut at both ends, and nothing when the range is
