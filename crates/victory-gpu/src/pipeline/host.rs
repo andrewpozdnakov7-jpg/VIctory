@@ -296,6 +296,11 @@ pub(crate) struct HostPipeline {
     /// written-pages bitmap, if a stage marks its writes through views
     /// (`victory_shader::emit`, "Write marks").
     pub(crate) marks: Option<(u32, u32)>,
+    /// Multi-argument host command signatures bound to `root`, cached per
+    /// mapped layout and record stride.
+    pub(crate) signatures: std::sync::Mutex<
+        Vec<(Vec<crate::indirect::HostIndirectArg>, u32, ID3D12CommandSignature)>,
+    >,
 }
 
 /// Logs a pipeline that gets no host pipeline, once per reason.
@@ -562,6 +567,7 @@ impl HostPipeline {
                 slots: 0,
                 inputs: Vec::new(),
                 marks,
+                signatures: std::sync::Mutex::new(Vec::new()),
             });
         }
         let Some(g) = g else {
@@ -596,6 +602,7 @@ impl HostPipeline {
                 slots: 0,
                 inputs: Vec::new(),
                 marks,
+                signatures: std::sync::Mutex::new(Vec::new()),
             });
         }
 
@@ -681,6 +688,7 @@ impl HostPipeline {
             slots: g.slots(),
             inputs: g.elements(),
             marks,
+            signatures: std::sync::Mutex::new(Vec::new()),
         })
     }
 }
