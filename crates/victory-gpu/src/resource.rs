@@ -124,7 +124,9 @@ pub(crate) fn element(format: u32) -> Option<(u64, u64)> {
         9..=22 => (8, 1),
         23..=47 | 67 | 87..=93 | 116 | 117 | 189 | 191 => (4, 1),
         118..=120 => (3, 1),
-        48..=59 | 68 | 69 | 85 | 86 | 115 => (2, 1),
+        48..=59 | 85 | 86 | 115 => (2, 1),
+        // DXGI 68/69 store two texels in each 32-bit word.
+        68..=69 => (4, 2),
         60..=65 | 190 => (1, 1),
         70..=72 | 79..=81 => (8, 4),
         73..=78 | 82..=84 | 94..=99 => (16, 4),
@@ -422,9 +424,10 @@ fn subresource(desc: &ResourceDesc, index: u32) -> Option<(PlacedFootprint, u32,
     Some((footprint, u32::try_from(height / block).ok()?, row_size))
 }
 
-/// Places subresources at 512-byte boundaries in an upload buffer.
-/// Row pitch is aligned to 512 bytes for depth/stencil planes and 256 bytes
-/// otherwise. Unknown sizes give the documented all-ones values.
+/// Places subsequent subresources at 512-byte boundaries relative to the
+/// supplied base offset. Row pitch is aligned to 512 bytes for depth/stencil
+/// planes and 256 bytes otherwise. Unknown sizes give the documented
+/// all-ones values.
 pub(crate) extern "system" fn copyable_footprints(
     _: This,
     desc: *const ResourceDesc,
@@ -439,16 +442,31 @@ pub(crate) extern "system" fn copyable_footprints(
     const PLACEMENT: u64 = 512;
     // SAFETY: the title passes a description (null is tolerated).
     let desc = unsafe { desc.as_ref() };
-    let mut end = base;
+    // Keep offsets relative to `base`: D3D12 preserves an unaligned base
+    // and aligns the distance to each following subresource.
+    let mut end = 0u64;
     let mut known = desc.is_some();
     for i in 0..count {
-        let one = desc.and_then(|d| subresource(d, first + i));
+        let one = desc
+            .and_then(|d| first.checked_add(i).and_then(|index| subresource(d, index)))
+            .and_then(|(mut footprint, row_count, row_size)| {
+                let offset = base.checked_add(end)?;
+                let lines = u64::from(row_count).checked_mul(u64::from(footprint.depth))?;
+                let preceding_rows = u64::from(footprint.row_pitch)
+                    .checked_mul(lines.saturating_sub(1))?;
+                let span = preceding_rows.checked_add(row_size)?;
+                let next = end.checked_add(span)?;
+                let next = if i + 1 < count {
+                    next.checked_next_multiple_of(PLACEMENT)?
+                } else {
+                    next
+                };
+                footprint.offset = offset;
+                Some((footprint, row_count, row_size, next))
+            });
         let (layout, row_count, row_size) = match one {
-            Some((mut footprint, row_count, row_size)) => {
-                footprint.offset = end.next_multiple_of(PLACEMENT);
-                let pitch = u64::from(footprint.row_pitch);
-                let lines = u64::from(row_count) * u64::from(footprint.depth);
-                end = footprint.offset + pitch * lines.saturating_sub(1) + row_size;
+            Some((footprint, row_count, row_size, next)) => {
+                end = next;
                 (footprint, row_count, row_size)
             }
             None => {
@@ -475,7 +493,7 @@ pub(crate) extern "system" fn copyable_footprints(
     }
     if !total.is_null() {
         // SAFETY: checked non-null.
-        unsafe { total.write(if known { end - base } else { u64::MAX }) };
+        unsafe { total.write(if known { end } else { u64::MAX }) };
     }
 }
 
@@ -2737,6 +2755,52 @@ mod tests {
             assert_eq!(sizes, [64, 32, 64, 32, 16, 8, 16, 8], "format {format}");
             assert_eq!(total, 24_072, "format {format}");
             assert!(subresource(&desc, 8).is_none(), "format {format}");
+        }
+    }
+
+    #[test]
+    fn copyable_footprints_match_native_packed_and_unaligned_cases() {
+        // DXGI 68/69 store pairs of texels in one 32-bit word. An odd mip
+        // width of five therefore occupies three words (six footprint texels).
+        for format in [68, 69] {
+            let desc = texture(10, 6, format, 2);
+            let (mut layout, mut rows, mut sizes, mut total) =
+                ([NO_FOOTPRINT], [0u32], [0u64], 0u64);
+            copyable_footprints(
+                std::ptr::null(),
+                &desc,
+                1,
+                1,
+                0,
+                layout.as_mut_ptr(),
+                rows.as_mut_ptr(),
+                sizes.as_mut_ptr(),
+                &mut total,
+            );
+            assert_eq!((layout[0].width, layout[0].height), (6, 3), "format {format}");
+            assert_eq!((rows[0], sizes[0]), (3, 12), "format {format}");
+            assert_eq!(layout[0].row_pitch, 256, "format {format}");
+            assert_eq!(total, 524, "format {format}");
+        }
+
+        let desc = texture(10, 6, 28, 2);
+        for base in [0, 1] {
+            let (mut layouts, mut rows, mut sizes, mut total) =
+                ([NO_FOOTPRINT; 2], [0u32; 2], [0u64; 2], 0u64);
+            copyable_footprints(
+                std::ptr::null(),
+                &desc,
+                0,
+                2,
+                base,
+                layouts.as_mut_ptr(),
+                rows.as_mut_ptr(),
+                sizes.as_mut_ptr(),
+                &mut total,
+            );
+            assert_eq!(layouts[0].offset, base);
+            assert_eq!(layouts[1].offset, base + 1536);
+            assert_eq!(total, 2068);
         }
     }
 
