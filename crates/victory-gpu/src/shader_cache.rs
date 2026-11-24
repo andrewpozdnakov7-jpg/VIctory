@@ -94,12 +94,20 @@ fn build() -> &'static [u8; 32] {
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
     let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
     match CACHE.get() {
-        Some(cache) => cached(cache, build(), container, translate),
+        Some(cache) => cached(
+            cache,
+            build(),
+            victory_shader::emit::host_max_wave(),
+            container,
+            translate,
+        ),
         None => translate(container),
     }
 }
 
-/// The cache entry's converter: the build and the container in, the
+const CACHE_PREFIX: usize = 32 + size_of::<u32>(); // build and maximum wave size
+
+/// The cache entry's converter: the build, wave size and container in, the
 /// encoded translation out. `ran` tells a miss from a hit.
 struct Translate<F> {
     translate: F,
@@ -116,7 +124,7 @@ impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Tra
     }
     fn convert(&self, input: &[u8]) -> anyhow::Result<Vec<u8>> {
         self.ran.store(true, Ordering::Relaxed);
-        let shader = (self.translate)(&input[32..]).map_err(anyhow::Error::msg)?;
+        let shader = (self.translate)(&input[CACHE_PREFIX..]).map_err(anyhow::Error::msg)?;
         Ok(encode(&shader))
     }
 }
@@ -124,10 +132,12 @@ impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Tra
 fn cached(
     cache: &Cache,
     build: &[u8; 32],
+    wave_lanes: u32,
     container: &[u8],
     translate: impl Fn(&[u8]) -> Result<HostShader, String> + Send + Sync,
 ) -> Result<HostShader, String> {
-    let input = [&build[..], container].concat();
+    // Host discovery can complete after the build fingerprint is first used.
+    let input = [&build[..], &wave_lanes.to_le_bytes(), container].concat();
     let converter = Translate {
         translate,
         ran: AtomicBool::new(false),
@@ -370,26 +380,49 @@ mod tests {
             runs.fetch_add(1, Ordering::Relaxed);
             Ok(shader())
         };
-        assert_eq!(cached(&cache, &build, container, translate), Ok(shader()));
-        assert_eq!(cached(&cache, &build, container, translate), Ok(shader()));
+        assert_eq!(cached(&cache, &build, 0, container, translate), Ok(shader()));
+        assert_eq!(cached(&cache, &build, 0, container, translate), Ok(shader()));
         assert_eq!(runs.load(Ordering::Relaxed), 1, "the second came from disk");
 
         // Another build translates again.
-        assert_eq!(cached(&cache, &[8; 32], container, translate), Ok(shader()));
+        assert_eq!(cached(&cache, &[8; 32], 0, container, translate), Ok(shader()));
         assert_eq!(runs.load(Ordering::Relaxed), 2);
 
         // A damaged entry is a miss, translated and stored again.
         for e in walk(dir.path()) {
             std::fs::write(e, b"VSH1 broken").unwrap();
         }
-        assert_eq!(cached(&cache, &build, container, translate), Ok(shader()));
+        assert_eq!(cached(&cache, &build, 0, container, translate), Ok(shader()));
         assert_eq!(runs.load(Ordering::Relaxed), 3);
-        assert_eq!(cached(&cache, &build, container, translate), Ok(shader()));
+        assert_eq!(cached(&cache, &build, 0, container, translate), Ok(shader()));
         assert_eq!(runs.load(Ordering::Relaxed), 3);
 
         // Failures are not stored.
         let fail = |_: &[u8]| Err::<HostShader, _>("unsupported".to_owned());
-        assert!(cached(&cache, &build, b"other", fail).is_err());
+        assert!(cached(&cache, &build, 0, b"other", fail).is_err());
+    }
+
+    #[test]
+    fn cache_separates_effective_maximum_wave_sizes() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        let build = [7u8; 32];
+        let container = b"one synthetic shader";
+        let runs = AtomicU64::new(0);
+        let expected = [32u32, 64, 0, 32, 64, 0];
+        let got = expected.map(|lanes| {
+            let result = cached(&cache, &build, lanes, container, |input| {
+                assert_eq!(input, container);
+                runs.fetch_add(1, Ordering::Relaxed);
+                let mut s = shader();
+                s.dxil = lanes.to_le_bytes().to_vec();
+                Ok(s)
+            })
+            .unwrap();
+            u32::from_le_bytes(result.dxil.try_into().unwrap())
+        });
+        assert_eq!(got, expected);
+        assert_eq!(runs.load(Ordering::Relaxed), 3);
     }
 
     fn walk(dir: &std::path::Path) -> Vec<PathBuf> {
