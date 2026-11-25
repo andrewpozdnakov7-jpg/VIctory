@@ -2006,6 +2006,121 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn multisampled_aliases_copy_all_samples() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_R32_FLOAT};
+
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let backing = Memory::zeroed(1 << 22, 1 << 16).unwrap();
+        let null = std::ptr::null();
+        let place = |desc: &ResourceDesc| {
+            let mut made = null;
+            assert_eq!(
+                create_at_address(
+                    null, backing.address(), desc, 0, std::ptr::null(), &RESOURCE_IIDS[0],
+                    &mut made,
+                ),
+                S_OK
+            );
+            made
+        };
+        let color = texture(4, 4, DXGI_FORMAT_R32_FLOAT.0 as u32, 1);
+        let common = ResourceDesc {
+            sample_count: 4,
+            layout: 0x100 | texture::Swizzle::SW_64KB_Z_X.0,
+            ..color
+        };
+        let from = place(&ResourceDesc {
+            format: DXGI_FORMAT_D32_FLOAT.0 as u32,
+            flags: DEPTH,
+            ..common
+        });
+        let to = place(&ResourceDesc { flags: 1, ..common });
+        assert_eq!(alias_source(to), Some(from));
+        let source = host_resource(from).expect("multisampled depth");
+        let dest = host_resource(to).expect("multisampled color alias");
+
+        let mut resolved = null;
+        assert_eq!(
+            create_committed(
+                null, &PROPERTIES, 0, &color, 0, std::ptr::null(), &RESOURCE_IIDS[0],
+                &mut resolved,
+            ),
+            S_OK
+        );
+        let single = host_resource(resolved).expect("single-sample resolve target");
+        let list = host.new_list().unwrap();
+        crate::list::ensure_state(&list, to, D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32);
+        let rtv = host.rtv(dest, None);
+        crate::list::ensure_state(&list, from, D3D12_RESOURCE_STATE_DEPTH_WRITE.0 as u32);
+        let view = D3D12_DEPTH_STENCIL_VIEW_DESC {
+            Format: DXGI_FORMAT_D32_FLOAT,
+            ViewDimension: D3D12_DSV_DIMENSION_TEXTURE2DMS,
+            ..Default::default()
+        };
+        let dsv = host.dsv(source, Some(&view));
+        let source_copy = host_copy(from).unwrap();
+        let dest_copy = host_copy(to).unwrap();
+        // SAFETY: both multisampled textures are live and in their target states.
+        unsafe {
+            list.list.ClearRenderTargetView(rtv, &[-0.5, 0.0, 0.0, 0.0], None);
+            list.list.ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 0.375, 0, None);
+        }
+        crate::texture::alias_copy(&list, from, to);
+        let first_copy_is_current = list.alias_copy_is_current(&source_copy, &dest_copy);
+        crate::list::ensure_state(&list, from, D3D12_RESOURCE_STATE_DEPTH_WRITE.0 as u32);
+        // SAFETY: the multisampled depth texture is live and in DEPTH_WRITE.
+        unsafe { list.list.ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 0.625, 0, None) };
+        assert!(!list.alias_copy_is_current(&source_copy, &dest_copy));
+        crate::texture::alias_copy(&list, from, to);
+        let second_copy_is_current = list.alias_copy_is_current(&source_copy, &dest_copy);
+
+        crate::list::ensure_state(&list, to, D3D12_RESOURCE_STATE_RESOLVE_SOURCE.0 as u32);
+        crate::list::ensure_state(&list, resolved, D3D12_RESOURCE_STATE_RESOLVE_DEST.0 as u32);
+        let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+        let mut total = 0;
+        // SAFETY: live textures in their resolve states, and room for one footprint.
+        unsafe {
+            list.list.ResolveSubresource(single, 0, dest, 0, DXGI_FORMAT_R32_FLOAT);
+            host.device.GetCopyableFootprints(
+                &single.GetDesc(), 0, 1, 0, Some(&mut footprint), None, None, Some(&mut total),
+            );
+        }
+        let (out, data) = host.shared_buffer(total).unwrap();
+        crate::list::ensure_state(&list, resolved, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32);
+        // SAFETY: resources in their copy states. The locations borrow their COM pointers.
+        unsafe {
+            let src = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(single),
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+            };
+            let dst = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&out),
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: footprint },
+            };
+            list.list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+        }
+        list.close();
+        host.execute(&[&list]);
+        for y in 0..4 {
+            let offset = footprint.Offset as usize + y * footprint.Footprint.RowPitch as usize;
+            // SAFETY: four R32 pixels from the completed copy, within the mapped buffer.
+            let row = unsafe { data.add(offset).cast::<[f32; 4]>().read_unaligned() };
+            assert_eq!(row, [0.625; 4], "resolved row {y} after the second clear");
+        }
+        assert!(first_copy_is_current, "the first direct copy satisfies further reads");
+        assert!(second_copy_is_current, "the refreshed direct copy satisfies further reads");
+        for resource in [resolved, to, from] {
+            assert_eq!(slot::<Release>(resource, 0x10)(resource), 0);
+        }
+    }
+
     fn heap(size: u64) -> This {
         let desc = HeapDesc {
             size,

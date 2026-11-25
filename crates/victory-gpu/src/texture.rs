@@ -95,10 +95,9 @@ pub(crate) static ALIAS_COPIES: std::sync::atomic::AtomicU64 = std::sync::atomic
 /// two title textures at one memory that cannot share a host texture
 /// (`resource::alias_source`: block-compressed against plain formats of
 /// the same bytes, or a cast the host refused), `to` (a placed view's)
-/// reading what the GPU wrote through `from`. Through a buffer, each
-/// subresource with its own format, as many as have the same bytes per
-/// row and rows in both; `to` no longer takes its contents from title
-/// memory.
+/// reading what the GPU wrote through `from`. Compatible multisampled
+/// textures copy directly, preserving their samples. Single-sample
+/// textures copy through a buffer, each subresource with its own format.
 pub(crate) fn alias_copy(list: &HostList, from: This, to: This) {
     const COPY_DEST: u32 = 0x400;
     const COPY_SOURCE: u32 = 0x800;
@@ -115,6 +114,31 @@ pub(crate) fn alias_copy(list: &HostList, from: This, to: This) {
     let (a, b) = (&source.texture, &dest.texture);
     // SAFETY: live resources.
     let (da, db) = unsafe { (a.GetDesc(), b.GetDesc()) };
+    let prepare = || {
+        crate::texture::host_written(to);
+        crate::list::ensure_state(list, from, COPY_SOURCE);
+        crate::list::ensure_state(list, to, COPY_DEST);
+    };
+    if da.SampleDesc.Count > 1 || db.SampleDesc.Count > 1 {
+        // A buffer footprint is single-sample. D3D12 can copy these
+        // textures directly when their extents, samples and formats agree.
+        if da.SampleDesc != db.SampleDesc
+            || (da.Dimension, da.Width, da.Height, da.DepthOrArraySize, da.MipLevels)
+                != (db.Dimension, db.Width, db.Height, db.DepthOrArraySize, db.MipLevels)
+            || crate::resource::family(da.Format.0 as u32)
+                != crate::resource::family(db.Format.0 as u32)
+        {
+            once!(?da, ?db, "multisampled aliased textures cannot be copied directly");
+            return;
+        }
+        prepare();
+        // SAFETY: an open list with live, copy-compatible textures in the
+        // states just set above.
+        unsafe { list.list.CopyResource(b, a) };
+        list.record_alias_copy(&source, &dest);
+        ALIAS_COPIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return;
+    }
     let count = |d: &D3D12_RESOURCE_DESC| {
         if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
             u32::from(d.MipLevels)
@@ -149,9 +173,7 @@ pub(crate) fn alias_copy(list: &HostList, from: This, to: This) {
     }
     let Some(buffer) = host.default_buffer(total) else { return };
     list.keep(&buffer);
-    crate::texture::host_written(to);
-    crate::list::ensure_state(list, from, COPY_SOURCE);
-    crate::list::ensure_state(list, to, COPY_DEST);
+    prepare();
     let place = |r: &ID3D12Resource, f: D3D12_PLACED_SUBRESOURCE_FOOTPRINT| D3D12_TEXTURE_COPY_LOCATION {
         // SAFETY: a borrowed pointer the copy does not release.
         pResource: unsafe { std::mem::transmute_copy(r) },
