@@ -294,44 +294,9 @@ pub(crate) fn save(now: bool) {
     let mut saved = 0u32;
     let mut total = 0usize;
     for (shard, library) in libraries.iter().enumerate() {
-        let (blob, prebuilt, added, marked) = {
-            let l = library.lock().unwrap_or_else(|e| e.into_inner());
-            if l.added == 0 && !l.prebuilt_changed {
-                continue;
-            }
-            // SAFETY: a buffer of the size the library asks for.
-            let bytes = unsafe {
-                let mut bytes = vec![0u8; l.library.GetSerializedSize()];
-                l.library.Serialize(&mut bytes).map(|()| bytes)
-            };
-            match bytes {
-                Ok(bytes) => {
-                    // Kept beside the bytes it holds for.
-                    let prebuilt = (!l.prebuilt.is_empty()).then(|| list(&tag(&bytes), &l.prebuilt));
-                    (bytes, prebuilt, l.added, l.prebuilt_changed)
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, shard, "host pipeline library shard not serialised");
-                    continue;
-                }
-            }
-        };
-        let written = write_atomically(&dir.join(shard_file(shard)), &blob).and_then(|()| match &prebuilt {
-            Some(list) => write_atomically(&dir.join(prebuilt_file(shard)), list.as_bytes()),
-            None => Ok(()),
-        });
-        match written {
-            Ok(()) => {
-                // Cleared only once the bytes are published, by what was
-                // serialised: a failed write leaves the shard dirty for the
-                // next save, and a store during the write keeps it dirty.
-                let mut l = library.lock().unwrap_or_else(|e| e.into_inner());
-                l.added -= added;
-                l.prebuilt_changed &= !marked;
-                saved += 1;
-                total += blob.len();
-            }
-            Err(e) => tracing::warn!(error = %e, shard, "host pipeline library shard not saved"),
+        if let Some(bytes) = save_shard(dir, shard, library, write_atomically) {
+            saved += 1;
+            total += bytes;
         }
     }
     if used_changed || saved > 0 {
@@ -357,6 +322,52 @@ pub(crate) fn save(now: bool) {
             "host pipeline library saved"
         );
     }
+}
+
+fn save_shard(
+    dir: &std::path::Path,
+    shard: usize,
+    library: &Mutex<Library>,
+    write: impl Fn(&std::path::Path, &[u8]) -> std::io::Result<()>,
+) -> Option<usize> {
+    let (blob, prebuilt, added, prebuilt_count) = {
+        let l = library.lock().unwrap_or_else(|e| e.into_inner());
+        if l.added == 0 && !l.prebuilt_changed {
+            return None;
+        }
+        // SAFETY: a buffer of the size the library asks for.
+        let bytes = unsafe {
+            let mut bytes = vec![0u8; l.library.GetSerializedSize()];
+            l.library.Serialize(&mut bytes).map(|()| bytes)
+        };
+        match bytes {
+            Ok(bytes) => {
+                // Kept beside the bytes it holds for.
+                let prebuilt = (!l.prebuilt.is_empty()).then(|| list(&tag(&bytes), &l.prebuilt));
+                (bytes, prebuilt, l.added, l.prebuilt.len())
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, shard, "host pipeline library shard not serialised");
+                return None;
+            }
+        }
+    };
+
+    let written = write(&dir.join(shard_file(shard)), &blob).and_then(|()| match &prebuilt {
+        Some(list) => write(&dir.join(prebuilt_file(shard)), list.as_bytes()),
+        None => Ok(()),
+    });
+    if let Err(e) = written {
+        tracing::warn!(error = %e, shard, "host pipeline library shard not saved");
+        return None;
+    }
+
+    // Acknowledge only successfully published changes. Updates that arrived
+    // while the write ran must stay dirty for the next save.
+    let mut l = library.lock().unwrap_or_else(|e| e.into_inner());
+    l.added -= added;
+    l.prebuilt_changed = l.prebuilt.len() != prebuilt_count;
+    Some(blob.len())
 }
 
 /// Writes `bytes` to a temporary file beside `path`, then renames it over
@@ -485,6 +496,39 @@ mod tests {
         assert_eq!(listed(saved.as_bytes(), &tag(b"library")), keys);
         assert!(listed(saved.as_bytes(), &tag(b"library2")).is_empty());
         assert!(listed(b"", &tag(b"library")).is_empty());
+    }
+
+    #[test]
+    fn a_prebuilt_key_recorded_during_publication_is_saved_next_time() {
+        let Some(device) = crate::host::host().and_then(|h| h.device.cast::<ID3D12Device1>().ok()) else {
+            return; // no host GPU here
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let mut library = open(&device, Vec::new()).expect("an empty library");
+        library.prebuilt_changed |= library.prebuilt.insert("before".to_owned());
+        let library = Mutex::new(library);
+        let shard = 0;
+        let published_keys = || {
+            let blob = std::fs::read(dir.path().join(shard_file(shard))).unwrap();
+            let records = std::fs::read(dir.path().join(prebuilt_file(shard))).unwrap();
+            listed(&records, &tag(&blob))
+        };
+
+        let first = save_shard(dir.path(), shard, &library, |path, bytes| {
+            // The saver has already captured the keys and released the mutex.
+            {
+                let mut l = library.lock().unwrap();
+                l.prebuilt_changed |= l.prebuilt.insert("during".to_owned());
+            }
+            write_atomically(path, bytes)
+        });
+        assert!(first.is_some());
+        assert_eq!(published_keys(), HashSet::from(["before".to_owned()]));
+
+        let second = save_shard(dir.path(), shard, &library, write_atomically);
+        assert!(second.is_some(), "a key recorded during publication still needs saving");
+        assert_eq!(published_keys(), HashSet::from(["before".to_owned(), "during".to_owned()]));
+        assert!(save_shard(dir.path(), shard, &library, write_atomically).is_none());
     }
 
     #[test]
