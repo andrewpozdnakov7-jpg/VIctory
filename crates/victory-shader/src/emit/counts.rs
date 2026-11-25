@@ -21,9 +21,9 @@ pub struct Counts {
     pub blocks: u64,
     /// Instructions, terminators among them.
     pub instructions: u64,
-    /// The same by kind: LLVM's name of the instruction (the integer name
-    /// for both forms of a binary operation: the record does not tell
-    /// `add` from `fadd`), and for a call the function called.
+    /// Counts by LLVM instruction kind. Integer and floating-point
+    /// instructions with a shared binary opcode use one label such as
+    /// `add/fadd`. Calls are counted by callee name.
     pub kinds: BTreeMap<String, u64>,
 }
 
@@ -193,8 +193,19 @@ impl Module {
         let (kind, value) = match code {
             2 => (
                 *[
-                    "add", "sub", "mul", "udiv", "sdiv", "urem", "srem", "shl", "lshr", "ashr",
-                    "and", "or", "xor",
+                    "add/fadd",
+                    "sub/fsub",
+                    "mul/fmul",
+                    "udiv",
+                    "sdiv/fdiv",
+                    "urem",
+                    "srem/frem",
+                    "shl",
+                    "lshr",
+                    "ashr",
+                    "and",
+                    "or",
+                    "xor",
                 ]
                 .get(op(2)? as usize)
                 .ok_or("a binary opcode")?,
@@ -327,7 +338,10 @@ mod tests {
         let y = m.call(body, load, vec![x]);
         let sum = m.bin(body, Bin::Add, x, y);
         let shifted = m.bin(body, Bin::Shl, sum, one);
-        let f = m.cast(body, Cast::Bitcast, shifted, f32t);
+        let mut f = m.cast(body, Cast::Bitcast, shifted, f32t);
+        for op in [Bin::Add, Bin::Sub, Bin::Mul, Bin::SDiv] {
+            f = m.bin(body, op, f, f);
+        }
         let nan = m.cmp(body, pred::UNO, f, f);
         let big = m.cmp(body, pred::IUGT, shifted, four);
         let both = m.bin(body, Bin::And, nan, big);
@@ -352,7 +366,7 @@ mod tests {
         assert_eq!(
             kinds(&c),
             [
-                ("add", 2),
+                ("add/fadd", 3),
                 ("and", 1),
                 ("atomicrmw", 1),
                 ("bitcast", 1),
@@ -365,15 +379,18 @@ mod tests {
                 ("getelementptr", 1),
                 ("icmp", 2),
                 ("load", 1),
+                ("mul/fmul", 1),
                 ("phi", 1),
                 ("ret", 1),
+                ("sdiv/fdiv", 1),
                 ("select", 1),
                 ("shl", 1),
                 ("store", 1),
+                ("sub/fsub", 1),
             ]
         );
         assert_eq!(c.instructions, c.kinds.values().sum::<u64>());
-        assert_eq!(c.instructions, 23);
+        assert_eq!(c.instructions, 27);
     }
 
     /// Through a whole container, as a shader is handed to the host.
@@ -392,12 +409,12 @@ mod tests {
         let one = Counts {
             blocks: 2,
             instructions: 3,
-            kinds: [("add".to_owned(), 2), ("ret".to_owned(), 1)].into(),
+            kinds: [("add/fadd".to_owned(), 2), ("ret".to_owned(), 1)].into(),
         };
         let mut total = one.clone();
         total.add(&one);
         assert_eq!((total.blocks, total.instructions), (4, 6));
-        assert_eq!(kinds(&total), [("add", 4), ("ret", 2)]);
+        assert_eq!(kinds(&total), [("add/fadd", 4), ("ret", 2)]);
     }
 
     /// What is no module of ours is refused, not miscounted.
