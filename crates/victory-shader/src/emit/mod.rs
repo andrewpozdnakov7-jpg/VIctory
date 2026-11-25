@@ -1228,7 +1228,7 @@ mod tests {
         Ok(out)
     }
 
-    fn p10_input_signature() -> Vec<u8> {
+    fn packed_interp_input_signature() -> Vec<u8> {
         let element = SigElement {
             name: "TEXCOORD".into(),
             index: 0,
@@ -1255,7 +1255,7 @@ mod tests {
         )
     }
 
-    fn emit_p10_fixture(
+    fn emit_interp_mov_fixture(
         reads: &[u32],
         export: u32,
         input_addr: u32,
@@ -1272,53 +1272,57 @@ mod tests {
                 ..texcoord(false)
             }],
             input_addr,
-            &p10_input_signature(),
+            &packed_interp_input_signature(),
             &rows(&[("SV_Target", 16, false)], false),
         )
     }
 
     #[test]
-    fn isolated_p10_preserves_packed_input_linkage() {
-        let shader = emit_p10_fixture(&[0xC812_0000], 0x0404_0404, 0).unwrap();
-        let c = Container::parse(&shader.dxil).unwrap();
-        let input = c.part(FourCC::ISG1).unwrap().data;
-        let mut expected = p10_input_signature();
-        // TEXCOORD0.x is used. The declaration and order of both elements stay intact.
-        expected[8 + 32 + 25] = 1;
-        assert_eq!(input, expected);
-        let psv = c.part(FourCC::PSV0).unwrap().data;
-        for packed_columns in [0x53, 0x41] {
-            assert!(psv.windows(6).any(|w| w == [1, 0, packed_columns, 0, 3, 1]));
+    fn isolated_coefficients_preserve_packed_input_linkage() {
+        for selector in 0..=1 {
+            let shader = emit_interp_mov_fixture(&[0xC812_0000 | selector], 0x0404_0404, 0).unwrap();
+            let c = Container::parse(&shader.dxil).unwrap();
+            let input = c.part(FourCC::ISG1).unwrap().data;
+            let mut expected = packed_interp_input_signature();
+            // TEXCOORD0.x is used. The declaration and order of both elements stay intact.
+            expected[8 + 32 + 25] = 1;
+            assert_eq!(input, expected);
+            let psv = c.part(FourCC::PSV0).unwrap().data;
+            for packed_columns in [0x53, 0x41] {
+                assert!(psv.windows(6).any(|w| w == [1, 0, packed_columns, 0, 3, 1]));
+            }
+            let features = c.part(FourCC::SFI0).unwrap().data;
+            assert_ne!(crate::dxbc::u32_at(features, 0).unwrap() & 0x2_0000, 0);
         }
-        let features = c.part(FourCC::SFI0).unwrap().data;
-        assert_ne!(crate::dxbc::u32_at(features, 0).unwrap() & 0x2_0000, 0);
     }
 
     #[test]
-    fn isolated_p10_rejects_incompatible_live_interpolation() {
-        let e = emit_p10_fixture(
-            &[0xC812_0000, 0xC808_0100, 0xC809_0101],
-            0x0204_0204,
-            1 << 1,
-        )
-        .err()
-        .unwrap();
-        assert!(
-            matches!(
-                e,
-                ShaderError::Unsupported {
-                    offset: 0,
-                    what: "isolated P10 sharing an input row with a different interpolation mode",
-                }
-            ),
-            "{e}"
-        );
+    fn isolated_coefficients_reject_incompatible_live_interpolation() {
+        for selector in 0..=1 {
+            let e = emit_interp_mov_fixture(
+                &[0xC812_0000 | selector, 0xC808_0100, 0xC809_0101],
+                0x0204_0204,
+                1 << 1,
+            )
+            .err()
+            .unwrap();
+            assert!(
+                matches!(
+                    e,
+                    ShaderError::Unsupported {
+                        offset: 0,
+                        what: "isolated coefficient sharing an input row with a different interpolation mode",
+                    }
+                ),
+                "{e}"
+            );
+        }
     }
 
     #[test]
-    fn isolated_p10_controls_keep_p0_and_p1_p2() {
-        let p0 = emit_p10_fixture(&[0xC812_0002], 0x0404_0404, 0).unwrap();
-        let pair = emit_p10_fixture(&[0xC808_0100, 0xC809_0101], 0x0202_0202, 1 << 1).unwrap();
+    fn coefficient_controls_keep_p0_and_p1_p2() {
+        let p0 = emit_interp_mov_fixture(&[0xC812_0002], 0x0404_0404, 0).unwrap();
+        let pair = emit_interp_mov_fixture(&[0xC808_0100, 0xC809_0101], 0x0202_0202, 1 << 1).unwrap();
         for (shader, mode) in [(p0, 1), (pair, 2)] {
             let c = Container::parse(&shader.dxil).unwrap();
             let psv = c.part(FourCC::PSV0).unwrap().data;
@@ -1331,26 +1335,12 @@ mod tests {
             let features = c.part(FourCC::SFI0).unwrap().data;
             assert_eq!(crate::dxbc::u32_at(features, 0).unwrap() & 0x2_0000, 0);
         }
-
-        let p20 = emit_p10_fixture(&[0xC812_0001], 0x0404_0404, 0)
-            .err()
-            .unwrap();
-        assert!(
-            matches!(
-                p20,
-                ShaderError::Unsupported {
-                    what: "a non-provoking vertex value",
-                    ..
-                }
-            ),
-            "{p20}"
-        );
     }
 
     #[cfg(windows)]
     #[test]
     #[ignore = "requires Windows DXC, the DXIL validator and WARP"]
-    fn isolated_p10_and_p0_draw_with_a_packed_signature() {
+    fn isolated_coefficients_and_p0_draw_with_a_packed_signature() {
         use super::host::{Draw, Host};
         use windows::Win32::Graphics::Direct3D12::D3D12_SHADER_VISIBILITY_PIXEL;
         use windows::Win32::Graphics::Dxgi::*;
@@ -1404,30 +1394,36 @@ mod tests {
             [1.0, -1.0, 0.5, 1.0, 0.75, 0.0, 0.0, 0.0],
             [0.0, 1.0, 0.5, 1.0, 0.125, 0.0, 0.0, 0.0],
         ];
-        for (name, operand, expected) in [("P10", 0, 0.5), ("P0", 2, 0.25)] {
-            let mut ps = emit_p10_fixture(&[0xC812_0000 | operand], 0x0404_0404, 0).unwrap();
+        let mut clipped = vertices;
+        clipped[0][0] = -2.0;
+        for (name, operand, expected) in
+            [("P10", 0, 0.5), ("P20", 1, -0.125), ("P0", 2, 0.25)]
+        {
+            let mut ps = emit_interp_mov_fixture(&[0xC812_0000 | operand], 0x0404_0404, 0).unwrap();
             validator.validate(&mut ps.dxil).unwrap();
             let root = host
                 .root_signature_for(&[(&ps, D3D12_SHADER_VISIBILITY_PIXEL)])
                 .unwrap();
             let pso = host.pipeline_with(&root, &vs, &ps.dxil).unwrap();
-            let pixels = host
-                .draw(
-                    &root,
-                    &pso,
-                    &Draw {
-                        roots: Vec::new(),
-                        textures: &[],
-                        samplers: &[],
-                        vertices: vertices.as_flattened(),
-                        stride: 32,
-                        size: (1, 1),
-                        mesh_groups: 0,
-                    },
-                )
-                .unwrap();
-            eprintln!("{name}: DXIL validated, SV_Target0.r = {}", pixels[0][0]);
-            assert_eq!(pixels[0][0], expected, "{name}");
+            for (shape, input) in [("unclipped", &vertices), ("clipped", &clipped)] {
+                let pixels = host
+                    .draw(
+                        &root,
+                        &pso,
+                        &Draw {
+                            roots: Vec::new(),
+                            textures: &[],
+                            samplers: &[],
+                            vertices: input.as_flattened(),
+                            stride: 32,
+                            size: (1, 1),
+                            mesh_groups: 0,
+                        },
+                    )
+                    .unwrap();
+                eprintln!("{name} {shape}: DXIL validated, SV_Target0.r = {}", pixels[0][0]);
+                assert_eq!(pixels[0][0], expected, "{name} {shape}");
+            }
         }
     }
 
