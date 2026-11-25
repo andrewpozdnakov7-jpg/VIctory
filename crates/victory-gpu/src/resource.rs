@@ -1908,6 +1908,111 @@ mod tests {
         }
     }
 
+    /// Subresource 1 names the second source slice but the first destination
+    /// slice's smaller mip. Both are eight-byte blocks, so the footprint
+    /// alone cannot tell those subresources apart.
+    #[cfg(windows)]
+    #[test]
+    fn alias_copy_does_not_write_a_slice_into_another_mip() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_BC1_UNORM, DXGI_FORMAT_R32G32_UINT};
+
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let backing = Memory::zeroed(1 << 20, 1 << 16).unwrap();
+        let null = std::ptr::null();
+        let place = |desc: &ResourceDesc| {
+            let mut made = null;
+            assert_eq!(
+                create_at_address(
+                    null, backing.address(), desc, 0, std::ptr::null(), &RESOURCE_IIDS[0],
+                    &mut made,
+                ),
+                S_OK
+            );
+            made
+        };
+        let from = place(&ResourceDesc {
+            depth_or_array_size: 2,
+            layout: 1,
+            flags: UNORDERED,
+            ..texture(1, 1, DXGI_FORMAT_R32G32_UINT.0 as u32, 1)
+        });
+        let to = place(&ResourceDesc {
+            depth_or_array_size: 2,
+            layout: 1,
+            ..texture(4, 4, DXGI_FORMAT_BC1_UNORM.0 as u32, 2)
+        });
+        assert_eq!(alias_source(to), Some(from));
+        let source = host_resource(from).expect("two source slices");
+        let dest = host_resource(to).expect("destination mip array");
+        let footprints = |resource: &ID3D12Resource, n: usize| {
+            let mut layouts = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); n];
+            let mut total = 0;
+            // SAFETY: live resource, with space for all requested footprints.
+            unsafe {
+                host.device.GetCopyableFootprints(
+                    &resource.GetDesc(), 0, n as u32, 0, Some(layouts.as_mut_ptr()),
+                    None, None, Some(&mut total),
+                );
+            }
+            (layouts, total)
+        };
+        let (from_layouts, from_bytes) = footprints(source, 2);
+        let (to_layouts, to_bytes) = footprints(dest, 4);
+        let (from_upload, from_data) = host.upload_buffer(from_bytes).unwrap();
+        let (to_upload, to_data) = host.upload_buffer(to_bytes).unwrap();
+        let (out, out_data) = host.shared_buffer(to_bytes).unwrap();
+        let list = host.new_list().unwrap();
+        let sub = |resource: &ID3D12Resource, i: usize| D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: copy locations borrow their resources' COM pointers.
+            pResource: unsafe { std::mem::transmute_copy(resource) },
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: i as u32 },
+        };
+        let placed = |buffer: &ID3D12Resource, fp| D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: as above.
+            pResource: unsafe { std::mem::transmute_copy(buffer) },
+            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: fp },
+        };
+        let upload = |view, resource, buffer, mapped: *mut u8,
+                      layouts: &[D3D12_PLACED_SUBRESOURCE_FOOTPRINT], blocks: &[u64]| {
+            crate::list::ensure_state(&list, view, D3D12_RESOURCE_STATE_COPY_DEST.0 as u32);
+            for (i, (&fp, &block)) in layouts.iter().zip(blocks).enumerate() {
+                // SAFETY: one complete eight-byte block per subresource,
+                // in its mapped footprint. The live texture is a copy destination.
+                unsafe {
+                    mapped.add(fp.Offset as usize).cast::<u64>().write_unaligned(block);
+                    list.list.CopyTextureRegion(&sub(resource, i), 0, 0, 0, &placed(buffer, fp), None);
+                }
+            }
+        };
+        const BLUE: u64 = 0x001f;
+        const RED: u64 = 0xf800;
+        const GREEN: u64 = 0x07e0;
+        upload(from, source, &from_upload, from_data, &from_layouts, &[RED, GREEN]);
+        upload(to, dest, &to_upload, to_data, &to_layouts, &[BLUE; 4]);
+        crate::texture::alias_copy(&list, from, to);
+        crate::list::ensure_state(&list, to, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32);
+        for (i, &fp) in to_layouts.iter().enumerate() {
+            // SAFETY: a live texture in COPY_SOURCE and matching buffer footprint.
+            unsafe { list.list.CopyTextureRegion(&placed(&out, fp), 0, 0, 0, &sub(dest, i), None) };
+        }
+        list.close();
+        host.execute(&[&list]);
+        let got: Vec<u64> = to_layouts.iter().map(|fp| {
+            // SAFETY: an eight-byte block in the mapped copy output, after its fence.
+            unsafe { out_data.add(fp.Offset as usize).cast::<u64>().read_unaligned() }
+        }).collect();
+        for resource in [to, from] {
+            assert_eq!(slot::<Release>(resource, 0x10)(resource), 0);
+        }
+        assert_eq!(got[1], BLUE, "first slice's second mip kept its blue BC1 block, got {got:x?}");
+    }
+
+
     fn heap(size: u64) -> This {
         let desc = HeapDesc {
             size,
