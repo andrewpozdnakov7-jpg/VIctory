@@ -8347,7 +8347,7 @@ impl<'a> Lower<'a> {
     /// texels at float coordinate `f`: `floor(u × size − 0.5)` (or
     /// `floor(u − 0.5)` when `unnormalized`) with the product exact and
     /// rounded to 1/256 of a texel, half up, as the hardware does, i.e.
-    /// `(floor(u × mul × 512) − 255) >> 9`, in 64-bit integers.
+    /// `(floor(u × mul × 512) − 255) >> 9` with a split product.
     ///
     /// For periodic modes (`WRAP`, `MIRROR`) exact integer-period reduction
     /// (`u - trunc(u)` or `u - 2 * trunc(u * 0.5)`) keeps the coordinate in
@@ -8412,40 +8412,55 @@ impl<'a> Lower<'a> {
         // u × mul_size × 512 = m × mul_size × 2^(e − 141).
         let k141 = k(self, 141);
         let shift = self.s.m.bin(c, Bin::Sub, k141, e);
-        let i64t = self.s.m.int(64);
-        self.s.flags |= flags::INT64;
-        let m = self.s.m.cast(c, Cast::ZExt, m, i64t);
-        let n = self.s.m.cast(c, Cast::ZExt, mul_size, i64t);
-        let p = self.s.m.bin(c, Bin::Mul, m, n);
-        let z64 = self.s.m.int_const(i64t, 0);
-        let neg = self.s.m.bin(c, Bin::Sub, z64, p);
+        let neg = self.s.m.bin(c, Bin::Sub, zero, m);
         let negative = self.s.m.cmp(c, pred::SLT, x, zero);
-        let p = self.s.m.select(c, negative, neg, p);
-        let k63 = k(self, 63);
-        let far = self.s.m.cmp(c, pred::SGT, shift, k63);
-        let g = if unnormalized {
-            // `|f| <= 65536` gives `e <= 143`, so `shift` may be `-2` or `-1`.
-            let left_shift = self.s.m.cmp(c, pred::SLT, shift, zero);
-            let rsh = self.s.m.select(c, far, k63, shift);
-            let rsh = self.s.m.select(c, left_shift, zero, rsh);
-            let rsh = self.s.m.cast(c, Cast::ZExt, rsh, i64t);
-            let right_val = self.s.m.bin(c, Bin::AShr, p, rsh);
-            let neg_sh = self.s.m.bin(c, Bin::Sub, zero, shift);
-            let lsh = self.s.m.select(c, left_shift, neg_sh, zero);
-            let lsh = self.s.m.cast(c, Cast::ZExt, lsh, i64t);
-            let left_val = self.s.m.bin(c, Bin::Shl, p, lsh);
-            self.s.m.select(c, left_shift, left_val, right_val)
-        } else {
-            // `|f| <= 64` keeps `e <= 133`, so `shift >= 8`.
-            let shift = self.s.m.select(c, far, k63, shift);
-            let shift = self.s.m.cast(c, Cast::ZExt, shift, i64t);
-            self.s.m.bin(c, Bin::AShr, p, shift)
+        let m = self.s.m.select(c, negative, neg, m);
+
+        // A texture axis is at most 16384 texels. Split the signed product at
+        // bit 16 so both partial products fit in i32, including the low carry.
+        let (k16, mask16, k31) = (k(self, 16), k(self, 0xFFFF), k(self, 31));
+        let low = self.s.m.bin(c, Bin::And, m, mask16);
+        let low = self.s.m.bin(c, Bin::Mul, low, mul_size);
+        let carry = self.s.m.bin(c, Bin::LShr, low, k16);
+        let low = self.s.m.bin(c, Bin::And, low, mask16);
+        let high = self.s.m.bin(c, Bin::AShr, m, k16);
+        let high = self.s.m.bin(c, Bin::Mul, high, mul_size);
+        let high = self.s.m.bin(c, Bin::Add, high, carry);
+
+        const IMAX: u32 = 37;
+        const IMIN: u32 = 38;
+        let bound = |l: &mut Self, op, a, b| {
+            l.s.op(c, "binary.i32", Attr::ReadNone, l.s.t.i32, op, &[a, b])
         };
-        let k255 = self.s.m.int_const(i64t, 255);
+        // The high word carries the sign, so shifting it also floors negative
+        // products. Clamp each shift to keep it within an i32.
+        let right = if unnormalized {
+            bound(self, IMAX, shift, zero)
+        } else {
+            shift
+        };
+        let low_right = bound(self, IMIN, right, k16);
+        let low = self.s.m.bin(c, Bin::LShr, low, low_right);
+        let high_right = self.s.m.bin(c, Bin::Sub, right, k16);
+        let high_right = bound(self, IMAX, high_right, zero);
+        let high_right = bound(self, IMIN, high_right, k31);
+        let high = self.s.m.bin(c, Bin::AShr, high, high_right);
+        let high_left = self.s.m.bin(c, Bin::Sub, k16, right);
+        let high_left = bound(self, IMAX, high_left, zero);
+        let high = self.s.m.bin(c, Bin::Shl, high, high_left);
+        let g = self.s.m.bin(c, Bin::Or, high, low);
+        let g = if unnormalized {
+            // At |u| >= 32768 the exponent can require a left shift by 1 or 2.
+            let left = self.s.m.bin(c, Bin::Sub, zero, shift);
+            let left = bound(self, IMAX, left, zero);
+            self.s.m.bin(c, Bin::Shl, g, left)
+        } else {
+            g
+        };
+        // |u × mul_size × 512| is at most 2^29 after coordinate reduction.
+        let (k255, k9) = (k(self, 255), k(self, 9));
         let g = self.s.m.bin(c, Bin::Sub, g, k255);
-        let k9 = self.s.m.int_const(i64t, 9);
-        let g = self.s.m.bin(c, Bin::AShr, g, k9);
-        self.s.m.cast(c, Cast::Trunc, g, self.s.t.i32)
+        self.s.m.bin(c, Bin::AShr, g, k9)
     }
 
     /// Like [`Self::whole`], for a 16-bit float stored in the low (`!hi`) or

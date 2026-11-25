@@ -874,16 +874,16 @@ fn gathers_at_a_level_address_modes_and_borders_match_reference_and_hardware() {
 /// address VGPR) on the host GPU and WARP.
 #[test]
 fn gathers_at_a_level_support_a16_d16_unorm_and_2d_arrays() {
-    // 16x16 2D array with 3 mip levels and 4 slices; unique value per
-    // (slice, level, y, x).
+    // A wide NPOT array exercises the high part of the coordinate product.
+    let (array_w, array_h) = (16381u32, 4u32);
     let (w0, h0, levels, slices) = (16u32, 16u32, 3u32, 4u32);
     let mut array_texels = Vec::new();
     for s in 0..slices {
         for l in 0..levels {
-            let (w, h) = (w0 >> l, h0 >> l);
+            let (w, h) = (array_w >> l, array_h >> l);
             for y in 0..h {
                 for x in 0..w {
-                    let val = (s * 400 + l * 100 + y * 16 + x + 1) as f32;
+                    let val = (((s * levels + l) * array_h + y) * array_w + x + 1) as f32;
                     array_texels.push([val, val + 0.5, 0.0, 1.0]);
                 }
             }
@@ -891,9 +891,13 @@ fn gathers_at_a_level_support_a16_d16_unorm_and_2d_arrays() {
     }
     let array_texel = |s: i64, l: u32, cx: i64, cy: i64, mode: u32, border: u32| -> f32 {
         let s = s.clamp(0, i64::from(slices) - 1) as u32;
-        let (w, h) = (i64::from(w0 >> l), i64::from(h0 >> l));
-        let per_slice: usize = (0..levels).map(|k| ((w0 >> k) * (h0 >> k)) as usize).sum();
-        let skip: usize = (0..l).map(|k| ((w0 >> k) * (h0 >> k)) as usize).sum();
+        let (w, h) = (i64::from(array_w >> l), i64::from(array_h >> l));
+        let per_slice: usize = (0..levels)
+            .map(|k| ((array_w >> k) * (array_h >> k)) as usize)
+            .sum();
+        let skip: usize = (0..l)
+            .map(|k| ((array_w >> k) * (array_h >> k)) as usize)
+            .sum();
         let bval = if border == 2 { 1.0 } else { 0.0 };
         match (gather_addr_ref(cx, w, mode), gather_addr_ref(cy, h, mode)) {
             (Some(x), Some(y)) => {
@@ -1169,7 +1173,7 @@ fn gathers_at_a_level_support_a16_d16_unorm_and_2d_arrays() {
                 &Dispatch {
                     roots: vec![(0, Root::Constants(ud))],
                     views: &[
-                        View::MippedArray(w0, h0, levels, slices, &array_texels),
+                        View::MippedArray(array_w, array_h, levels, slices, &array_texels),
                         View::Buffer {
                             data: &input_arr,
                             stride: Stride::Raw,
@@ -1183,7 +1187,7 @@ fn gathers_at_a_level_support_a16_d16_unorm_and_2d_arrays() {
             .unwrap_or_else(|e| panic!("{backend}/2d_array: dispatch failed: {e}"));
         for (lane, &(u, v, s, raw_lvl)) in rec_arr.iter().enumerate() {
             let lvl = raw_lvl.min(levels - 1);
-            let (w, h) = (w0 >> lvl, h0 >> lvl);
+            let (w, h) = (array_w >> lvl, array_h >> lvl);
             let x = gather_first_ref(u, w, 6, false);
             let y = gather_first_ref(v, h, 6, false);
             let si = slice_ref(s);
@@ -1210,6 +1214,17 @@ fn gathers_at_a_level_support_a16_d16_unorm_and_2d_arrays() {
         ran += 1;
     }
     assert!(ran > 0, "no device");
+    for shader in [&shader_2d, &shader_arr] {
+        let container = crate::Container::parse(&shader.dxil).unwrap();
+        let features = container.part(crate::FourCC::SFI0).unwrap();
+        let flags = u64::from_le_bytes(features.data[..8].try_into().unwrap());
+        const INT64_SHADER_OPS: u64 = 0x8000;
+        assert_eq!(
+            flags & INT64_SHADER_OPS,
+            0,
+            "gather requires Int64ShaderOps"
+        );
+    }
 }
 
 /// Unsupported sampler features (half-border, custom border on a border mode,
