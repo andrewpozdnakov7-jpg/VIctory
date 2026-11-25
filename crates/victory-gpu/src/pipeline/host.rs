@@ -812,6 +812,305 @@ fn root_signature(
 mod tests {
     use super::*;
 
+    #[test]
+    fn cpu_rectangle_accepts_a_vertex_view_without_trailing_padding() {
+        let Some(host) = host() else {
+            eprintln!("no D3D12 host; skipped");
+            return;
+        };
+        let red = [1.0, 0.0, 0.0, 1.0];
+        let clear = [0.0; 4];
+        let draw = |topology, size| draw_from_padded_vertices(host, topology, size);
+        assert_eq!(draw(4, 56), [red, clear], "triangle with no trailing padding");
+        assert_eq!(draw(17, 64), [red, red], "fully padded rectangle");
+        assert_eq!(draw(17, 55), [clear, clear], "incomplete last position");
+        assert_eq!(draw(17, 56), [red, red], "rectangle with no trailing padding");
+    }
+
+    fn draw_from_padded_vertices(
+        host: &crate::host::Host,
+        topology: u32,
+        position_size: u32,
+    ) -> [[f32; 4]; 2] {
+        use crate::object::{S_OK, This, guid, slot};
+        use victory_shader::{HwStage, emit::HostShader};
+        use windows::Win32::Foundation::RECT;
+        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+        use windows::core::s;
+
+        let source = b"
+struct Vertex { float4 position : SV_Position; float4 color : COLOR; };
+Vertex vs(float2 position : POSITION, float4 color : COLOR) {
+    Vertex output;
+    output.position = float4(position, 0.5, 1);
+    output.color = color;
+    return output;
+}
+float4 ps(Vertex input) : SV_Target { return input.color; }
+";
+        let compile = |stage, kind, entry, target| {
+            let mut code: Option<ID3DBlob> = None;
+            // SAFETY: the source, names and output pointer are live.
+            unsafe {
+                D3DCompile(
+                    source.as_ptr().cast(),
+                    source.len(),
+                    s!("rectangle_tail"),
+                    None,
+                    None,
+                    entry,
+                    target,
+                    0,
+                    0,
+                    &mut code,
+                    None,
+                )
+            }
+            .unwrap();
+            let code = code.unwrap();
+            // SAFETY: these bytes are owned by the live compiler blob.
+            let bytes = unsafe {
+                std::slice::from_raw_parts(
+                    code.GetBufferPointer().cast::<u8>(),
+                    code.GetBufferSize(),
+                )
+            };
+            let shader = Shader::new(stage, bytes);
+            assert!(
+                shader
+                    .translated
+                    .set(Some(Translated {
+                        host: HostShader {
+                            stage: kind,
+                            dxil: bytes.to_vec(),
+                            user_data: Vec::new(),
+                            samplers: Vec::new(),
+                            static_samplers: Vec::new(),
+                            root_cbvs: Vec::new(),
+                            root_srvs: Vec::new(),
+                            root_uavs: Vec::new(),
+                            memory: false,
+                            memory_writes: false,
+                            view_addresses: false,
+                            heap: false,
+                            heap_writes: false,
+                            view_marks: false,
+                        },
+                        used: Vec::new(),
+                    }))
+                    .is_ok()
+            );
+            Arc::new(shader)
+        };
+        let shaders = vec![
+            compile("vertex", HwStage::Vs, s!("vs"), s!("vs_5_1")),
+            compile("pixel", HwStage::Ps, s!("ps"), s!("ps_5_1")),
+        ];
+        let format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+        let mut graphics = Box::new(GraphicsState::default());
+        graphics.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        graphics.rasterizer.CullMode = D3D12_CULL_MODE_NONE;
+        graphics.depth.DepthEnable = false.into();
+        graphics.targets.NumRenderTargets = 1;
+        graphics.targets.RTFormats[0] = format;
+        graphics.inputs = vec![
+            D3D12_INPUT_ELEMENT_DESC {
+                SemanticName: s!("POSITION"),
+                ..element(DXGI_FORMAT_R32G32_FLOAT, 0)
+            },
+            D3D12_INPUT_ELEMENT_DESC {
+                SemanticName: s!("COLOR"),
+                InputSlot: 1,
+                ..element(DXGI_FORMAT_R8G8B8A8_UNORM, 0)
+            },
+        ];
+        let null = std::ptr::null();
+        let mut pipeline = null;
+        assert_eq!(
+            super::super::hand_out(
+                shaders,
+                Some(graphics),
+                &super::super::PIPELINE_IIDS[0],
+                &mut pipeline
+            ),
+            S_OK
+        );
+        assert!(!super::super::host_pipeline(pipeline).unwrap().rectangles);
+
+        let position = crate::resource::test_buffer(u64::from(position_size.max(56)));
+        let color = crate::resource::test_buffer(256);
+        let address = |buffer| crate::resource::buffer_bytes(buffer).unwrap().0;
+        // SAFETY: each allocation holds four test vertices.
+        unsafe {
+            let positions = [[0.0f32, 0.0], [-1.0, 1.0], [-1.0, -1.0], [1.0, 1.0]];
+            for (i, xy) in positions.into_iter().enumerate() {
+                address(position).add(i * 16).cast::<[f32; 2]>().write_unaligned(xy);
+            }
+            address(color)
+                .cast::<[[u8; 4]; 4]>()
+                .write_unaligned([[255, 0, 0, 255]; 4]);
+        }
+        let allocator_iid = guid(
+            0x6102dee4,
+            0xaf59,
+            0x4b09,
+            [0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24],
+        );
+        let list_iid = guid(
+            0x5b160d0f,
+            0xac1b,
+            0x4185,
+            [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55],
+        );
+        let (mut allocator, mut guest) = (null, null);
+        assert_eq!(
+            crate::list::create_allocator(null, 0, &allocator_iid, &mut allocator),
+            S_OK
+        );
+        assert_eq!(
+            crate::list::create_list(null, 0, 0, allocator, pipeline, &list_iid, &mut guest),
+            S_OK
+        );
+        let list = crate::list::host_list(guest).unwrap();
+        #[repr(C)]
+        struct Vb {
+            address: u64,
+            size: u32,
+            stride: u32,
+        }
+        let views = [
+            Vb {
+                address: address(position) as u64,
+                size: position_size,
+                stride: 16,
+            },
+            Vb {
+                address: address(color) as u64,
+                size: 16,
+                stride: 4,
+            },
+        ];
+        slot::<extern "system" fn(This, u32, u32, *const Vb)>(guest, 0x180)(
+            guest,
+            0,
+            2,
+            views.as_ptr(),
+        );
+        crate::list::with_state(guest, |list, state| {
+            state.set_topology(list, topology);
+            state.viewports(
+                list,
+                &[D3D12_VIEWPORT {
+                    Width: 2.0,
+                    Height: 2.0,
+                    MaxDepth: 1.0,
+                    ..Default::default()
+                }],
+            );
+            state.scissors(
+                list,
+                &[RECT {
+                    right: 2,
+                    bottom: 2,
+                    ..Default::default()
+                }],
+            );
+        });
+
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 2,
+            Height: 2,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: format,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+            ..Default::default()
+        };
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let mut target: Option<ID3D12Resource> = None;
+        let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+        let mut total = 0;
+        // SAFETY: live descriptions and space for one footprint and texture.
+        unsafe {
+            host.device
+                .CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    None,
+                    &mut target,
+                )
+                .unwrap();
+            host.device.GetCopyableFootprints(
+                &desc,
+                0,
+                1,
+                0,
+                Some(&mut footprint),
+                None,
+                None,
+                Some(&mut total),
+            );
+        }
+        let target = target.unwrap();
+        let rtv = host.rtv(&target, None);
+        let (readback, data) = host.shared_buffer(total).unwrap();
+        // SAFETY: live view of the texture in the render-target state.
+        unsafe {
+            list.list.OMSetRenderTargets(1, Some(&rtv), false, None);
+            list.list.ClearRenderTargetView(rtv, &[0.0; 4], None);
+        }
+        slot::<extern "system" fn(This, u32, u32, u32, u32)>(guest, 0x60)(guest, 3, 1, 1, 0);
+        // SAFETY: recording the transition and copy into live resources.
+        unsafe {
+            list.list.ResourceBarrier(&[crate::host::transition(
+                &target,
+                D3D12_RESOURCE_STATE_RENDER_TARGET,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            let src = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&target),
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    SubresourceIndex: 0,
+                },
+            };
+            let dst = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&readback),
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    PlacedFootprint: footprint,
+                },
+            };
+            list.list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+        }
+        assert_eq!(
+            slot::<extern "system" fn(This) -> i32>(guest, 0x48)(guest),
+            S_OK
+        );
+        host.execute(&[list]);
+        let texel = |x: usize, y: usize| {
+            let offset =
+                footprint.Offset as usize + y * footprint.Footprint.RowPitch as usize + x * 16;
+            // SAFETY: the texture copy finished and this texel is within the mapped buffer.
+            unsafe { data.add(offset).cast::<[f32; 4]>().read_unaligned() }
+        };
+        let actual = [texel(0, 0), texel(1, 1)];
+        for o in [guest, allocator, pipeline, position, color] {
+            assert_eq!(slot::<extern "system" fn(This) -> u32>(o, 0x10)(o), 0);
+        }
+        actual
+    }
+
     fn element(format: DXGI_FORMAT, offset: u32) -> D3D12_INPUT_ELEMENT_DESC {
         D3D12_INPUT_ELEMENT_DESC {
             SemanticName: PCSTR(c"TEXCOORD".as_ptr().cast()),

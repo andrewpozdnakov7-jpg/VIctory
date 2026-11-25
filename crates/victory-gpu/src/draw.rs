@@ -43,18 +43,35 @@ pub(crate) struct VertexView {
     stride: u32,
 }
 
-fn rectangle_vertex_range(v: VertexView, count: u32, first: u32) -> Option<(u64, u64, u32)> {
+fn rectangle_vertex_range(
+    v: VertexView,
+    count: u32,
+    first: u32,
+    elements: &[(u32, u32)],
+) -> Option<(u64, u64, u32)> {
     if v.address == 0 || v.stride == 0 {
         return None;
     }
     let stride = u64::from(v.stride);
     let end_bytes = (u64::from(first) + u64::from(count)).checked_mul(stride)?;
-    if end_bytes > u64::from(v.size) {
-        return None;
+    let missing = end_bytes.saturating_sub(u64::from(v.size));
+    if missing != 0 {
+        // The last vertex can end at its last element, before stride padding.
+        let used = elements
+            .iter()
+            .map(|&(offset, format)| {
+                crate::resource::element(format)
+                    .map_or(stride, |(bytes, _)| u64::from(offset) + bytes)
+            })
+            .max()
+            .unwrap_or(stride);
+        if count < 3 || !count.is_multiple_of(3) || missing > stride.saturating_sub(used) {
+            return None;
+        }
     }
     let from = v.address.checked_add(u64::from(first) * stride)?;
     let rects = u64::from(count / 3);
-    let src_bytes = rects.checked_mul(3)?.checked_mul(stride)?;
+    let src_bytes = rects.checked_mul(3)?.checked_mul(stride)?.checked_sub(missing)?;
     from.checked_add(src_bytes)?;
     let dst_bytes = u32::try_from(rects.checked_mul(6)?.checked_mul(stride)?).ok()?;
     Some((from, src_bytes, dst_bytes))
@@ -1572,7 +1589,7 @@ impl State {
                 continue;
             }
             let v = self.vertex[slot as usize];
-            let Some((from, src_bytes, dst_bytes)) = rectangle_vertex_range(v, count, first)
+            let Some((from, src_bytes, dst_bytes)) = rectangle_vertex_range(v, count, first, &elements)
                 .filter(|&(from, src_bytes, _)| crate::shadow::find(from, src_bytes).is_some())
             else {
                 once!(slot, "rectangle vertices outside their buffer");
@@ -1987,15 +2004,18 @@ mod tests {
     #[test]
     fn rectangle_vertex_range_valid() {
         assert_eq!(
-            rectangle_vertex_range(RECTANGLE_VIEW, 3, 1),
+            rectangle_vertex_range(RECTANGLE_VIEW, 3, 1, &[]),
             Some((0x1000_0010, 48, 96))
         );
     }
 
     #[test]
     fn rectangle_vertex_range_rejects_vertex_index_overflow() {
-        assert_eq!(rectangle_vertex_range(RECTANGLE_VIEW, 3, u32::MAX - 2), None);
-        assert_eq!(rectangle_vertex_range(RECTANGLE_VIEW, u32::MAX, 1), None);
+        assert_eq!(
+            rectangle_vertex_range(RECTANGLE_VIEW, 3, u32::MAX - 2, &[]),
+            None
+        );
+        assert_eq!(rectangle_vertex_range(RECTANGLE_VIEW, u32::MAX, 1, &[]), None);
     }
 
     #[test]
@@ -2004,8 +2024,8 @@ mod tests {
             address: u64::MAX - 15,
             ..RECTANGLE_VIEW
         };
-        assert_eq!(rectangle_vertex_range(view, 3, 1), None);
-        assert_eq!(rectangle_vertex_range(view, 3, 0), None);
+        assert_eq!(rectangle_vertex_range(view, 3, 1, &[]), None);
+        assert_eq!(rectangle_vertex_range(view, 3, 0, &[]), None);
     }
 
     #[test]
@@ -2015,7 +2035,7 @@ mod tests {
             stride: u32::MAX,
             ..RECTANGLE_VIEW
         };
-        assert_eq!(rectangle_vertex_range(view, u32::MAX, u32::MAX), None);
+        assert_eq!(rectangle_vertex_range(view, u32::MAX, u32::MAX, &[]), None);
     }
 
     #[test]
@@ -2026,7 +2046,7 @@ mod tests {
                 stride,
                 ..RECTANGLE_VIEW
             };
-            assert_eq!(rectangle_vertex_range(view, 3, 0), None);
+            assert_eq!(rectangle_vertex_range(view, 3, 0, &[]), None);
         }
     }
 

@@ -24,28 +24,35 @@ pub(crate) fn expand_rects(src: &[u8], dst: &mut [u8], stride: usize, elements: 
     let (Some(in_rect), Some(out_rect)) = (stride.checked_mul(3), stride.checked_mul(6)) else {
         return;
     };
-    for (rect, out) in src
-        .chunks_exact(in_rect)
-        .zip(dst.chunks_exact_mut(out_rect))
-    {
-        let v = |i: usize| &rect[i * stride..(i + 1) * stride];
+    for (rect, out) in src.chunks(in_rect).zip(dst.chunks_exact_mut(out_rect)) {
+        // The last vertex can have all of its elements with fewer than stride bytes.
+        let Some(last) = rect.get(2 * stride..).filter(|last| !last.is_empty()) else {
+            break;
+        };
+        let vertices = [&rect[..stride], &rect[stride..2 * stride], last];
+        let v = |i: usize| vertices[i];
+        let copy_vertex = |to: &mut [u8], from: &[u8]| {
+            let (data, padding) = to.split_at_mut(from.len());
+            data.copy_from_slice(from);
+            padding.fill(0);
+        };
         let right = elements
             .iter()
             .find_map(|&(offset, format)| {
                 let at = offset as usize;
                 let (n, kind) = components(format)?;
                 let float = matches!(kind, Kind::F32 | Kind::F16);
-                (float && n >= 2 && stride.saturating_sub(at) / kind.bytes() >= 2).then(|| {
+                (float && n >= 2 && last.len().saturating_sub(at) / kind.bytes() >= 2).then(|| {
                     victory_shader::emit::right_angle([0, 1, 2].map(|i| [0, 1].map(|k| kind.read(&v(i)[at..], k))))
                 })
             })
             .unwrap_or(1);
         let (a, b) = ((right + 2) % 3, (right + 1) % 3);
         for (slot, i) in [0, 1, 2, a, b].into_iter().enumerate() {
-            out[slot * stride..(slot + 1) * stride].copy_from_slice(v(i));
+            copy_vertex(&mut out[slot * stride..(slot + 1) * stride], v(i));
         }
         let fourth = &mut out[5 * stride..];
-        fourth.copy_from_slice(v(a));
+        copy_vertex(fourth, v(a));
         for &(offset, format) in elements {
             let at = offset as usize;
             let Some((n, kind)) = components(format) else {
@@ -53,7 +60,7 @@ pub(crate) fn expand_rects(src: &[u8], dst: &mut [u8], stride: usize, elements: 
             };
             // Only the components inside the vertex: the rest belong to the
             // next one.
-            let inside = stride.saturating_sub(at) / kind.bytes();
+            let inside = last.len().saturating_sub(at) / kind.bytes();
             for c in 0..n.min(inside) {
                 let get = |i: usize| kind.read(&v(i)[at..], c);
                 let value = get(a) + get(b) - get(right);
