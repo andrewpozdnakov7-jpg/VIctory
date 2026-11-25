@@ -73,6 +73,14 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
 }
 
 fn try_build_valu_cs(body: &[u32]) -> Result<HostShader, crate::ShaderError> {
+    try_build_valu_cs_group(body, 1, buffer_store_dword(0, 8, 0))
+}
+
+fn try_build_valu_cs_group(
+    body: &[u32],
+    group_size: u32,
+    store: [u32; 2],
+) -> Result<HostShader, crate::ShaderError> {
     let mut words = Vec::new();
     // s[4:5] = descriptor table address (heap index 0 -> byte offset 0).
     words.push(s_mov_b32(5, 0x80)); // inline constant 0
@@ -83,7 +91,7 @@ fn try_build_valu_cs(body: &[u32]) -> Result<HostShader, crate::ShaderError> {
         words.push(vop1(0x001, i + 1, sgpr(i))); // v_mov_b32
     }
     words.extend_from_slice(body);
-    words.extend_from_slice(&buffer_store_dword(0, 8, 0));
+    words.extend(store);
     words.push(S_ENDPGM);
 
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
@@ -121,7 +129,7 @@ fn try_build_valu_cs(body: &[u32]) -> Result<HostShader, crate::ShaderError> {
         }],
         io: StageIo::Cs(ComputeIo {
             rsrc2: 5 << 1, // 5 user SGPRs: s0..s4
-            threads: [1, 1, 1],
+            threads: [group_size, 1, 1],
         }),
         code,
     };
@@ -184,6 +192,17 @@ fn run_cases(
     cases: &[[u32; 4]],
     mut check: impl FnMut(&str, usize, [u32; 4], u32),
 ) {
+    run_readback_cases(shader, cases, 1, |label, i, inputs, out| {
+        check(label, i, inputs, out[0]);
+    });
+}
+
+fn run_readback_cases(
+    shader: &HostShader,
+    cases: &[[u32; 4]],
+    dwords: u32,
+    mut check: impl FnMut(&str, usize, [u32; 4], &[u32]),
+) {
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let mut ran = 0;
     for (label, warp) in [("hardware", false), ("warp", true)] {
@@ -212,13 +231,13 @@ fn run_cases(
                     &pso,
                     &Dispatch {
                         roots: vec![(0, Root::Constants(ud))],
-                        views: &[View::RawUav(1)],
+                        views: &[View::RawUav(dwords)],
                         samplers: &[],
                         groups: [1, 1, 1],
                     },
                 )
                 .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
-            check(label, i, inputs, out[0][0]);
+            check(label, i, inputs, &out[0]);
         }
         ran += 1;
     }
@@ -1906,4 +1925,33 @@ fn relative_moves_reach_only_what_their_clamped_index_can() {
         "{:?}",
         refused.err()
     );
+}
+
+#[test]
+fn packed_fmac_dpp8_reads_the_neighbour_in_each_compute_lane() {
+    const LANES: u32 = 32;
+    // Each 8-lane group swaps adjacent lanes.
+    let selectors = 1 | 3 << 6 | 2 << 9 | 5 << 12 | 4 << 15 | 7 << 18 | 6 << 21;
+    let body = [
+        0x1A << 25 | 5 << 17 | 130,            // v_lshlrev_b32 v5, 2, v0 (byte offset)
+        vop1(0x006, 6, vgpr(0)),               // v_cvt_f32_u32 v6, v0
+        0x03 << 25 | 7 << 17 | 6 << 9 | 262,  // v_add_f32 v7, v6, v6
+        0x2F << 25 | 6 << 17 | 7 << 9 | 262,  // v_cvt_pkrtz_f16_f32 v6, v6, v7
+        0x3C << 25 | 2 << 17 | 1 << 9 | 0xE9, // v_pk_fmac_f16_dpp v2, v6, v1
+        selectors << 8 | 6,
+    ];
+    let mut store = buffer_store_dword(2, 8, 0);
+    store[0] |= 1 << 12; // offen
+    store[1] |= 5; // byte offset in v5
+    let shader = try_build_valu_cs_group(&body, LANES, store).expect("build");
+    let inputs = [[0x4000_3C00, 0x3C00_4000, 0, 0]]; // v1 = (1, 2), v2 = (2, 1)
+
+    run_readback_cases(&shader, &inputs, LANES, |label, _, _, result| {
+        assert_eq!(result.len(), LANES as usize);
+        for (lane, &packed) in result.iter().enumerate() {
+            let neighbour = (lane ^ 1) as f32;
+            let actual = [f16_to_f32(packed as u16), f16_to_f32((packed >> 16) as u16)];
+            assert_eq!(actual, [neighbour + 2.0, 4.0 * neighbour + 1.0], "{label}: lane {lane}");
+        }
+    });
 }
