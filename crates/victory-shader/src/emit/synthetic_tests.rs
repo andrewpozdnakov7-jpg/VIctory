@@ -471,6 +471,49 @@ fn d16_image_load_rounds_normalized_texels_to_nearest() {
             out.as_chunks::<2>().0.iter().all(|&got| got == float_want),
             "{label}: FLOAT control"
         );
+        let packed = DXGI_FORMAT_A4B4G4R4_UNORM;
+        let mut support =
+            windows::Win32::Graphics::Direct3D12::D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+                Format: packed,
+                ..Default::default()
+            };
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_FEATURE_FORMAT_SUPPORT, D3D12_FORMAT_SUPPORT1_SHADER_LOAD,
+            D3D12_FORMAT_SUPPORT1_TEXTURE2D,
+        };
+        // SAFETY: the query writes the supplied format support structure.
+        let supported = unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_FORMAT_SUPPORT,
+                (&raw mut support).cast(),
+                size_of_val(&support) as u32,
+            )
+        }
+        .is_ok()
+            && support
+                .Support1
+                .contains(D3D12_FORMAT_SUPPORT1_TEXTURE2D | D3D12_FORMAT_SUPPORT1_SHADER_LOAD);
+        if supported {
+            // The same four bits in each channel exercise every UNORM code.
+            let data: Vec<_> = (0..256u16)
+                .flat_map(|i| ((i & 15) * 0x1111).to_le_bytes())
+                .collect();
+            let view = View::TextureBits {
+                size: [256, 1],
+                format: packed,
+                data: &data,
+                texel_bytes: 2,
+            };
+            let out = read(view, packed, 1);
+            for (x, &got) in out.as_chunks::<2>().0.iter().enumerate() {
+                let want = pack([(x % 16) as f64 / 15.0; 4], false);
+                assert_eq!(got, want, "{label}: A4B4G4R4_UNORM code {}", x % 16);
+            }
+            eprintln!("{label}: all A4B4G4R4_UNORM codes matched");
+        } else {
+            eprintln!("{label}: no A4B4G4R4_UNORM texture load support");
+        }
+
         for (format, bits, signed) in [
             (DXGI_FORMAT_R8G8B8A8_UNORM, 8, false),
             (DXGI_FORMAT_R8G8B8A8_SNORM, 8, true),
