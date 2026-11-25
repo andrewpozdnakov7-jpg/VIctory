@@ -235,10 +235,7 @@ pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
 }
 
-/// Shows the first plane's first resource in our window.
-///
-/// shortcut: one plane, no scaling or placement, the source expected in
-/// the common state.
+/// Shows the first resource of each presented plane in our window.
 extern "system" fn present(
     _: This,
     planes: u32,
@@ -286,10 +283,14 @@ extern "system" fn present(
         && !plane_parameters.is_null()
         && let Some(host) = crate::host::host()
     {
+        use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
+        use windows::core::Interface;
+
         const COPY_SOURCE: u32 = 0x800;
-        // SAFETY: the title passes `planes` plane descriptions.
+        // SAFETY: the title passes the plane descriptions.
         let slice = unsafe { std::slice::from_raw_parts(plane_parameters, planes.min(8) as usize) };
-        let mut resources = Vec::with_capacity(slice.len());
+        let mut resources: Vec<(This, &ID3D12Resource, u32, bool)> =
+            Vec::with_capacity(slice.len());
         for plane in slice {
             if plane.count == 0 || plane.resources.is_null() {
                 continue;
@@ -297,19 +298,28 @@ extern "system" fn present(
             // SAFETY: the plane lists `count` resources.
             let resource = unsafe { *plane.resources };
             if let Some(texture) = crate::resource::host_resource(resource) {
-                let state = crate::resource::host_transition(resource, COPY_SOURCE)
-                    .map_or(COPY_SOURCE, |(_, before)| before);
-                resources.push((resource, texture, state));
+                // Distinct title resources may refer to one host texture.
+                // Keep its original state for every plane and restore it once.
+                let prior = resources.iter().find_map(|(_, earlier, state, _)| {
+                    (earlier.as_raw() == texture.as_raw()).then_some(*state)
+                });
+                let state = prior.unwrap_or_else(|| {
+                    crate::resource::host_transition(resource, COPY_SOURCE)
+                        .map_or(COPY_SOURCE, |(_, before)| before)
+                });
+                resources.push((resource, texture, state, prior.is_none()));
             }
         }
         if !resources.is_empty() {
             let sources: Vec<(&_, u32)> = resources
                 .iter()
-                .map(|(_, tex, state)| (*tex, *state))
+                .map(|(_, tex, state, _)| (*tex, *state))
                 .collect();
             let shown = host.present(&sources, frame);
-            for &(resource, _, state) in &resources {
-                crate::resource::host_transition(resource, state);
+            for &(resource, _, state, first) in &resources {
+                if first {
+                    crate::resource::host_transition(resource, state);
+                }
             }
             #[cfg(feature = "diagnostics")]
             blinks(frame, resources[0].0, resources[0].2, shown);
@@ -486,6 +496,81 @@ static NEWER_FUNCTIONS: Table<36> = Table(queue_table(true));
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    /// Distinct title resources can name the same host texture. Presenting
+    /// both planes must preserve that texture's original rendering state.
+    #[cfg(windows)]
+    #[test]
+    fn aliased_present_planes_preserve_the_host_texture_state() {
+        use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATE_RENDER_TARGET;
+
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        const TARGET: u32 = D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32;
+        let address = crate::watch::tests::pool(1);
+        let null = std::ptr::null();
+        let iid = crate::object::guid(
+            0x696442be,
+            0xa72e,
+            0x4059,
+            [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+        );
+        #[repr(align(8))]
+        struct TextureWords([u32; 14]);
+        let desc = TextureWords([3, 0, 0, 0, 32, 0, 32, 1 | 1 << 16, 87, 1, 0, 1, 1, 0]);
+        let resources = std::array::from_fn::<_, 2, _>(|_| {
+            let mut resource = null;
+            assert_eq!(
+                crate::resource::create_at_address(
+                    null,
+                    address as u64,
+                    desc.0.as_ptr().cast(),
+                    0,
+                    null.cast(),
+                    &iid,
+                    &mut resource,
+                ),
+                S_OK
+            );
+            resource
+        });
+        assert_ne!(resources[0], resources[1]);
+        let primary = crate::resource::host_copy(resources[0]).unwrap();
+        let alias = crate::resource::host_copy(resources[1]).unwrap();
+        assert!(std::sync::Arc::ptr_eq(&primary, &alias));
+        let list = host.new_list().unwrap();
+        crate::list::ensure_state(&list, resources[0], TARGET);
+        // SAFETY: the texture is a live render target, on an open list.
+        unsafe {
+            list.list.ClearRenderTargetView(
+                host.rtv(&primary.texture, None),
+                &[0.25, 0.5, 0.75, 1.0],
+                None,
+            );
+        }
+        list.close();
+        host.execute(&[&list]);
+        assert_eq!(primary.state.load(Ordering::Relaxed), TARGET);
+
+        let planes = resources.each_ref().map(|resource| Plane {
+            token: 0,
+            count: 1,
+            resources: std::ptr::from_ref(resource),
+            _rest: [0; 6],
+        });
+        assert_eq!(present(null, 2, planes.as_ptr(), null.cast()), S_OK);
+        let restored = primary.state.load(Ordering::Relaxed);
+        let release = |resource| slot::<extern "system" fn(This) -> u32>(resource, 0x10)(resource);
+        for resource in resources {
+            assert_eq!(release(resource), 0);
+        }
+        drop((list, primary, alias));
+        crate::watch::tests::free(address);
+        // SAFETY: a plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+        assert_eq!(restored, TARGET, "the two planes share one rendering state");
+    }
 
     /// Where a queue's signal is: newer layouts have it two slots later.
     /// Another test may switch layouts while this one runs, so the queue's
