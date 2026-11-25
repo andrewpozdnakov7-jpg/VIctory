@@ -1701,6 +1701,45 @@ fn src_scc_reads_as_zero_or_one() {
 /// program runs. Unclamped, the read could reach the descriptor words and
 /// the program is refused.
 #[test]
+fn v_movrelsd_2_b32_uses_two_m0_offsets() {
+    let body = [
+        s_mov_b32(crate::ir::M0, 0),
+        vop1(0x001, 5, vgpr(2)),
+        vop1(0x001, 6, vgpr(3)),
+        vop1(0x001, 7, vgpr(4)),
+        vop1(0x001, 9, 128 + 17),
+        vop1(0x001, 10, 128 + 19),
+        vop1(0x001, 11, 128 + 29),
+        vop1(0x048, 9, vgpr(5)),
+    ];
+    let inputs = [
+        [0x0002_0001, 101, 102, 103],
+        [0x0000_0002, 201, 202, 203],
+        [0x8001_fc00, 301, 302, 303],
+        [0x0001_0004, 401, 402, 403],
+    ];
+    let expected = [
+        [17, 19, 102],
+        [203, 19, 29],
+        [17, 301, 29],
+        [17, 17, 29],
+    ];
+    for (column, register) in [9, 10, 11].into_iter().enumerate() {
+        let mut words = body.to_vec();
+        words.push(vop1(0x001, 0, vgpr(register)));
+        let shader = build_valu_cs(&words);
+        run_cases(&shader, &inputs, |backend, row, input, got| {
+            assert_eq!(
+                got,
+                expected[row][column],
+                "{backend}: M0={:#010x}, v{register}",
+                input[0],
+            );
+        });
+    }
+}
+
+#[test]
 fn relative_moves_reach_only_what_their_clamped_index_can() {
     let body = |second_index: u32| {
         let mut w = Vec::new();
