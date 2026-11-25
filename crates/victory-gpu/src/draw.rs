@@ -2124,6 +2124,98 @@ void main(uint3 id : SV_DispatchThreadID) {
         }
     }
 
+    #[test]
+    fn heap_anisotropic_point_mips_sample_without_blending() {
+        let Some(host) = crate::host::host() else {
+            eprintln!("no D3D12 device; skipped");
+            return;
+        };
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS19::default();
+        // SAFETY: the output points to a correctly sized options structure.
+        let result = unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS19,
+                (&raw mut options).cast(),
+                size_of_val(&options) as u32,
+            )
+        };
+        if result.is_err() || !options.AnisoFilterWithPointMipSupported.as_bool() {
+            eprintln!("anisotropic point mips unavailable; skipped");
+            return;
+        }
+
+        const SAMPLE: &str = r#"
+#define RS "DescriptorTable(SRV(t0)), DescriptorTable(Sampler(s0)), UAV(u0), RootConstants(num32BitConstants=1, b0)"
+Texture2D<float> tex : register(t0);
+SamplerState samp : register(s0);
+RWByteAddressBuffer out_buffer : register(u0);
+cbuffer C : register(b0) { uint offset; }
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main() {
+    out_buffer.Store2(offset, asuint(float2(tex.SampleLevel(samp, 0.5, 0.25),
+                                           tex.SampleLevel(samp, 0.5, 0.75))));
+}
+"#;
+        let (root, pso) = compile_cs(SAMPLE);
+        let address = title_memory(1 << 16);
+        let mut words = texture_words(2, 2, 41, 0x100, 0); // R32_FLOAT
+        words[7] = 1 | 2 << 16;
+        let object = texture_at_address(address, &words);
+        let (_memory, desc) = crate::resource::texture_memory(object).unwrap();
+        let layout = crate::resource::texture_layout(&desc).unwrap();
+        // SAFETY: the allocation stays live and the texture fits in it.
+        let tiled =
+            unsafe { std::slice::from_raw_parts_mut(address as *mut u8, layout.size as usize) };
+        for (mip, (value, width)) in [(0.25f32, 2usize), (0.75, 1)].into_iter().enumerate() {
+            let bytes = value.to_le_bytes().repeat(width * width);
+            layout.planes[0]
+                .layout
+                .tile(tiled, mip as u32, 0, &bytes, width * 4, bytes.len())
+                .unwrap();
+        }
+        let views = Slots::new(1);
+        let view = View::Shader(object as usize, None);
+        views.make(0, &view);
+        let samplers = crate::descriptor::host::HostHeap::new(true, 2).unwrap();
+        let mut slots = [[0u32; 4]; 2];
+        let mut desc = [0u32; 27];
+        desc[1..3].fill(3); // anisotropic magnification and minification
+        desc[6..9].fill(3); // clamp addressing
+        desc[10] = 1.0f32.to_bits();
+        desc[13] = 4;
+        for (slot, memory) in slots.iter_mut().enumerate() {
+            desc[3] = slot as u32 + 1; // point mip, then linear mip
+            let handle = memory.as_mut_ptr() as u64;
+            crate::descriptor::create_sampler_x(std::ptr::null(), &desc, handle);
+            assert!(samplers.mirror(slot as u32, handle, true).is_some());
+        }
+
+        let (out, mapped) = host.shared_buffer(16).unwrap();
+        let list = host.new_list().unwrap();
+        readable(&list, &used(ResourceType::Srv), &view, false);
+        // SAFETY: the open list references live shader-visible heaps and buffers.
+        unsafe {
+            let l = &list.list;
+            l.SetDescriptorHeaps(&[Some(views.0.clone()), Some(samplers.heap.clone())]);
+            l.SetComputeRootSignature(&root);
+            l.SetPipelineState(&pso);
+            l.SetComputeRootDescriptorTable(0, views.gpu(0));
+            l.SetComputeRootUnorderedAccessView(2, out.GetGPUVirtualAddress());
+            for i in 0..2 {
+                l.SetComputeRootDescriptorTable(1, samplers.gpu(i));
+                l.SetComputeRoot32BitConstant(3, i * 8, 0);
+                l.Dispatch(1, 1, 1);
+            }
+        }
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: the queue finished writing four floats to the mapped output.
+        let data = unsafe { mapped.cast::<[f32; 4]>().read_unaligned() };
+        crate::object::slot::<extern "system" fn(This) -> u32>(object, 0x10)(object);
+        assert_eq!(data, [0.25, 0.75, 0.375, 0.625]);
+    }
+
     const READ: &str = r#"
 #define RS "DescriptorTable(SRV(t0)), UAV(u1)"
 Texture2D<float4> t : register(t0);
