@@ -2938,6 +2938,116 @@ mod tests {
         }
     }
 
+    /// A default RTV on a typed array still clears all first-mip slices
+    /// when the host texture is typeless to allow unordered access.
+    #[cfg(windows)]
+    #[test]
+    fn default_rtv_clears_first_mip_of_every_array_slice() {
+        const SRGB: u32 = 29;
+        const UNORM: u32 = 28;
+        const TYPELESS: u32 = 27;
+        const RENDER_TARGET: u32 = 4;
+        const ALLOW_RENDER_TARGET: u32 = 1;
+        const TEXTURE2D_ARRAY: u32 = 5;
+        const BLUE: [f32; 4] = [0.0, 0.0, 1.0, 1.0];
+        const RED: [f32; 4] = [1.0, 0.0, 0.0, 1.0];
+
+        if crate::host::host().is_none() {
+            return; // no host GPU here
+        }
+        let null = std::ptr::null();
+        let create = |desc: &ResourceDesc, state| {
+            let mut out = null;
+            assert_eq!(
+                create_committed(null, &PROPERTIES, 0, desc, state, null.cast(), &RESOURCE_IIDS[0], &mut out),
+                S_OK
+            );
+            out
+        };
+        let queue_iid = guid(0x0ec870a6, 0x5d7e, 0x4c22, [0x8c, 0xfc, 0x5b, 0xaa, 0xe0, 0x76, 0x16, 0xed]);
+        let allocator_iid = guid(0x6102dee4, 0xaf59, 0x4b09, [0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24]);
+        let list_iid = guid(0x5b160d0f, 0xac1b, 0x4185, [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55]);
+        let queue_desc = [0u32; 4];
+        let (mut queue, mut allocator) = (null, null);
+        assert_eq!(crate::queue::create(null, queue_desc.as_ptr().cast(), &queue_iid, &mut queue), S_OK);
+        assert_eq!(crate::list::create_allocator(null, 0, &allocator_iid, &mut allocator), S_OK);
+
+        #[repr(C)]
+        struct Location {
+            resource: This,
+            kind: u32,
+            footprint: PlacedFootprint,
+        }
+        type Clear = extern "system" fn(This, u64, *const [f32; 4], u32, *const crate::list::Rect);
+        type Copy = extern "system" fn(This, *const Location, u32, u32, u32, *const Location, *const u8);
+        for extra_flag in [0, UNORDERED] {
+            let desc = ResourceDesc {
+                depth_or_array_size: 2,
+                flags: ALLOW_RENDER_TARGET | extra_flag,
+                ..texture(4, 4, SRGB, 2)
+            };
+            let image = create(&desc, RENDER_TARGET);
+            let host_image = host_resource(image).unwrap();
+            // SAFETY: the texture is live. The two guest resources have
+            // the same format, but only the unordered one is promoted.
+            let format = unsafe { host_image.GetDesc() }.Format.0 as u32;
+            assert_eq!(format, if extra_flag == 0 { SRGB } else { TYPELESS });
+            let readback = create(&buffer(4096), 0);
+            let (data, _) = buffer_bytes(readback).unwrap();
+            // SAFETY: the buffer holds 4096 bytes.
+            unsafe { std::ptr::write_bytes(data, 0xEE, 4096) };
+
+            let mut list = null;
+            assert_eq!(crate::list::create_list(null, 0, 0, allocator, null, &list_iid, &mut list), S_OK);
+            let clear = slot::<Clear>(list, 0x1a0);
+            let mut descriptor = [0u64; 16];
+            let handle = descriptor.as_mut_ptr() as u64;
+            for mip in 0..2 {
+                let explicit = [SRGB, TEXTURE2D_ARRAY, mip, 0, 2, 0];
+                crate::descriptor::create_rtv(null, image, &explicit, handle);
+                clear(list, handle, &BLUE, 0, null.cast());
+            }
+            crate::descriptor::create_rtv(null, image, null.cast(), handle);
+            clear(list, handle, &RED, 0, null.cast());
+
+            let copy = slot::<Copy>(list, 0x80);
+            for subresource in 0..4 {
+                let size = 4 >> (subresource % 2);
+                let footprint = PlacedFootprint {
+                    offset: 1024 * subresource,
+                    format: UNORM,
+                    width: size,
+                    height: size,
+                    depth: 1,
+                    row_pitch: 256,
+                };
+                let from = Location {
+                    resource: image,
+                    kind: 0,
+                    footprint: PlacedFootprint { offset: subresource, ..footprint },
+                };
+                let to = Location { resource: readback, kind: 1, footprint };
+                copy(list, &to, 0, 0, 0, &from, null.cast());
+            }
+            assert_eq!(slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list), S_OK, "host format {format}");
+            slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(queue, 1, &list);
+
+            for subresource in 0..4 {
+                // SAFETY: the submission completes before CPU access and
+                // the first texel of each footprint is within the buffer.
+                let texel = unsafe { data.add(subresource * 1024).cast::<[u8; 4]>().read() };
+                let expected = if subresource % 2 == 0 { [255, 0, 0, 255] } else { [0, 0, 255, 255] };
+                assert_eq!(texel, expected, "host format {format}, subresource {subresource}");
+            }
+            let release = |object| slot::<Release>(object, 0x10)(object);
+            assert_eq!(release(list), 0);
+            assert_eq!(release(readback), 0);
+            assert_eq!(release(image), 0);
+        }
+        assert_eq!(slot::<Release>(allocator, 0x10)(allocator), 0);
+        assert_eq!(slot::<Release>(queue, 0x10)(queue), 0);
+    }
+
     /// A texture region copied into a title buffer through our list and
     /// queue: once the list has run, its rows are in the buffer at the
     /// footprint's offset and pitch, and nothing else of the buffer moved.
