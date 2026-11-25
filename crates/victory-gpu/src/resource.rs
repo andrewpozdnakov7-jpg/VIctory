@@ -1397,6 +1397,70 @@ mod tests {
         }
     }
 
+    /// Compare the title's GetDesc result with the native D3D12 result
+    /// when the same resource is created with automatic mip levels.
+    #[cfg(windows)]
+    #[test]
+    fn automatic_mip_counts_match_native_d3d12_getdesc() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_SAMPLE_DESC};
+
+        let Some(host) = crate::host::host() else {
+            eprintln!("no native D3D12 device; skipped");
+            return;
+        };
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let native_count = |desc: ResourceDesc| {
+            let input = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION(desc.dimension as i32),
+                Width: desc.width,
+                Height: desc.height,
+                DepthOrArraySize: desc.depth_or_array_size,
+                MipLevels: desc.mip_levels,
+                Format: DXGI_FORMAT(desc.format as i32),
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT(desc.layout as i32),
+                ..Default::default()
+            };
+            let mut native: Option<ID3D12Resource> = None;
+            // SAFETY: these are valid descriptions of small ordinary
+            // committed resources and the output slot is ours.
+            unsafe {
+                host.device.CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &input,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    None,
+                    &mut native,
+                ).unwrap();
+                native.unwrap().GetDesc().MipLevels
+            }
+        };
+        let guest_count = |desc: ResourceDesc| {
+            let null = std::ptr::null();
+            let mut object = null;
+            assert_eq!(create_committed(null, &PROPERTIES, 0, &desc, 0, null.cast(), &RESOURCE_IIDS[0], &mut object), S_OK);
+            let mut result = desc;
+            slot::<extern "system" fn(This, *mut ResourceDesc)>(object, 0x50)(object, &mut result);
+            assert_eq!(slot::<Release>(object, 0x10)(object), 0);
+            result.mip_levels
+        };
+        let square = texture(4, 4, 28, 0);
+        let line = ResourceDesc { dimension: 2, width: 16, height: 1, ..square };
+        let array = ResourceDesc { depth_or_array_size: 6, ..square };
+        let volume = ResourceDesc { dimension: 4, width: 16, height: 8, depth_or_array_size: 32, ..square };
+        let explicit = texture(4, 4, 28, 2);
+        let cases = [line, square, array, volume, explicit, buffer(256)];
+        let native = cases.map(native_count);
+        let guest = cases.map(guest_count);
+        assert_eq!(native, [5, 3, 3, 6, 2, 1]);
+        assert_eq!(guest, native);
+    }
+
     fn heap(size: u64) -> This {
         let desc = HeapDesc {
             size,
