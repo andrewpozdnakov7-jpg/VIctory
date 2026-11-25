@@ -11,6 +11,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use victory_shader::{ResourceType, RootType, UsedResource};
+use victory_shader::emit::spread_groups;
 
 use crate::descriptor::View;
 use windows::Win32::Foundation::RECT;
@@ -94,6 +95,8 @@ pub(crate) struct State {
     /// What was set straight onto the host list, for the next segment of
     /// the list ([`State::cut`]).
     fixed: Fixed,
+    /// Host-computed compute dispatch spread constants `[row, asked_x]`.
+    dispatch_spread: [u32; 2],
 }
 
 /// Fixed-function state the title set, as it set it.
@@ -768,6 +771,9 @@ impl State {
                         .find(|m| m.0 == u.slot && u.root == RootType::Table);
                     values[u.index as usize] = match fresh {
                         Some(&(_, offset)) => offset,
+                        None if u.slot == victory_shader::emit::DISPATCH_SLOT => {
+                            self.dispatch_spread[usize::from(u.dword != 0)]
+                        }
                         None if u.dword == victory_shader::emit::ROOT_VIEW_OFFSET => {
                             // Where the root address lies in the copy its view shows.
                             let offset = match self.roots_ref(compute).get(usize::from(u.slot)) {
@@ -1114,7 +1120,23 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
-        if !self.bind(list, p, true) {
+        let can_spread = p.stages.first().is_some_and(|s| {
+            s.translated()
+                .host
+                .user_data
+                .iter()
+                .any(|u| u.slot == victory_shader::emit::DISPATCH_SLOT)
+        });
+        let (row, asked, gx, gy, gz) = spread_groups(x, y, z, can_spread);
+        if gx > 65_535 || gy > 65_535 || gz > 65_535 {
+            once!(
+                "dispatch groups ({gx}, {gy}, {gz}) exceed D3D12 limit 65,535 (spread: {can_spread})"
+            );
+        }
+        self.dispatch_spread = [row, asked];
+        let bound = self.bind(list, p, true);
+        self.dispatch_spread = [0, 0];
+        if !bound {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             dropped(list, self.pipeline, "dispatch");
@@ -1125,7 +1147,7 @@ impl State {
         #[cfg(feature = "diagnostics")]
         self.probe_small(list, true);
         // SAFETY: an open list with everything set.
-        unsafe { list.list.Dispatch(x, y, z) };
+        unsafe { list.list.Dispatch(gx, gy, gz) };
         #[cfg(feature = "diagnostics")]
         self.probe_written(list);
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
@@ -1731,12 +1753,12 @@ impl State {
         // the arguments and dispatch a compute shader for records nothing
         // reads. Same order as the `is_skipped` check above, for the same
         // reason.
-        if crate::pipeline::host_pipeline(self.pipeline as This).is_none() {
+        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);
             why("no host pipeline");
             return false;
-        }
+        };
         let len = u64::from(stride) * u64::from(max.max(1));
         let Some(args) = crate::shadow::find(arguments, len) else {
             why("arguments outside title buffers");
@@ -1752,10 +1774,27 @@ impl State {
             },
             None => None,
         };
-        let Some(signature) = matches!(kind, DRAW | INDEXED | DISPATCH | MESH)
-            .then(|| host_signature(kind, stride))
-            .flatten()
-        else {
+        let spread = if kind == DISPATCH && p.compute {
+            p.stages.first().and_then(|s| {
+                let (param, _) = s.user_data?;
+                let row_index = s
+                    .translated()
+                    .host
+                    .user_data
+                    .iter()
+                    .find(|u| u.slot == victory_shader::emit::DISPATCH_SLOT && u.dword == 0)?
+                    .index;
+                host_spread_signature(&p.root, param, row_index)
+            })
+        } else {
+            None
+        };
+        let is_spread = spread.is_some();
+        let Some(signature) = spread.or_else(|| {
+            matches!(kind, DRAW | INDEXED | DISPATCH | MESH)
+                .then(|| host_signature(kind, stride))
+                .flatten()
+        }) else {
             why("no host signature");
             return false;
         };
@@ -1764,7 +1803,7 @@ impl State {
             s.refresh(list, *at, 4);
         }
         // Bounded first: the clamp binds a compute pipeline of its own.
-        let Some(clamped) = crate::indirect::bound(list, args.gpu(arguments), (kind, stride, max)) else {
+        let Some(clamped) = crate::indirect::bound(list, args.gpu(arguments), (kind, stride, max), is_spread) else {
             why("not bounded (no clamp, or arguments not 4-byte aligned)");
             return false;
         };
@@ -1874,6 +1913,65 @@ fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
     }
     let signature = signature?;
     made.push(((kind, stride), signature.clone()));
+    Some(signature)
+}
+
+/// A command signature for compute dispatches whose group count was spread across z:
+/// 4 bytes groups per row (root constant at `row_index`),
+/// 4 bytes asked x groups (root constant at `row_index + 1`),
+/// 12 bytes dispatch arguments (x, y, z).
+/// Command signature for spread indirect dispatches: 2 root constants
+/// (`row`, `asked_x`) followed by `DISPATCH` (`gx, gy, gz`), stride 20 bytes.
+fn host_spread_signature(
+    root: &ID3D12RootSignature,
+    param: u32,
+    row_index: u32,
+) -> Option<ID3D12CommandSignature> {
+    type SpreadKey = (usize, u32, u32);
+    static MADE: std::sync::Mutex<Vec<(SpreadKey, ID3D12CommandSignature)>> =
+        std::sync::Mutex::new(Vec::new());
+    let key = (root.as_raw() as usize, param, row_index);
+    let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, s)) = made.iter().find(|(k, _)| *k == key) {
+        return Some(s.clone());
+    }
+    let args = [
+        D3D12_INDIRECT_ARGUMENT_DESC {
+            Type: D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT,
+            Anonymous: D3D12_INDIRECT_ARGUMENT_DESC_0 {
+                Constant: D3D12_INDIRECT_ARGUMENT_DESC_0_1 {
+                    RootParameterIndex: param,
+                    DestOffsetIn32BitValues: row_index,
+                    Num32BitValuesToSet: 2,
+                },
+            },
+        },
+        D3D12_INDIRECT_ARGUMENT_DESC {
+            Type: D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH,
+            ..Default::default()
+        },
+    ];
+    let desc = D3D12_COMMAND_SIGNATURE_DESC {
+        ByteStride: 20,
+        NumArgumentDescs: args.len() as u32,
+        pArgumentDescs: args.as_ptr(),
+        NodeMask: 0,
+    };
+    let mut signature: Option<ID3D12CommandSignature> = None;
+    // SAFETY: valid argument descriptors and root signature.
+    let result = unsafe {
+        crate::host::host()?.device.CreateCommandSignature(
+            &desc,
+            Some(root),
+            &mut signature,
+        )
+    };
+    if let Err(e) = result {
+        once!(error = %e, param, row_index, "spread command signature refused");
+        return None;
+    }
+    let signature = signature?;
+    made.push((key, signature.clone()));
     Some(signature)
 }
 
@@ -3906,5 +4004,53 @@ void main(uint3 id : SV_DispatchThreadID) {
             assert_eq!(host.log_messages(), None, "case {case} D3D12 debug errors");
             let _ = kept_obj;
         }
+    }
+
+    #[test]
+    fn spread_indirect_signature_matches_root_and_layout() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let param = D3D12_ROOT_PARAMETER {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+            Anonymous: D3D12_ROOT_PARAMETER_0 {
+                Constants: D3D12_ROOT_CONSTANTS {
+                    ShaderRegister: 0,
+                    RegisterSpace: 0,
+                    Num32BitValues: 4,
+                },
+            },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+        };
+        let desc = D3D12_ROOT_SIGNATURE_DESC {
+            NumParameters: 1,
+            pParameters: &param,
+            NumStaticSamplers: 0,
+            pStaticSamplers: std::ptr::null(),
+            Flags: D3D12_ROOT_SIGNATURE_FLAG_NONE,
+        };
+        let mut blob = None;
+        let mut error = None;
+        // SAFETY: valid root signature desc.
+        let hr = unsafe {
+            D3D12SerializeRootSignature(
+                &desc,
+                D3D_ROOT_SIGNATURE_VERSION_1,
+                &mut blob,
+                Some(&mut error),
+            )
+        };
+        if hr.is_err() {
+            return;
+        }
+        let blob = blob.unwrap();
+        // SAFETY: the serialized root signature blob is valid and within its size.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize())
+        };
+        // SAFETY: the device is live and root signature bytes are valid.
+        let root: ID3D12RootSignature = unsafe { host.device.CreateRootSignature(0, bytes) }.unwrap();
+        let sig = super::host_spread_signature(&root, 0, 0);
+        assert!(sig.is_some());
     }
 }

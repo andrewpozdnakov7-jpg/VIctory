@@ -270,7 +270,9 @@ fn title_memory_is_read_and_written_at_computed_addresses() {
             for u in &shader.user_data {
                 let constants = [TITLE as u32, (TITLE >> 32) as u32, value, operand.to_bits()];
                 ud[u.index as usize] = match u.root {
-                    RootType::Constants => constants[u.dword as usize],
+                    RootType::Constants if u.slot != super::DISPATCH_SLOT => {
+                        constants[u.dword as usize]
+                    }
                     RootType::Descriptor => (root_uav >> (32 * u.dword)) as u32,
                     _ => 0,
                 };
@@ -596,7 +598,11 @@ fn writes_through_views_mark_their_pages() {
         let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
         let mut ud = vec![0u32; shader.user_data_dwords() as usize];
         for u in &shader.user_data {
-            ud[u.index as usize] = if u.root == RootType::Constants { value } else { 0 };
+            ud[u.index as usize] = if u.root == RootType::Constants && u.slot != super::DISPATCH_SLOT {
+                value
+            } else {
+                0
+            };
         }
         let out = host
             .dispatch(
