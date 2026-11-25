@@ -283,7 +283,7 @@ fn v_add_sub_nc_i16_wrap_and_saturate_with_op_sel() {
             (i16::MAX, 0),
             (i16::MIN, 0),
         ];
-        for opsel in [0, 0b0001, 0b0010, 0b1011] {
+        for opsel in [0b0000, 0b0001, 0b0010, 0b0011, 0b1000, 0b1001, 0b1010, 0b1011] {
             let a_high = (opsel & 1) * 16;
             let b_high = (opsel >> 1 & 1) * 16;
             let dst_high = (opsel >> 3 & 1) * 16;

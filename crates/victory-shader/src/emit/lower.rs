@@ -6513,12 +6513,17 @@ impl<'a> Lower<'a> {
                         };
                         let r = self.s.m.bin(c, op, a, b);
                         if v.clamp {
+                            // Keep the saturated value in a 16-bit pattern. NVIDIA drivers can
+                            // otherwise sign-extend it into the untouched destination half.
                             let lo = self.s.m.i32(i32::from(i16::MIN) as u32);
                             let hi = self.s.m.i32(i16::MAX as u32);
+                            let mask = self.s.m.i32(0xFFFF);
+                            let low = self.s.m.bin(c, Bin::And, r, mask);
                             let below = self.s.m.cmp(c, pred::SLT, r, lo);
-                            let r = self.s.m.select(c, below, lo, r);
+                            let min = self.s.m.i32(0x8000);
+                            let lower_bounded = self.s.m.select(c, below, min, low);
                             let above = self.s.m.cmp(c, pred::SGT, r, hi);
-                            self.s.m.select(c, above, hi, r)
+                            self.s.m.select(c, above, hi, lower_bounded)
                         } else {
                             r
                         }
