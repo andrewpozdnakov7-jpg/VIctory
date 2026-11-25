@@ -2079,7 +2079,7 @@ mod tests {
         // SAFETY: the open list still tracks the first clear's render-target state.
         unsafe {
             host_list.list.ResourceBarrier(&[crate::host::transition(
-                texture,
+                &texture,
                 D3D12_RESOURCE_STATE_RENDER_TARGET,
                 D3D12_RESOURCE_STATE_COPY_SOURCE,
             )]);

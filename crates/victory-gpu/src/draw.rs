@@ -258,6 +258,7 @@ impl State {
         self.host_heaps = [0; 2];
         self.fresh_tables.clear();
         self.table_failed = false;
+        self.fixed = Fixed::default();
     }
 
     /// The title's topology; console-only ones become host lists (see
@@ -3030,6 +3031,19 @@ mod clear_state_tests {
             root_slots: root_slots.into(),
             root_run,
             memory: None,
+            fixed: Fixed {
+                viewports: Some(vec![D3D12_VIEWPORT {
+                    Width: 2.0,
+                    Height: 1.0,
+                    MaxDepth: 1.0,
+                    ..Default::default()
+                }]),
+                scissors: Some(vec![RECT { left: 0, top: 0, right: 2, bottom: 1 }]),
+                blend_factor: Some(Some([0.25; 4])),
+                stencil_ref: Some(3),
+                targets: Some((vec![8], 9)),
+                topology: true,
+            },
         };
         let pipeline: This = std::ptr::dangling();
 
@@ -3050,6 +3064,13 @@ mod clear_state_tests {
         assert!(state.targets.is_empty());
         assert_eq!(state.depth, 0);
         assert_eq!(state.topology, 0);
+        // A later host-list segment must not replay cleared state.
+        assert!(!state.fixed.topology);
+        assert!(state.fixed.viewports.is_none());
+        assert!(state.fixed.scissors.is_none());
+        assert!(state.fixed.blend_factor.is_none());
+        assert!(state.fixed.stencil_ref.is_none());
+        assert!(state.fixed.targets.is_none());
         assert_eq!(state.host_pipeline, 0);
         assert_eq!(state.host_roots, [0; 2]);
         assert_eq!(state.host_heaps, [0; 2]);
