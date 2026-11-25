@@ -38,6 +38,8 @@ const RTV_RING: u32 = 1024;
 
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
+    /// The device is on the software adapter (WARP, `VICTORY_D3D12_WARP`).
+    pub(crate) software: bool,
     queue: ID3D12CommandQueue,
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
@@ -181,7 +183,8 @@ fn create() -> windows::core::Result<Host> {
         // Diagnostics: the software adapter, on which a shader's wild access
         // is an access violation in this process (a crash report with the
         // address and instruction) instead of a GPU fault and driver reset.
-        if cfg!(feature = "diagnostics") && crate::switch::on("VICTORY_D3D12_WARP") {
+        let software = cfg!(feature = "diagnostics") && crate::switch::on("VICTORY_D3D12_WARP");
+        if software {
             let adapter = warp_adapter()?;
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
@@ -239,6 +242,7 @@ fn create() -> windows::core::Result<Host> {
         }
         Ok(Host {
             device,
+            software,
             queue,
             fence,
             submitted: Mutex::new(0),
