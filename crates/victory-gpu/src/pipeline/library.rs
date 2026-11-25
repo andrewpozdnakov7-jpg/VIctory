@@ -123,10 +123,23 @@ fn library_file(software: bool) -> &'static str {
 
 /// The library file of this run's host.
 fn host_library_file() -> &'static str {
-    library_file(crate::host::host().is_some_and(|h| h.software))
+    library_file(host_software())
+}
+
+/// The pre-build's list of a host on the software adapter or on hardware: it
+/// is tagged with its library's bytes, so one list for both was replaced by
+/// whichever pre-built last and refused by the other.
+fn prebuilt_file(software: bool) -> &'static str {
+    if software { SOFTWARE_PREBUILT_FILE } else { PREBUILT_FILE }
+}
+
+/// Whether this run's host is on the software adapter (WARP).
+fn host_software() -> bool {
+    crate::host::host().is_some_and(|h| h.software)
 }
 const EARLY_FILE: &str = "early-pipelines.txt";
 const PREBUILT_FILE: &str = "prebuilt-pipelines.txt";
+const SOFTWARE_PREBUILT_FILE: &str = "prebuilt-pipelines-warp.txt";
 /// Title pipelines listed for an early start, at most.
 const EARLY_MAX: usize = 8192;
 
@@ -140,7 +153,7 @@ fn library() -> Option<&'static Mutex<Library>> {
             let tag = tag(&blob);
             let mut library = open(&device, blob);
             // The pre-build's list, if it was saved with these bytes.
-            if let (Some(l), Some(list)) = (library.as_mut(), read(PREBUILT_FILE))
+            if let (Some(l), Some(list)) = (library.as_mut(), read(prebuilt_file(host_software())))
                 && !l._blob.is_empty()
             {
                 l.prebuilt = listed(&list, &tag);
@@ -345,7 +358,7 @@ pub(crate) fn save(now: bool) {
         .and_then(|()| write_atomically(&dir.join(host_library_file()), &blob))
         .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()))
         .and_then(|()| match &prebuilt {
-            Some(list) => write_atomically(&dir.join(PREBUILT_FILE), list.as_bytes()),
+            Some(list) => write_atomically(&dir.join(prebuilt_file(host_software())), list.as_bytes()),
             None => Ok(()),
         });
     let (created, distinct) = created();
@@ -458,6 +471,22 @@ pub(crate) fn note_used(key: &str) {
 mod tests {
     use super::*;
 
+    /// A hardware pre-build and a WARP one in one cache folder each read back
+    /// their own list: neither replaces the other's (#2646 review).
+    #[test]
+    fn each_host_reads_back_its_own_prebuilt_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = |k: &[&str]| k.iter().map(|s| s.to_string()).collect::<HashSet<_>>();
+        let (hw, warp) = (keys(&["a", "b"]), keys(&["c"]));
+        std::fs::write(dir.path().join(prebuilt_file(false)), list("hw-tag", &hw)).unwrap();
+        std::fs::write(dir.path().join(prebuilt_file(true)), list("warp-tag", &warp)).unwrap();
+        let read = |software| std::fs::read(dir.path().join(prebuilt_file(software))).unwrap();
+        assert_eq!(listed(&read(false), "hw-tag"), hw);
+        assert_eq!(listed(&read(true), "warp-tag"), warp);
+        // a list read for another library's bytes is refused, as before
+        assert!(listed(&read(true), "hw-tag").is_empty());
+    }
+
     /// A WARP host and a hardware one keep their libraries apart, so a run on
     /// one does not empty the other's; the hardware file keeps its name (#2637).
     #[test]
@@ -465,6 +494,10 @@ mod tests {
         assert_eq!(library_file(false), "host-pipelines.bin");
         assert_ne!(library_file(true), library_file(false));
         assert!(library_file(true).ends_with(".bin"));
+        // the pre-build's list too: it names its library's bytes
+        assert_eq!(prebuilt_file(false), "prebuilt-pipelines.txt");
+        assert_ne!(prebuilt_file(true), prebuilt_file(false));
+        assert!(prebuilt_file(true).ends_with(".txt"));
     }
 
     #[test]
