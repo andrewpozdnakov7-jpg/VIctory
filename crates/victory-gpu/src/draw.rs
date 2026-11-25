@@ -1127,11 +1127,14 @@ impl State {
                 continue;
             };
             let mirrored = host.mirror(index, at, true);
-            if !host.has_view(index) {
-                let props = table_entry_props(slot, k * 8, used, table_views);
-                if mirrored.is_some() || !matches_plain_null_srv(props) {
-                    fresh.push(slot);
-                }
+            let props = table_entry_props(slot, k * 8, used, table_views);
+            if mirrored
+                .as_ref()
+                .is_some_and(|view| !table_access_matches(view, props))
+                || (!host.has_view(index)
+                    && (mirrored.is_some() || !matches_plain_null_srv(props)))
+            {
+                fresh.push(slot);
             }
         }
         fresh.sort_unstable();
@@ -1204,6 +1207,10 @@ impl State {
                     else {
                         continue;
                     };
+                    let props = table_entry_props(slot, k * 8, used, table_views);
+                    if !table_access_matches(&view, props) {
+                        continue;
+                    }
                     if let Some(u) = entries
                         .iter()
                         .find(|u| u.table_offset_dwords / 8 == k && u.kind != ResourceType::Cbv)
@@ -1239,7 +1246,9 @@ impl State {
                 let props = table_entry_props(slot, k * 8, used, table_views);
                 let at = table + u64::from(k) * 32;
                 match heap.index(at).and_then(|_| crate::descriptor::view(at)) {
-                    Some(view) if host.try_make_at(index, &view) => {
+                    Some(view)
+                        if table_access_matches(&view, props) && host.try_make_at(index, &view) =>
+                    {
                         if let Some(u) = entry_u {
                             readable(list, u, &view, true);
                         } else if let Some(tv) = table_views
@@ -1943,6 +1952,12 @@ fn table_entry_props(
     }
 }
 
+/// Whether a live descriptor matches the shader handle's SRV or UAV access.
+fn table_access_matches(view: &View, props: Option<(u32, u32)>) -> bool {
+    let unordered = matches!(view, View::Unordered(..) | View::Placed(true, ..));
+    props.is_none_or(|(kind, _)| unordered == (kind & 0x1000 != 0))
+}
+
 /// Whether the default null 2D float SRV (`null_view`) satisfies `props`.
 fn matches_plain_null_srv(props: Option<(u32, u32)>) -> bool {
     match props {
@@ -2634,6 +2649,89 @@ void main(uint3 id : SV_DispatchThreadID) {
         drop(found);
         slots.make_null(0);
         assert!(shown.upgrade().is_none(), "released with the slot");
+    }
+
+    #[test]
+    fn a_live_srv_in_a_uav_table_gets_a_typed_null() {
+        use victory_shader::emit::TableView;
+
+        let host = crate::host::host().expect("a D3D12 device");
+        let null = std::ptr::null();
+        let heap_desc: [u32; 8] = [0, 2, 1, 0, 0, 0, 0, 0];
+        let mut heap = null;
+        let iid = crate::object::guid(
+            0x8efb471d,
+            0x616c,
+            0x4f49,
+            [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
+        );
+        assert_eq!(
+            crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap),
+            S_OK,
+        );
+        let title_heap = crate::descriptor::heap(heap);
+        let heap_host = title_heap.host().expect("a host view heap");
+        let src = buffer(256);
+        let raw_srv: [u32; 10] = [39, 1, 0x1688, 0, 0, 0, 64, 0, 1, 0];
+        crate::descriptor::create_srv(null, src, &raw_srv, title_heap.start);
+        assert!(heap_host.has_view(0), "the title slot holds a live raw SRV");
+
+        let _ = host.log_messages();
+        let list = host.new_list().unwrap();
+        let mut state = State::default();
+        state.set_heaps(&[heap]);
+        state.set_table(true, 0, title_heap.start);
+        let used = [UsedResource {
+            dwords: 4,
+            ..used(ResourceType::Uav)
+        }];
+        let expected = [TableView {
+            slot: 0,
+            dword: 0,
+            props: (11 | 0x1000, 0),
+        }];
+        let made = state.tables(&list, &used, &expected, true);
+        let [(0, offset)] = made.as_slice() else {
+            panic!("expected a replacement UAV table, got {made:?}");
+        };
+        let index = offset / 32;
+        assert!(index >= heap_host.count());
+        assert!(!heap_host.has_view(index), "the replacement is null");
+        assert!(heap_host.has_view(0), "the original title slot is still live");
+        assert_eq!(state.tables(&list, &used, &expected, true), made);
+
+        let (root, pso) = compile_cs(
+            r#"
+#define RS "DescriptorTable(UAV(u0)), UAV(u1)"
+RWByteAddressBuffer missing : register(u0);
+RWByteAddressBuffer out_words : register(u1);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main() {
+    uint old = missing.Load(0);
+    missing.Store(0, 0xAABBCCDD);
+    out_words.Store(0, old);
+    out_words.Store(4, 0x11223344);
+}
+"#,
+        );
+        let (out, data) = host.shared_buffer(256).unwrap();
+        // SAFETY: an open list, live descriptors and an idle mapped output.
+        unsafe {
+            data.cast::<[u32; 2]>().write([u32::MAX; 2]);
+            list.list.SetDescriptorHeaps(&[Some(heap_host.heap.clone())]);
+            list.list.SetComputeRootSignature(&root);
+            list.list.SetComputeRootDescriptorTable(0, heap_host.gpu(index));
+            list.list.SetComputeRootUnorderedAccessView(1, out.GetGPUVirtualAddress());
+            list.list.SetPipelineState(&pso);
+            list.list.Dispatch(1, 1, 1);
+        }
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: execution is complete and the output buffer is still mapped.
+        let result = unsafe { data.cast::<[u32; 2]>().read() };
+        assert_eq!(result, [0, 0x1122_3344]);
+        assert_eq!(host.log_messages(), None);
     }
 
     #[test]
