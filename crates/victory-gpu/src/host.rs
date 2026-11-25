@@ -2809,6 +2809,7 @@ impl Host {
                 let srv_gpu_base = comp.srv_heap.GetGPUDescriptorHandleForHeapStart();
                 let count = planes.len().min(MAX_PLANES as usize);
                 let mut before = Vec::with_capacity(count + 1);
+                let mut after = Vec::with_capacity(count);
                 for (i, &(tex, state)) in planes[..count].iter().enumerate() {
                     let d = tex.GetDesc();
                     let srv_fmt = swap_format(d.Format).unwrap_or(d.Format);
@@ -2833,11 +2834,20 @@ impl Host {
                         handle,
                     );
                     let state = D3D12_RESOURCE_STATES(state as i32);
-                    if state != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE {
+                    if state != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
+                        && planes[..i]
+                            .iter()
+                            .all(|(earlier, _)| earlier.as_raw() != tex.as_raw())
+                    {
                         before.push(transition(
                             tex,
                             state,
                             D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                        ));
+                        after.push(transition(
+                            tex,
+                            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                            state,
                         ));
                     }
                 }
@@ -2903,17 +2913,6 @@ impl Host {
                     )]);
                     (None::<()>, None::<()>)
                 };
-                let mut after = Vec::with_capacity(count);
-                for &(tex, state) in &planes[..count] {
-                    let state = D3D12_RESOURCE_STATES(state as i32);
-                    if state != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE {
-                        after.push(transition(
-                            tex,
-                            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
-                            state,
-                        ));
-                    }
-                }
                 if !after.is_empty() {
                     list.ResourceBarrier(&after);
                 }
