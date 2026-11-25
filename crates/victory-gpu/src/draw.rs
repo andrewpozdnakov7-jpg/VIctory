@@ -1131,8 +1131,7 @@ impl State {
             if mirrored
                 .as_ref()
                 .is_some_and(|view| !table_access_matches(view, props))
-                || (!host.has_view(index)
-                    && (mirrored.is_some() || !matches_plain_null_srv(props)))
+                || (!host.has_view(index) && (mirrored.is_some() || !matches_plain_null_srv(props)))
             {
                 fresh.push(slot);
             }
@@ -2697,7 +2696,10 @@ void main(uint3 id : SV_DispatchThreadID) {
         let index = offset / 32;
         assert!(index >= heap_host.count());
         assert!(!heap_host.has_view(index), "the replacement is null");
-        assert!(heap_host.has_view(0), "the original title slot is still live");
+        assert!(
+            heap_host.has_view(0),
+            "the original title slot is still live"
+        );
         assert_eq!(state.tables(&list, &used, &expected, true), made);
 
         let (root, pso) = compile_cs(
@@ -2719,10 +2721,13 @@ void main() {
         // SAFETY: an open list, live descriptors and an idle mapped output.
         unsafe {
             data.cast::<[u32; 2]>().write([u32::MAX; 2]);
-            list.list.SetDescriptorHeaps(&[Some(heap_host.heap.clone())]);
+            list.list
+                .SetDescriptorHeaps(&[Some(heap_host.heap.clone())]);
             list.list.SetComputeRootSignature(&root);
-            list.list.SetComputeRootDescriptorTable(0, heap_host.gpu(index));
-            list.list.SetComputeRootUnorderedAccessView(1, out.GetGPUVirtualAddress());
+            list.list
+                .SetComputeRootDescriptorTable(0, heap_host.gpu(index));
+            list.list
+                .SetComputeRootUnorderedAccessView(1, out.GetGPUVirtualAddress());
             list.list.SetPipelineState(&pso);
             list.list.Dispatch(1, 1, 1);
         }
