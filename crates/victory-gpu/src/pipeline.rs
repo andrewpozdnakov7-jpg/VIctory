@@ -697,6 +697,94 @@ mod tests {
     use super::*;
     use crate::object::{S_OK, slot};
 
+    #[cfg(windows)]
+    #[test]
+    fn a_dispatch_reads_root_constant_four_and_a_real_view_offset() {
+        use victory_shader::{HwStage, RootType, emit};
+        use windows::Win32::Graphics::Direct3D::{Fxc::D3DCompile, ID3DBlob};
+        use windows::core::s;
+
+        let Some(host) = crate::host::host() else {
+            eprintln!("no D3D12 host; skipped");
+            return;
+        };
+        let hlsl = b"
+cbuffer UserData : register(b0) { uint value; };
+RWByteAddressBuffer output_buffer : register(u1, space1);
+[numthreads(1, 1, 1)]
+void main() { output_buffer.Store(0, value); }
+";
+        let mut code: Option<ID3DBlob> = None;
+        // SAFETY: the HLSL and output slot live through compilation.
+        unsafe {
+            D3DCompile(
+                hlsl.as_ptr().cast(), hlsl.len(), s!("root_dword"), None, None,
+                s!("main"), s!("cs_5_1"), 0, 0, &mut code, None,
+            )
+        }
+        .unwrap();
+        let code = code.unwrap();
+        // SAFETY: the blob owns these bytes and is live through the dispatches.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize())
+        };
+
+        let buffers = [256; 3].map(crate::resource::test_buffer);
+        let [source, constants_out, offset_out] = buffers;
+        let address = |buffer| crate::resource::buffer_bytes(buffer).unwrap().0;
+        let value = 1.25f32.to_bits();
+        let null = std::ptr::null();
+        let release = |o| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        let mut actual = [0; 2];
+        for (i, (root, out)) in [
+            (RootType::Constants, constants_out),
+            (RootType::Descriptor, offset_out),
+        ].into_iter().enumerate() {
+            let shader = Shader::new("compute", bytes);
+            assert!(shader.translated.set(Some(Translated {
+                host: emit::HostShader {
+                    stage: HwStage::Cs,
+                    dxil: bytes.to_vec(),
+                    user_data: vec![emit::UserData { index: 0, slot: 7, root, dword: 4 }],
+                    samplers: Vec::new(),
+                    static_samplers: Vec::new(),
+                    root_cbvs: Vec::new(),
+                    root_srvs: Vec::new(),
+                    root_uavs: vec![1],
+                    memory: false,
+                    memory_writes: false,
+                    view_addresses: false,
+                    heap: false,
+                    heap_writes: false,
+                    view_marks: false,
+                },
+                used: Vec::new(),
+            })).is_ok());
+            let mut pipeline = null;
+            assert_eq!(hand_out(vec![Arc::new(shader)], None, &PIPELINE_IIDS[0], &mut pipeline), S_OK);
+            assert!(host_pipeline(pipeline).is_some(), "synthetic compute pipeline");
+            let list = host.new_list().unwrap();
+            let mut state = crate::draw::State::default();
+            state.set_pipeline(pipeline);
+            if root == RootType::Constants {
+                state.set_constants(true, 7, &[11, 22, 33, 44, value], 0);
+            } else {
+                state.set_view(true, 7, address(source) as u64 + 16);
+            }
+            state.set_view(true, 1, address(out) as u64);
+            state.dispatch(&list, 1, 1, 1);
+            list.close();
+            host.execute(&[&list]);
+            // SAFETY: the buffer is live and the submission is complete.
+            actual[i] = unsafe { address(out).cast::<u32>().read_unaligned() };
+            assert_eq!(release(pipeline), 0);
+        }
+        for buffer in buffers {
+            assert_eq!(release(buffer), 0);
+        }
+        assert_eq!(actual, [value, 16]);
+    }
+
     fn shaders(p: This) -> Vec<(&'static str, Vec<u8>)> {
         pipeline(p)
             .shaders
