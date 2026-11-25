@@ -1247,15 +1247,15 @@ extern "system" fn map(this: This, _sub: u32, _read: *const c_void, out: *mut *m
 }
 extern "system" fn unmap(_: This, _sub: u32, _written: *const c_void) {}
 extern "system" fn resource_desc(this: This, out: *mut ResourceDesc) {
-    if let Some(out) = unsafe { out.as_mut() } {
+    if !out.is_null() {
         let mut desc = resource(this).desc;
         // Native D3D12 reports the levels it actually allocated for an
-        // automatically sized chain; keep the title's explicit value
-        // otherwise.
-        if desc.mip_levels == 0 {
+        // automatically sized texture chain.
+        if desc.dimension != BUFFER && desc.mip_levels == 0 {
             desc.mip_levels = mip_count(&desc) as u16;
         }
-        *out = desc;
+        // SAFETY: checked non-null; the title passes room for a description.
+        unsafe { out.write(desc) };
     }
 }
 /// Device method `GetCustomHeapProperties`, returning its struct through a
@@ -1887,5 +1887,17 @@ mod tests {
         create(&buffer(256), &mut buf);
         assert_eq!(reported(buf), 1, "buffers have one level");
         assert_eq!(slot::<Release>(buf, 0x10)(buf), 0);
+
+        // Automatic mip chains apply to textures. A buffer's description is
+        // returned unchanged even when its caller left this field at zero.
+        let mut implicit = null;
+        let desc = ResourceDesc {
+            mip_levels: 0,
+            ..buffer(256)
+        };
+        create(&desc, &mut implicit);
+        let count = reported(implicit);
+        assert_eq!(slot::<Release>(implicit, 0x10)(implicit), 0);
+        assert_eq!(count, 0, "buffer width must not determine a mip count");
     }
 }
