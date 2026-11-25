@@ -480,6 +480,19 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
     S_OK
 }
 
+extern "system" fn clear_state(this: This, pipeline: This) {
+    #[cfg(windows)]
+    with_state(this, |host, state| {
+        // SAFETY: the list is open. Draw or dispatch binds the translated pipeline.
+        unsafe { host.list.ClearState(None) };
+        state.clear(pipeline);
+        #[cfg(feature = "diagnostics")]
+        host.note_op(|| format!("clear state {pipeline:?}"));
+    });
+    #[cfg(not(windows))]
+    let _ = (this, pipeline);
+}
+
 /// A resource barrier as titles pass it: type, flags, then a resource and
 /// either a subresource and two states (transition) or a second resource
 /// (aliasing). The same layout as the host's.
@@ -1736,13 +1749,14 @@ fn defer_write(this: This, address: u64, what: Written, bytes: usize) {
 /// layout): IUnknown 3, object 4, device child 1, list 1, graphics list 96
 /// (59 as on PC, then console ones), then versions 1-6 (6 + 1 + 1 + 11 + 3
 /// + 13): 140 slots.
-const METHODS: [(usize, *const ()); 52] = [
+const METHODS: [(usize, *const ()); 53] = [
     (0, list_query as *const ()),
     (2, list_release as *const ()),
     (7, object::parent_device as *const ()),      // 0x38
     (8, list_type as *const ()),                  // 0x40
     (9, close as *const ()),                      // 0x48
     (10, reset as *const ()),                     // 0x50
+    (11, clear_state as *const ()),               // 0x58
     (12, state::draw as *const ()),               // 0x60 instanced
     (13, state::draw_indexed as *const ()),       // 0x68 indexed
     (14, state::dispatch as *const ()),           // 0x70
@@ -1975,6 +1989,209 @@ mod tests {
                 state::clear_unordered_float as *const ()
             );
             assert_eq!(table.0[0x1b8 / 8], ignored_state as *const ());
+        }
+    }
+
+    #[test]
+    fn clear_state_slot_is_stable() {
+        const CLEAR_STATE: extern "system" fn(This, This) = clear_state;
+        for table in [&LIST_FUNCTIONS, &NEWER_LIST_FUNCTIONS] {
+            assert_eq!(table.0[0x58 / 8], CLEAR_STATE as *const ());
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn clear_state_preserves_recorded_gpu_commands() {
+        use crate::resource::{self, HeapProperties, ResourceDesc};
+        use windows::Win32::Foundation::RECT;
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::{
+            DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC,
+        };
+
+        let Some(host) = crate::host::host() else {
+            eprintln!("skipping ClearState GPU test: no host D3D12 device");
+            return;
+        };
+        let null = std::ptr::null();
+        let (mut allocator, mut queue, mut list, mut image) = (null, null, null, null);
+        let iid = &PAGEABLE_IIDS[0];
+        let queue_desc = [0u32; 4]; // direct queue, default priority and flags
+        assert_eq!(
+            crate::queue::create(null, queue_desc.as_ptr().cast(), iid, &mut queue),
+            S_OK
+        );
+        assert_eq!(create_allocator(null, 0, iid, &mut allocator), S_OK);
+        assert_eq!(
+            create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list),
+            S_OK
+        );
+        let host_list = host_list(list).expect("host command list");
+
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 2,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+            ..Default::default()
+        };
+        let guest_desc = (&raw const desc).cast::<ResourceDesc>();
+        assert_eq!(
+            resource::create_committed(
+                null,
+                (&raw const heap).cast::<HeapProperties>(),
+                0,
+                guest_desc,
+                COPY_SOURCE,
+                null.cast(),
+                iid,
+                &mut image,
+            ),
+            S_OK
+        );
+        let texture = resource::host_resource(image).expect("host render target");
+        let mut rtv = [0u64; 8];
+        let handle = rtv.as_mut_ptr() as u64;
+        crate::descriptor::create_rtv(null, image, null.cast(), handle);
+        let viewport = D3D12_VIEWPORT {
+            Width: 2.0,
+            Height: 1.0,
+            MaxDepth: 1.0,
+            ..Default::default()
+        };
+        let scissor = RECT {
+            left: 0,
+            top: 0,
+            right: 2,
+            bottom: 1,
+        };
+        state::viewports(list, 1, &viewport);
+        state::scissors(list, 1, &scissor);
+        state::blend_factor(list, &[0.25; 4]);
+        state::stencil_ref(list, 3);
+        state::topology(list, 4); // triangle list
+        state::targets(list, 1, &handle, 0, null.cast());
+        clear_rtv(list, handle, &[1.0, 0.0, 0.0, 1.0], 0, null.cast());
+
+        slot::<extern "system" fn(This, This)>(list, 0x58)(list, null);
+
+        let (_, before) = host_list
+            .transition(image, COPY_SOURCE)
+            .expect("tracked render-target state");
+        assert_eq!(before, D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32);
+        // SAFETY: the open list still tracks the first clear's render-target state.
+        unsafe {
+            host_list.list.ResourceBarrier(&[crate::host::transition(
+                &texture,
+                D3D12_RESOURCE_STATE_RENDER_TARGET,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+        }
+        state::viewports(list, 1, &viewport);
+        let right = Rect {
+            left: 1,
+            top: 0,
+            right: 2,
+            bottom: 1,
+        };
+        clear_rtv(list, handle, &[0.0, 1.0, 0.0, 1.0], 1, &right);
+
+        // Read the two pixels back so submission proves that both clears ran.
+        // Starting in COPY_SOURCE also exercises the list's render-target prelude.
+        const ROW_PITCH: u32 = 256;
+        let mut readback: Option<ID3D12Resource> = None;
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_READBACK,
+            ..heap
+        };
+        let buffer = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: u64::from(ROW_PITCH),
+            Format: Default::default(),
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: D3D12_RESOURCE_FLAG_NONE,
+            ..desc
+        };
+        // SAFETY: a valid readback buffer description and out pointer.
+        unsafe {
+            host.device
+                .CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &buffer,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    None,
+                    &mut readback,
+                )
+                .unwrap();
+        }
+        let readback = readback.unwrap();
+        let mut footprint = std::mem::MaybeUninit::uninit();
+        resource::copyable_footprints(
+            null,
+            guest_desc,
+            0,
+            1,
+            0,
+            footprint.as_mut_ptr(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        );
+        // SAFETY: the footprint query above wrote one entry.
+        let footprint = unsafe { footprint.assume_init() };
+        use windows::core::Interface;
+        let from = CopyLocation {
+            resource: texture.as_raw().cast(),
+            kind: 0,
+            footprint,
+        };
+        let to = CopyLocation {
+            resource: readback.as_raw().cast(),
+            kind: 1,
+            footprint,
+        };
+        ensure_state(host_list, image, COPY_SOURCE);
+        // SAFETY: an open list and live resources in the copy states. The
+        // locations have the host layout and the buffer holds one padded row.
+        unsafe {
+            host_list.list.CopyTextureRegion(
+                (&raw const to).cast(),
+                0,
+                0,
+                0,
+                (&raw const from).cast(),
+                None,
+            );
+        }
+        assert_eq!(close(list), S_OK);
+        slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(queue, 1, &list);
+        let mut data = std::ptr::null_mut();
+        // SAFETY: queue submission has completed and the buffer holds both pixels.
+        let pixels = unsafe {
+            readback.Map(0, None, Some(&mut data)).unwrap();
+            let pixels = data.cast::<[u8; 8]>().read();
+            readback.Unmap(0, None);
+            pixels
+        };
+        assert_eq!(pixels, [255, 0, 0, 255, 0, 255, 0, 255]);
+        for object in [list, queue, allocator, image] {
+            assert_eq!(
+                slot::<extern "system" fn(This) -> u32>(object, 0x10)(object),
+                0
+            );
         }
     }
 

@@ -243,6 +243,26 @@ impl State {
         self.pipeline = pipeline as usize;
     }
 
+    pub(crate) fn clear(&mut self, pipeline: This) {
+        // Earlier draws can still read the dynamic slots and page table owned by this list.
+        // Root views remain valid and can be reused when their heap is rebound.
+        self.pipeline = pipeline as usize;
+        self.heaps = [0; 2];
+        self.graphics.clear();
+        self.compute.clear();
+        self.vertex = [VertexView::default(); 32];
+        self.index = IndexView::default();
+        self.targets.clear();
+        self.depth = 0;
+        self.topology = 0;
+        self.host_pipeline = 0;
+        self.host_roots = [0; 2];
+        self.host_heaps = [0; 2];
+        self.fresh_tables.clear();
+        self.table_failed = false;
+        self.fixed = Fixed::default();
+    }
+
     /// The title's topology; console-only ones become host lists (see
     /// [`crate::primitive`]).
     pub(crate) fn set_topology(&mut self, list: &HostList, topology: u32) {
@@ -2992,5 +3012,98 @@ void main(uint3 id : SV_DispatchThreadID) {
         drop(found);
         slots.make_null(0);
         assert!(shown.upgrade().is_none(), "released with the slot");
+    }
+}
+
+#[cfg(test)]
+mod clear_state_tests {
+    use super::*;
+
+    #[test]
+    fn clear_resets_bindings_but_retains_dynamic_slots() {
+        // A synthetic allocation record with no registered heap.
+        let dynamic = (0, 64, 3);
+        let root_slots = [((0, 16, false), dynamic.1)];
+        let root_run = (0, dynamic.1 + 1, dynamic.1 + dynamic.2);
+        let mut state = State {
+            pipeline: 1,
+            heaps: [2, 3],
+            graphics: vec![Root::Table(4)],
+            compute: vec![Root::View(5)],
+            vertex: [VertexView {
+                address: 6,
+                size: 64,
+                stride: 16,
+            }; 32],
+            index: IndexView {
+                address: 7,
+                size: 32,
+                format: 57,
+            },
+            targets: vec![8],
+            depth: 9,
+            topology: 4,
+            host_pipeline: 10,
+            host_roots: [11, 12],
+            host_heaps: [13, 14],
+            fresh_tables: [((4, 15), dynamic.1)].into(),
+            dynamic: vec![dynamic],
+            table_failed: true,
+            root_slots: root_slots.into(),
+            root_run,
+            memory: None,
+            fixed: Fixed {
+                viewports: Some(vec![D3D12_VIEWPORT {
+                    Width: 2.0,
+                    Height: 1.0,
+                    MaxDepth: 1.0,
+                    ..Default::default()
+                }]),
+                scissors: Some(vec![RECT { left: 0, top: 0, right: 2, bottom: 1 }]),
+                blend_factor: Some(Some([0.25; 4])),
+                stencil_ref: Some(3),
+                targets: Some((vec![8], 9)),
+                topology: true,
+            },
+        };
+        let pipeline: This = std::ptr::dangling();
+
+        state.clear(pipeline);
+
+        assert_eq!(state.pipeline, pipeline as usize);
+        assert_eq!(state.heaps, [0; 2]);
+        assert!(state.graphics.is_empty());
+        assert!(state.compute.is_empty());
+        assert_eq!(
+            state.vertex.map(|v| (v.address, v.size, v.stride)),
+            [(0, 0, 0); 32]
+        );
+        assert_eq!(
+            (state.index.address, state.index.size, state.index.format),
+            (0, 0, 0)
+        );
+        assert!(state.targets.is_empty());
+        assert_eq!(state.depth, 0);
+        assert_eq!(state.topology, 0);
+        // A later host-list segment must not replay cleared state.
+        assert!(!state.fixed.topology);
+        assert!(state.fixed.viewports.is_none());
+        assert!(state.fixed.scissors.is_none());
+        assert!(state.fixed.blend_factor.is_none());
+        assert!(state.fixed.stencil_ref.is_none());
+        assert!(state.fixed.targets.is_none());
+        assert_eq!(state.host_pipeline, 0);
+        assert_eq!(state.host_roots, [0; 2]);
+        assert_eq!(state.host_heaps, [0; 2]);
+        assert!(state.fresh_tables.is_empty());
+        assert!(!state.table_failed);
+        assert_eq!(state.dynamic, [dynamic]);
+        assert_eq!(state.root_slots, root_slots.into());
+        assert_eq!(state.root_run, root_run);
+
+        state.reset(std::ptr::null());
+        assert!(state.dynamic.is_empty());
+        assert!(state.root_slots.is_empty());
+        assert_eq!(state.root_run, (0, 0, 0));
     }
 }
