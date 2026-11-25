@@ -298,6 +298,12 @@ pub(crate) struct HostPipeline {
     pub(crate) marks: Option<(u32, u32)>,
 }
 
+/// A compute shader reading lanes within aligned groups may get host
+/// waves of `host_min` lanes, which must hold whole groups.
+fn too_few_lanes(shader: &victory_shader::emit::HostShader, host_min: u32) -> bool {
+    host_min < shader.min_lanes
+}
+
 /// Logs a pipeline that gets no host pipeline, once per reason.
 fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline> {
     static SEEN: std::sync::Mutex<Vec<&str>> = std::sync::Mutex::new(Vec::new());
@@ -348,6 +354,14 @@ impl HostPipeline {
             s.translated()?;
         }
         let host = host()?;
+        if let Some(cs) = compute
+            && too_few_lanes(&cs.translated()?.host, host.wave_lanes_min())
+        {
+            return refuse(
+                "the host GPU's waves are narrower than the lane groups the shader reads",
+                shaders,
+            );
+        }
         // `SFI0`: 64-bit atomics on typed resources and on heap resources.
         let atomics64 = stages.iter().any(|(s, _)| {
             let Some(t) = s.translated() else {
@@ -858,6 +872,28 @@ mod tests {
             element(DXGI_FORMAT_R32G32B32_FLOAT, APPEND),
         ];
         assert_eq!(offsets(&c), [0, 4, 12]);
+    }
+
+    #[test]
+    fn shaders_reading_lane_groups_need_host_waves_that_hold_them() {
+        let shader = |min_lanes| victory_shader::emit::HostShader {
+            min_lanes,
+            ..victory_shader::emit::host::stub_ps()
+        };
+        // WARP (4), a 16-lane host, a 32-lane one.
+        for (min_lanes, refused) in [
+            (0, [false; 3]),
+            (4, [false; 3]),
+            (8, [true, false, false]),
+            (16, [true, false, false]),
+            (32, [true, true, false]),
+        ] {
+            let got = [4, 16, 32].map(|host| too_few_lanes(&shader(min_lanes), host));
+            assert_eq!(got, refused, "groups of {min_lanes}");
+        }
+        // A host whose lane counts did not read back runs none of them.
+        assert!(too_few_lanes(&shader(4), 0));
+        assert!(!too_few_lanes(&shader(0), 0));
     }
 
     /// An explicit offset near 4 GiB overflowed the next appended offset

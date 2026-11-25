@@ -750,6 +750,30 @@ impl Host {
         })
     }
 
+    /// The fewest lanes a host wave has (0 if unknown); logged once.
+    pub(crate) fn wave_lanes_min(&self) -> u32 {
+        static LANES: OnceLock<u32> = OnceLock::new();
+        *LANES.get_or_init(|| {
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+            // SAFETY: the query writes the structure of the given size.
+            let ok = unsafe {
+                self.device.CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS1,
+                    (&raw mut options).cast(),
+                    size_of_val(&options) as u32,
+                )
+            }
+            .is_ok();
+            let lanes = if ok { options.WaveLaneCountMin } else { 0 };
+            tracing::info!(
+                min = lanes,
+                max = options.WaveLaneCountMax,
+                "host wave lanes"
+            );
+            lanes
+        })
+    }
+
     /// A new list, open for recording.
     pub(crate) fn new_list(&self) -> windows::core::Result<HostList> {
         // SAFETY: plain object creation.

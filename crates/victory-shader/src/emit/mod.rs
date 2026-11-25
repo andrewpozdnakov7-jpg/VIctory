@@ -2,7 +2,9 @@
 //! or mesh shader as a PC DXIL container (SM 6.6) that host D3D12 accepts.
 //! Compute shaders keep the console's thread-group size; one that depends
 //! on the lane layout (cross-lane operations) declares the console's wave
-//! size (`WaveSize`), so the host device must support it.
+//! size (`WaveSize`), so the host device must support it, unless it reads
+//! lanes only within aligned groups narrower than the wave (quads, rows):
+//! then host waves need only hold whole groups ([`HostShader::min_lanes`]).
 //!
 //! What the host binds for a translated shader ([`HostShader`]):
 //!
@@ -192,6 +194,8 @@ mod diff_tests;
 mod flow_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
+#[cfg(all(test, windows))]
+mod lane_group_tests;
 mod lower;
 mod rect;
 pub use rect::rectangle_gs;
@@ -307,6 +311,10 @@ pub struct HostShader {
     /// `u`[`VIEW_WRITES`] in [`MEMORY_SPACE`] (module notes, "Write
     /// marks").
     pub view_marks: bool,
+    /// Compute: the fewest lanes a host wave must have (0: any). A program
+    /// reading other lanes only within aligned groups of this many declares
+    /// no wave size, so it runs on host waves that hold whole groups.
+    pub min_lanes: u32,
 }
 
 impl HostShader {
@@ -519,6 +527,7 @@ pub fn emit_with(
         heap: l.heap,
         heap_writes: l.heap_writes,
         view_marks: l.view_marks,
+        min_lanes: l.min_lanes,
     })
 }
 
@@ -878,6 +887,7 @@ mod tests {
             heap: false,
             heap_writes: false,
             view_marks: false,
+            min_lanes: 0,
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -895,6 +905,7 @@ mod tests {
                 heap: false,
                 heap_writes: false,
                 view_marks: false,
+                min_lanes: 0,
             })
         };
         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);

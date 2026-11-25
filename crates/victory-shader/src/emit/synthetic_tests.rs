@@ -118,6 +118,7 @@ fn build(words: &[u32]) -> Result<HostShader, crate::ShaderError> {
         heap: lowered.heap,
         heap_writes: lowered.heap_writes,
         view_marks: lowered.view_marks,
+        min_lanes: lowered.min_lanes,
     })
 }
 

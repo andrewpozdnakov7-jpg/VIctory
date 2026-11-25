@@ -212,6 +212,7 @@ fn encode(translation: &Result<HostShader, String>) -> Vec<u8> {
         heap,
         heap_writes,
         view_marks,
+        min_lanes,
     } = s;
     let mut out = MAGIC.to_vec();
     let word = |out: &mut Vec<u8>, v: u32| out.extend(v.to_le_bytes());
@@ -263,6 +264,7 @@ fn encode(translation: &Result<HostShader, String>) -> Vec<u8> {
             | u32::from(*heap_writes) << 4
             | u32::from(*view_marks) << 5,
     );
+    word(&mut out, *min_lanes);
     out
 }
 
@@ -324,6 +326,7 @@ fn decode(bytes: &[u8]) -> Option<Result<HostShader, String>> {
     let root_srvs = r.list()?;
     let root_uavs = r.list()?;
     let memory = r.word()?;
+    let min_lanes = r.word()?;
     r.0.is_empty().then_some(Ok(HostShader {
         stage,
         dxil,
@@ -339,6 +342,7 @@ fn decode(bytes: &[u8]) -> Option<Result<HostShader, String>> {
         heap: memory & 8 != 0,
         heap_writes: memory & 16 != 0,
         view_marks: memory & 32 != 0,
+        min_lanes,
     }))
 }
 
@@ -372,6 +376,7 @@ mod tests {
             heap: true,
             heap_writes: true,
             view_marks: true,
+            min_lanes: 16,
         }
     }
 

@@ -199,6 +199,7 @@ fn program() -> HostShader {
         heap: l.heap,
         heap_writes: l.heap_writes,
         view_marks: l.view_marks,
+        min_lanes: l.min_lanes,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone()).expect("DXIL validation failed");
@@ -431,6 +432,7 @@ fn root_views_read_their_copy_and_zeros_past_it() {
         heap: l.heap,
         heap_writes: l.heap_writes,
         view_marks: l.view_marks,
+        min_lanes: l.min_lanes,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone()).expect("DXIL validation failed");
@@ -566,6 +568,7 @@ fn writes_through_views_mark_their_pages() {
         heap: l.heap,
         heap_writes: l.heap_writes,
         view_marks: l.view_marks,
+        min_lanes: l.min_lanes,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone()).expect("DXIL validation failed");

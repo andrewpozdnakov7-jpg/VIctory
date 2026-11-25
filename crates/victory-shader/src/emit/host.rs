@@ -272,6 +272,22 @@ impl Host {
         }
     }
 
+    /// The host's fewest and most lanes per wave.
+    pub fn wave_lanes(&self) -> Result<(u32, u32), String> {
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+        // SAFETY: the query writes the structure of the given size.
+        unsafe {
+            self.device
+                .CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS1,
+                    (&raw mut options).cast(),
+                    size_of_val(&options) as u32,
+                )
+                .map_err(err)?;
+        }
+        Ok((options.WaveLaneCountMin, options.WaveLaneCountMax))
+    }
+
     /// A compute pipeline; user data is root parameter 0.
     pub fn compute_pipeline(
         &self,
@@ -734,6 +750,7 @@ fn fmad_probe() -> Result<HostShader, crate::ShaderError> {
         heap: lowered.heap,
         heap_writes: lowered.heap_writes,
         view_marks: lowered.view_marks,
+        min_lanes: lowered.min_lanes,
     })
 }
 
@@ -833,6 +850,7 @@ fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
         heap: false,
         heap_writes: false,
         view_marks: false,
+        min_lanes: 0,
     }
 }
 
