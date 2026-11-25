@@ -2342,6 +2342,109 @@ mod tests {
         }
     }
 
+    /// A source write updates a placed alias. A later write to the alias
+    /// wins until the source changes again.
+    #[cfg(windows)]
+    #[test]
+    fn a_second_gpu_write_reaches_the_placed_alias_in_the_same_list() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_BC1_UNORM, DXGI_FORMAT_R32G32_UINT};
+
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let backing = Memory::zeroed(1 << 20, 1 << 16).unwrap();
+        let null = std::ptr::null();
+        let place = |desc: &ResourceDesc| {
+            let mut made = null;
+            assert_eq!(
+                create_at_address(
+                    null, backing.address(), desc, 0, std::ptr::null(), &RESOURCE_IIDS[0],
+                    &mut made,
+                ),
+                S_OK
+            );
+            made
+        };
+        let from = place(&ResourceDesc {
+            layout: 1,
+            flags: UNORDERED,
+            ..texture(1, 1, DXGI_FORMAT_R32G32_UINT.0 as u32, 1)
+        });
+        let to = place(&ResourceDesc {
+            layout: 1,
+            ..texture(4, 4, DXGI_FORMAT_BC1_UNORM.0 as u32, 1)
+        });
+        let source = host_resource(from).expect("source writer");
+        let dest = host_resource(to).expect("placed alias");
+        assert_eq!(alias_source(to), Some(from));
+        const STRIDE: u64 = D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT as u64;
+        let (upload, mapped) = host.upload_buffer(3 * STRIDE).unwrap();
+        let (out, data) = host.shared_buffer(4 * STRIDE).unwrap();
+        let footprint = |r: &ID3D12Resource, offset: u64| {
+            let mut fp = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+            // SAFETY: a live texture and room for its one footprint.
+            unsafe {
+                host.device.GetCopyableFootprints(
+                    &r.GetDesc(), 0, 1, offset, Some(&mut fp), None, None, None,
+                );
+            }
+            fp
+        };
+        let sub = |r: &ID3D12Resource| D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: an open copy location borrows the COM pointer.
+            pResource: unsafe { std::mem::transmute_copy(r) },
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+        };
+        let placed = |r: &ID3D12Resource, fp| D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: as above.
+            pResource: unsafe { std::mem::transmute_copy(r) },
+            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: fp },
+        };
+        let list = host.new_list().unwrap();
+        let read = |view, resource: &ID3D12Resource, offset| {
+            crate::list::ensure_state(&list, view, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32);
+            let fp = footprint(resource, offset);
+            // SAFETY: resources in the states just chosen and a matching footprint.
+            unsafe { list.list.CopyTextureRegion(&placed(&out, fp), 0, 0, 0, &sub(resource), None) };
+        };
+        let write = |view, resource: &ID3D12Resource, offset, block| {
+            let fp = footprint(resource, offset);
+            crate::list::ensure_state(&list, view, D3D12_RESOURCE_STATE_COPY_DEST.0 as u32);
+            crate::texture::host_writes(&list, view);
+            // SAFETY: the upload contains an eight-byte texel at each aligned offset.
+            unsafe {
+                mapped.add(fp.Offset as usize).cast::<u64>().write_unaligned(block);
+                list.list.CopyTextureRegion(&sub(resource), 0, 0, 0, &placed(&upload, fp), None);
+            }
+        };
+        const RED: u64 = 0xf800;
+        const BLUE: u64 = 0x001f;
+        const GREEN: u64 = 0x07e0;
+        write(from, &source, 0, RED);
+        crate::texture::alias_copy(&list, from, to);
+        read(to, &dest, 0);
+        write(to, &dest, STRIDE, BLUE);
+        crate::texture::alias_copy(&list, from, to);
+        read(to, &dest, STRIDE);
+        write(from, &source, 2 * STRIDE, GREEN);
+        read(from, &source, 3 * STRIDE);
+        crate::texture::alias_copy(&list, from, to);
+        read(to, &dest, 2 * STRIDE);
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: the four complete readbacks, at their aligned offsets.
+        let [first, dest_write, source_write, writer] = [0, STRIDE, 2 * STRIDE, 3 * STRIDE]
+            .map(|offset| unsafe { data.add(offset as usize).cast::<u64>().read_unaligned() });
+        for resource in [to, from] {
+            assert_eq!(slot::<Release>(resource, 0x10)(resource), 0);
+        }
+        assert_eq!(writer, GREEN, "the second GPU write reached the source");
+        assert_eq!([first, dest_write, source_write], [RED, BLUE, GREEN], "placed alias readbacks");
+    }
+
     fn texture(width: u64, height: u32, format: u32, mips: u16) -> ResourceDesc {
         ResourceDesc {
             dimension: 3,
@@ -2351,6 +2454,111 @@ mod tests {
             mip_levels: mips,
             layout: 0,
             ..buffer(0)
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn multisampled_aliases_copy_all_samples() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_R32_FLOAT};
+
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let backing = Memory::zeroed(1 << 22, 1 << 16).unwrap();
+        let null = std::ptr::null();
+        let place = |desc: &ResourceDesc| {
+            let mut made = null;
+            assert_eq!(
+                create_at_address(
+                    null, backing.address(), desc, 0, std::ptr::null(), &RESOURCE_IIDS[0],
+                    &mut made,
+                ),
+                S_OK
+            );
+            made
+        };
+        let color = texture(4, 4, DXGI_FORMAT_R32_FLOAT.0 as u32, 1);
+        let common = ResourceDesc {
+            sample_count: 4,
+            layout: 0x100 | texture::Swizzle::SW_64KB_Z_X.0,
+            ..color
+        };
+        let from = place(&ResourceDesc {
+            format: DXGI_FORMAT_D32_FLOAT.0 as u32,
+            flags: DEPTH,
+            ..common
+        });
+        let to = place(&ResourceDesc { flags: 1, ..common });
+        let source = host_resource(from).expect("multisampled depth");
+        let dest = host_resource(to).expect("multisampled color alias");
+        assert_eq!(alias_source(to), Some(from));
+
+        let mut resolved = null;
+        assert_eq!(
+            create_committed(
+                null, &PROPERTIES, 0, &color, 0, std::ptr::null(), &RESOURCE_IIDS[0],
+                &mut resolved,
+            ),
+            S_OK
+        );
+        let single = host_resource(resolved).expect("single-sample resolve target");
+        let list = host.new_list().unwrap();
+        crate::list::ensure_state(&list, to, D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32);
+        let rtv = host.rtv(&dest, None);
+        crate::list::ensure_state(&list, from, D3D12_RESOURCE_STATE_DEPTH_WRITE.0 as u32);
+        let view = D3D12_DEPTH_STENCIL_VIEW_DESC {
+            Format: DXGI_FORMAT_D32_FLOAT,
+            ViewDimension: D3D12_DSV_DIMENSION_TEXTURE2DMS,
+            ..Default::default()
+        };
+        let dsv = host.dsv(&source, Some(&view));
+        // SAFETY: both multisampled textures are live and in their target states.
+        unsafe {
+            list.list.ClearRenderTargetView(rtv, &[-0.5, 0.0, 0.0, 0.0], None);
+            list.list.ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 0.375, 0, None);
+        }
+        crate::texture::alias_copy(&list, from, to);
+
+        crate::list::ensure_state(&list, to, D3D12_RESOURCE_STATE_RESOLVE_SOURCE.0 as u32);
+        crate::list::ensure_state(&list, resolved, D3D12_RESOURCE_STATE_RESOLVE_DEST.0 as u32);
+        let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+        let mut total = 0;
+        // SAFETY: live textures in their resolve states, and room for one footprint.
+        unsafe {
+            list.list.ResolveSubresource(&single, 0, &dest, 0, DXGI_FORMAT_R32_FLOAT);
+            host.device.GetCopyableFootprints(
+                &single.GetDesc(), 0, 1, 0, Some(&mut footprint), None, None, Some(&mut total),
+            );
+        }
+        let (out, data) = host.shared_buffer(total).unwrap();
+        crate::list::ensure_state(&list, resolved, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32);
+        // SAFETY: resources in their copy states. The locations borrow their COM pointers.
+        unsafe {
+            let src = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&single),
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+            };
+            let dst = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&out),
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: footprint },
+            };
+            list.list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+        }
+        // SAFETY: the test owns this open command list.
+        unsafe { list.list.Close() }.expect("the alias copy and resolve close");
+        host.execute(&[&list]);
+        for y in 0..4 {
+            let offset = footprint.Offset as usize + y * footprint.Footprint.RowPitch as usize;
+            // SAFETY: four R32 pixels from the completed copy, within the mapped buffer.
+            let row = unsafe { data.add(offset).cast::<[f32; 4]>().read_unaligned() };
+            assert_eq!(row, [0.375; 4], "resolved row {y}");
+        }
+        for resource in [resolved, to, from] {
+            assert_eq!(slot::<Release>(resource, 0x10)(resource), 0);
         }
     }
 
