@@ -14,7 +14,7 @@ use super::container::SigElement;
 use super::shader::{Shader, VIEW_STRIDES, flags};
 use crate::ShaderError;
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
-use crate::io::{Barycentric, Elsewhere, Export, Input, Interp, Io, Target};
+use crate::io::{Attribute, Barycentric, Elsewhere, Export, Input, Interp, Io, Target};
 use crate::ir::{EXEC, Exit, Inst, Program, Reg, Value};
 use crate::native::{HwStage, NativeProgram, ResourceType, RootType, StageIo, Usage, UsedResource};
 use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER_DATA};
@@ -200,6 +200,8 @@ struct Lower<'a> {
     scalar: HashMap<Site, Address>,
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
+    /// Rows with an emitted isolated P10 read and its byte offset.
+    isolated_p10_rows: BTreeMap<u8, usize>,
     handles: HashMap<(usize, Site, u8, bool, u32), V>,
     /// Blocks splitting the edge from one IR block to another.
     edges: HashMap<(usize, usize), usize>,
@@ -607,6 +609,7 @@ impl<'a> Lower<'a> {
             scalar: x.res.scalar.iter().copied().collect(),
             exports: x.io.exports.iter().map(|e| (e.site, e)).collect(),
             interps: x.io.interps.iter().map(|(s, i)| (*s, i)).collect(),
+            isolated_p10_rows: BTreeMap::new(),
             handles: HashMap::new(),
             edges: HashMap::new(),
             exported: vec![false; p.blocks.len()],
@@ -1305,6 +1308,20 @@ impl<'a> Lower<'a> {
             self.exit(b)?;
         }
         self.fill_phis()?;
+        // The signature writer aligns unread float inputs with the row's
+        // decided mode. Reject a live read or fixed mode it cannot change.
+        for (&row, &offset) in &self.isolated_p10_rows {
+            if self.s.inputs.iter().any(|e| {
+                e.row == Some(u32::from(row))
+                    && e.interp != 1
+                    && (e.kind != 0 || e.comp != 9 || e.usage != 0)
+            }) {
+                return Err(unsupported(
+                    offset,
+                    "isolated P10 sharing an input row with a different interpolation mode",
+                ));
+            }
+        }
         let user_data = self.user_reads.values().copied().collect();
         self.s.samplers = self.samplers.len() as u32;
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
@@ -7406,6 +7423,7 @@ impl<'a> Lower<'a> {
         let Some(&interp) = self.interps.get(&site) else {
             return Err("the first half of an interpolation");
         };
+        let p10 = matches!(interp, Interp::Vertex { vertex: 0, .. });
         let (attribute, mode) = match interp {
             Interp::Interpolated { unless, .. } if !self.avoids(site, unless) => {
                 return Err("an interpolation with computed barycentrics");
@@ -7431,6 +7449,7 @@ impl<'a> Lower<'a> {
                 attribute,
                 vertex: 2,
             } => (attribute, 1),
+            Interp::Vertex { attribute, vertex: 0 } => (attribute, 1),
             Interp::Vertex { .. } => return Err("a non-provoking vertex value"),
         };
         let dst = match &inst.fields {
@@ -7465,6 +7484,8 @@ impl<'a> Lower<'a> {
         };
         let f16 = inst.name().ends_with("_f16");
         let x = match packing {
+            None if p10 => self.isolated_p10(attribute, inst.machine.offset)?,
+            Some(_) if p10 => return Err("a non-provoking vertex value"),
             None if f16 || attribute.high => return Err("a 16-bit read of a 32-bit input"),
             None => channel(self, attribute.row, attribute.channel)?,
             Some(pack2) => {
@@ -7508,6 +7529,63 @@ impl<'a> Lower<'a> {
         // A pixel interpolates in every lane; guards only hide inactive ones.
         self.write(inst, Reg::V(reg), x, None);
         Ok(())
+    }
+
+    /// Read the float32 parameter coefficient P10 as P1 - P0, using the
+    /// host triangle's vertex order.
+    fn isolated_p10(&mut self, attribute: &Attribute, offset: usize) -> Result<V, Why> {
+        const UNSUPPORTED: Why = "a non-provoking vertex value";
+        let StageIo::Ps { inputs, .. } = &self.x.native.io else {
+            return Err(UNSUPPORTED);
+        };
+        if attribute.usage != Usage::Generic
+            || attribute.high
+            || !inputs.iter().any(|input| {
+                input.row == attribute.row
+                    && input.usage == attribute.usage
+                    && input.mask & (1 << attribute.channel) != 0
+                    && !input.flat
+                    && !input.fp16
+            })
+        {
+            return Err(UNSUPPORTED);
+        }
+        let (id, col) = self
+            .find_input(attribute.row, attribute.channel)
+            .ok_or(UNSUPPORTED)?;
+        let e = &mut self.s.inputs[id];
+        if e.kind != 0 || e.comp != 9 || e.half {
+            return Err(UNSUPPORTED);
+        }
+        if e.usage != 0 && e.interp != 1 {
+            return Err("one input interpolated two ways");
+        }
+        e.interp = 1;
+        e.usage |= 1 << col;
+        self.isolated_p10_rows
+            .entry(attribute.row)
+            .or_insert(offset);
+        self.s.flags |= flags::BARYCENTRICS;
+
+        let c = self.cur;
+        let id = self.s.m.i32(id as u32);
+        let row = self.s.m.i32(0);
+        let col = self.s.m.i8(col);
+        let mut vertex = |k| {
+            let k = self.s.m.i8(k);
+            self.s.op(
+                c,
+                "attributeAtVertex.f32",
+                Attr::ReadNone,
+                self.s.t.f32,
+                137,
+                &[id, row, col, k],
+            )
+        };
+        let p0 = vertex(0);
+        let p1 = vertex(1);
+        let delta = self.s.m.bin(c, Bin::Sub, p1, p0);
+        Ok(self.s.m.cast(c, Cast::Bitcast, delta, self.s.t.i32))
     }
 
     /// Whether no lane that runs the instruction at `site` has been where

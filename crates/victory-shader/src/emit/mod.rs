@@ -1228,6 +1228,209 @@ mod tests {
         Ok(out)
     }
 
+    fn p10_input_signature() -> Vec<u8> {
+        let element = SigElement {
+            name: "TEXCOORD".into(),
+            index: 0,
+            kind: 0,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 1,
+            usage: 0,
+            half: false,
+        };
+        container::signature(
+            &[
+                SigElement {
+                    name: "COLOR".into(),
+                    col: 1,
+                    cols: 3,
+                    ..element.clone()
+                },
+                element,
+            ],
+            true,
+        )
+    }
+
+    fn emit_p10_fixture(
+        reads: &[u32],
+        export: u32,
+        input_addr: u32,
+    ) -> Result<HostShader, ShaderError> {
+        let words: Vec<u32> = reads
+            .iter()
+            .copied()
+            .chain([0xF800_180F, export, 0xBF81_0000])
+            .collect();
+        emit_pixel(
+            &words,
+            vec![crate::native::PsInput {
+                mask: 0xf,
+                ..texcoord(false)
+            }],
+            input_addr,
+            &p10_input_signature(),
+            &rows(&[("SV_Target", 16, false)], false),
+        )
+    }
+
+    #[test]
+    fn isolated_p10_preserves_packed_input_linkage() {
+        let shader = emit_p10_fixture(&[0xC812_0000], 0x0404_0404, 0).unwrap();
+        let c = Container::parse(&shader.dxil).unwrap();
+        let input = c.part(FourCC::ISG1).unwrap().data;
+        let mut expected = p10_input_signature();
+        // TEXCOORD0.x is used. The declaration and order of both elements stay intact.
+        expected[8 + 32 + 25] = 1;
+        assert_eq!(input, expected);
+        let psv = c.part(FourCC::PSV0).unwrap().data;
+        for packed_columns in [0x53, 0x41] {
+            assert!(psv.windows(6).any(|w| w == [1, 0, packed_columns, 0, 3, 1]));
+        }
+        let features = c.part(FourCC::SFI0).unwrap().data;
+        assert_ne!(crate::dxbc::u32_at(features, 0).unwrap() & 0x2_0000, 0);
+    }
+
+    #[test]
+    fn isolated_p10_rejects_incompatible_live_interpolation() {
+        let e = emit_p10_fixture(
+            &[0xC812_0000, 0xC808_0100, 0xC809_0101],
+            0x0204_0204,
+            1 << 1,
+        )
+        .err()
+        .unwrap();
+        assert!(
+            matches!(
+                e,
+                ShaderError::Unsupported {
+                    offset: 0,
+                    what: "isolated P10 sharing an input row with a different interpolation mode",
+                }
+            ),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn isolated_p10_controls_keep_p0_and_p1_p2() {
+        let p0 = emit_p10_fixture(&[0xC812_0002], 0x0404_0404, 0).unwrap();
+        let pair = emit_p10_fixture(&[0xC808_0100, 0xC809_0101], 0x0202_0202, 1 << 1).unwrap();
+        for (shader, mode) in [(p0, 1), (pair, 2)] {
+            let c = Container::parse(&shader.dxil).unwrap();
+            let psv = c.part(FourCC::PSV0).unwrap().data;
+            for packed_columns in [0x53, 0x41] {
+                assert!(
+                    psv.windows(6)
+                        .any(|w| w == [1, 0, packed_columns, 0, 3, mode])
+                );
+            }
+            let features = c.part(FourCC::SFI0).unwrap().data;
+            assert_eq!(crate::dxbc::u32_at(features, 0).unwrap() & 0x2_0000, 0);
+        }
+
+        let p20 = emit_p10_fixture(&[0xC812_0001], 0x0404_0404, 0)
+            .err()
+            .unwrap();
+        assert!(
+            matches!(
+                p20,
+                ShaderError::Unsupported {
+                    what: "a non-provoking vertex value",
+                    ..
+                }
+            ),
+            "{p20}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires Windows DXC, the DXIL validator and WARP"]
+    fn isolated_p10_and_p0_draw_with_a_packed_signature() {
+        use super::host::{Draw, Host};
+        use windows::Win32::Graphics::Direct3D12::D3D12_SHADER_VISIBILITY_PIXEL;
+        use windows::Win32::Graphics::Dxgi::*;
+
+        let path = super::validator::Validator::default_path().unwrap();
+        let dxc = std::env::var_os("VICTORY_PC_DXC")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| path.with_file_name("dxc.exe"));
+        let mut validator = super::validator::Validator::load(Some(&path)).unwrap();
+        let dir = std::env::temp_dir().join(format!("victory-p10-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let vs = super::flow_tests::compile(
+            &dxc,
+            &dir,
+            r#"
+            struct Varyings { float value : TEXCOORD0; float3 spare : COLOR0; float4 pos : SV_Position; };
+            Varyings vs_main(float4 data : POSITION, float4 attr : TEXCOORD0) {
+                Varyings v;
+                v.value = attr.x;
+                v.spare = attr.yzw;
+                v.pos = data;
+                return v;
+            }
+            "#,
+            "vs_main",
+            "vs_6_6",
+        );
+        std::fs::remove_file(dir.join("vs_main.hlsl")).unwrap();
+        if vs.is_ok() {
+            std::fs::remove_file(dir.join("vs_main.bin")).unwrap();
+        }
+        std::fs::remove_dir(&dir).unwrap();
+        let vs = vs.unwrap();
+
+        let host = Host::new(true).unwrap();
+        // SAFETY: the queried interfaces are owned and the adapter matches the device's LUID.
+        let adapter = unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).unwrap();
+            let adapter: IDXGIAdapter1 = factory
+                .EnumAdapterByLuid(host.device.GetAdapterLuid())
+                .unwrap();
+            adapter.GetDesc1().unwrap()
+        };
+        eprintln!(
+            "WARP adapter {:04x}:{:04x}",
+            adapter.VendorId, adapter.DeviceId
+        );
+
+        let vertices = [
+            [-1.0, -1.0, 0.5, 1.0, 0.25, 0.0, 0.0, 0.0],
+            [1.0, -1.0, 0.5, 1.0, 0.75, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.5, 1.0, 0.125, 0.0, 0.0, 0.0],
+        ];
+        for (name, operand, expected) in [("P10", 0, 0.5), ("P0", 2, 0.25)] {
+            let mut ps = emit_p10_fixture(&[0xC812_0000 | operand], 0x0404_0404, 0).unwrap();
+            validator.validate(&mut ps.dxil).unwrap();
+            let root = host
+                .root_signature_for(&[(&ps, D3D12_SHADER_VISIBILITY_PIXEL)])
+                .unwrap();
+            let pso = host.pipeline_with(&root, &vs, &ps.dxil).unwrap();
+            let pixels = host
+                .draw(
+                    &root,
+                    &pso,
+                    &Draw {
+                        roots: Vec::new(),
+                        textures: &[],
+                        samplers: &[],
+                        vertices: vertices.as_flattened(),
+                        stride: 32,
+                        size: (1, 1),
+                        mesh_groups: 0,
+                    },
+                )
+                .unwrap();
+            eprintln!("{name}: DXIL validated, SV_Target0.r = {}", pixels[0][0]);
+            assert_eq!(pixels[0][0], expected, "{name}");
+        }
+    }
+
     /// A float4 element per row (16-bit ones declared so in the part).
     fn rows(elements: &[(&str, u8, bool)], input: bool) -> Vec<u8> {
         let els: Vec<SigElement> = elements
