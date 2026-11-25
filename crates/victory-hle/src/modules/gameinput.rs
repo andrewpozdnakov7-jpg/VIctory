@@ -679,15 +679,20 @@ fn relative(
     let Some(index) = hub.index(reference.device) else {
         return fail(out, E_INVALIDARG);
     };
-    if !device.is_null() && !std::ptr::eq(device, reference.device) {
-        return fail(out, E_INVALIDARG);
-    }
     let state = hub.state();
-    // As for the current reading: a device filter for a device that is gone
-    // fails, so a title polling it stops instead of waiting for readings.
-    if !device.is_null() && !state.slots[index].connected {
-        return fail(out, DEVICE_DISCONNECTED);
-    }
+    // The reference locates the starting point in the stream. The device
+    // filter limits which readings can be returned from there.
+    let devices = if device.is_null() {
+        0..DEVICES
+    } else {
+        let Some(filter) = hub.index(device) else {
+            return fail(out, E_INVALIDARG);
+        };
+        if !state.slots[filter].connected {
+            return fail(out, DEVICE_DISCONNECTED);
+        }
+        filter..filter + 1
+    };
     if state.slots[index]
         .history
         .front()
@@ -697,11 +702,6 @@ fn relative(
     }
     // On one device this order is its sequence order.
     let at = (reference.timestamp, index, reference.sequence);
-    let devices = if device.is_null() {
-        0..DEVICES
-    } else {
-        index..index + 1
-    };
     let candidates = devices
         .flat_map(|i| {
             let history = &state.slots[i].history;
@@ -1562,6 +1562,39 @@ mod tests {
         let rest = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
         assert_eq!(pad(rest), PadState::default());
         release(rest);
+    }
+
+    #[test]
+    fn a_device_filter_can_differ_from_the_reference_device() {
+        type Walk = extern "system" fn(This, *const Reading, u32, *const Device, Out) -> HRESULT;
+        let (hub, host) = fake();
+        {
+            let mut host = host.lock().unwrap();
+            host.pads[0] = Some(PadState { buttons: A, ..Default::default() });
+            host.pads[1] = Some(PadState { buttons: B, ..Default::default() });
+        }
+        hub.poll();
+        let first = current(hub, GAMEPAD_KIND, 0).unwrap();
+        let second = current(hub, GAMEPAD_KIND, 1).unwrap();
+        let filtered = |offset, reference, device: usize| {
+            let mut out = std::ptr::null();
+            let operation = slot::<Walk, _>(&hub.object, offset);
+            result(
+                operation(&hub.object, reference, GAMEPAD_KIND, &hub.devices[device], &mut out),
+                out,
+            )
+        };
+
+        // Both readings came from one poll. The global stream orders the
+        // first pad before the second even though their timestamps match.
+        assert_eq!(stamp(first).0, stamp(second).0);
+        assert_eq!(filtered(0x28, first, 1), Ok(second));
+        assert_eq!(filtered(0x30, second, 0), Ok(first));
+        assert_eq!(filtered(0x30, first, 1), Err(READING_NOT_FOUND));
+        assert_eq!(filtered(0x28, second, 0), Err(READING_NOT_FOUND));
+        for reading in [first, first, second, second] {
+            release(reading);
+        }
     }
 
     #[test]
