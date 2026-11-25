@@ -284,7 +284,8 @@ pub(crate) fn alias_copy(list: &HostList, from: This, to: This) {
         }
         prepare();
         // SAFETY: live, copy-compatible textures in the states set above.
-        unsafe { list.list.CopyResource(&b, &a) };
+        unsafe { list.list.CopyResource(b, a) };
+        list.record_alias_copy(&source, &dest);
         ALIAS_COPIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return;
     }

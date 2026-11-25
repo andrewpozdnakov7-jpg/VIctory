@@ -2519,43 +2519,64 @@ mod tests {
             list.list.ClearRenderTargetView(rtv, &[-0.5, 0.0, 0.0, 0.0], None);
             list.list.ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 0.375, 0, None);
         }
-        crate::texture::alias_copy(&list, from, to);
-
-        crate::list::ensure_state(&list, to, D3D12_RESOURCE_STATE_RESOLVE_SOURCE.0 as u32);
-        crate::list::ensure_state(&list, resolved, D3D12_RESOURCE_STATE_RESOLVE_DEST.0 as u32);
         let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
         let mut total = 0;
-        // SAFETY: live textures in their resolve states, and room for one footprint.
+        // SAFETY: a live single-sample texture and one queried subresource.
         unsafe {
-            list.list.ResolveSubresource(&single, 0, &dest, 0, DXGI_FORMAT_R32_FLOAT);
             host.device.GetCopyableFootprints(
                 &single.GetDesc(), 0, 1, 0, Some(&mut footprint), None, None, Some(&mut total),
             );
         }
-        let (out, data) = host.shared_buffer(total).unwrap();
-        crate::list::ensure_state(&list, resolved, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32);
-        // SAFETY: resources in their copy states. The locations borrow their COM pointers.
-        unsafe {
-            let src = D3D12_TEXTURE_COPY_LOCATION {
-                pResource: std::mem::transmute_copy(&single),
-                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
-            };
-            let dst = D3D12_TEXTURE_COPY_LOCATION {
-                pResource: std::mem::transmute_copy(&out),
-                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: footprint },
-            };
-            list.list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
-        }
+        let read_alias = || {
+            crate::texture::alias_copy(&list, from, to);
+            crate::list::ensure_state(&list, to, D3D12_RESOURCE_STATE_RESOLVE_SOURCE.0 as u32);
+            crate::list::ensure_state(&list, resolved, D3D12_RESOURCE_STATE_RESOLVE_DEST.0 as u32);
+            // SAFETY: live textures in the resolve states above.
+            unsafe {
+                list.list.ResolveSubresource(&single, 0, &dest, 0, DXGI_FORMAT_R32_FLOAT);
+            }
+            let (out, data) = host.shared_buffer(total).unwrap();
+            crate::list::ensure_state(&list, resolved, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32);
+            // SAFETY: live resources in their copy states, borrowed COM pointers.
+            unsafe {
+                let src = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(&single),
+                    Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+                };
+                let dst = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(&out),
+                    Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: footprint },
+                };
+                list.list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+            }
+            (out, data)
+        };
+
+        let first = read_alias();
+        crate::list::ensure_state(&list, to, D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32);
+        // SAFETY: the alias is an open render target with a live view.
+        unsafe { list.list.ClearRenderTargetView(rtv, &[0.625, 0.0, 0.0, 0.0], None) };
+        let overwritten = read_alias();
+        crate::list::ensure_state(&list, from, D3D12_RESOURCE_STATE_DEPTH_WRITE.0 as u32);
+        // SAFETY: the source is a live depth target with a valid view.
+        unsafe { list.list.ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 0.875, 0, None) };
+        let refreshed = read_alias();
         // SAFETY: the test owns this open command list.
-        unsafe { list.list.Close() }.expect("the alias copy and resolve close");
+        unsafe { list.list.Close() }.expect("the alias copies and resolves close");
         host.execute(&[&list]);
-        for y in 0..4 {
-            let offset = footprint.Offset as usize + y * footprint.Footprint.RowPitch as usize;
-            // SAFETY: four R32 pixels from the completed copy, within the mapped buffer.
-            let row = unsafe { data.add(offset).cast::<[f32; 4]>().read_unaligned() };
-            assert_eq!(row, [0.375; 4], "resolved row {y}");
+        for (i, ((_out, data), expected)) in [first, overwritten, refreshed]
+            .into_iter()
+            .zip([0.375, 0.625, 0.875])
+            .enumerate()
+        {
+            for y in 0..4 {
+                let offset = footprint.Offset as usize + y * footprint.Footprint.RowPitch as usize;
+                // SAFETY: four R32 pixels from the completed copy, within the mapped buffer.
+                let row = unsafe { data.add(offset).cast::<[f32; 4]>().read_unaligned() };
+                assert_eq!(row, [expected; 4], "resolve {i}, row {y}");
+            }
         }
         for resource in [resolved, to, from] {
             assert_eq!(slot::<Release>(resource, 0x10)(resource), 0);
