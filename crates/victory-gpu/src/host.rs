@@ -2490,6 +2490,10 @@ struct SwapChainRetry {
 }
 
 impl SwapChainRetry {
+    fn ready(&self, now: Instant) -> bool {
+        self.next_attempt.is_none_or(|next| now >= next)
+    }
+
     /// A desktop can become presentable again. Keep retrying while limiting
     /// the DXGI calls and warnings during the outage.
     fn attempt<T, E>(
@@ -2497,7 +2501,7 @@ impl SwapChainRetry {
         now: Instant,
         operation: impl FnOnce() -> Result<T, E>,
     ) -> Option<Result<T, E>> {
-        if self.next_attempt.is_some_and(|next| now < next) {
+        if !self.ready(now) {
             return None;
         }
         let result = operation();
@@ -2687,6 +2691,30 @@ impl Host {
             tracing::warn!(format = primary_desc.Format.0, "cannot present this format");
             return None;
         };
+        let mut presentation = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
+        let Presentation { presenter, retry } = &mut *presentation;
+        if presenter.is_none() && !retry.ready(Instant::now()) {
+            return None;
+        }
+        let cached_format = presenter
+            .as_ref()
+            .and_then(|p| p.compositor.as_ref())
+            .map(|c| c.format);
+        let mut new_compositor = None;
+        let planes = if planes.len() > 1 && cached_format != Some(format) {
+            match create_compositor(&self.device, format) {
+                Ok(c) => {
+                    new_compositor = Some(c);
+                    planes
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "presenting the primary plane after compositor initialization failed");
+                    &planes[..1]
+                }
+            }
+        } else {
+            planes
+        };
         let (mut width, mut height) = (primary_desc.Width as u32, primary_desc.Height);
         for &(tex, _) in &planes[1..] {
             // SAFETY: live resource.
@@ -2694,8 +2722,6 @@ impl Host {
             width = width.max(d.Width as u32);
             height = height.max(d.Height);
         }
-        let mut presentation = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
-        let Presentation { presenter, retry } = &mut *presentation;
         if presenter.is_none() {
             *presenter = match retry
                 .attempt(Instant::now(), || self.presenter(width, height, format))?
@@ -2708,6 +2734,9 @@ impl Host {
             };
         }
         let p = presenter.as_mut()?;
+        if let Some(c) = new_compositor {
+            p.compositor = Some(c);
+        }
         if (p.width, p.height, p.format) != (width, height, format) {
             let resized = retry.attempt(Instant::now(), || {
                 // SAFETY: no back buffer is held; every submission was waited for.
@@ -2729,21 +2758,6 @@ impl Host {
                 }
             }
         }
-        // Leave the copy list closed if compositor initialization fails.
-        let compositor = if planes.len() > 1 {
-            if p.compositor.as_ref().is_none_or(|c| c.format != format) {
-                match create_compositor(&self.device, format) {
-                    Ok(c) => p.compositor = Some(c),
-                    Err(e) => {
-                        tracing::warn!(error = %e, "no present compositor");
-                        return None;
-                    }
-                }
-            }
-            Some(p.compositor.as_ref()?)
-        } else {
-            None
-        };
         // SAFETY: our swap chain, list and live source textures.
         unsafe {
             let index = p.swap_chain.GetCurrentBackBufferIndex();
@@ -2789,7 +2803,7 @@ impl Host {
                 list.ResourceBarrier(&after);
                 (capture, probe)
             } else {
-                let comp = compositor.expect("compositor was created for multiple planes");
+                let comp = p.compositor.as_ref().expect("compositor was prepared for multiple planes");
                 let rtv = comp.rtv_heap.GetCPUDescriptorHandleForHeapStart();
                 self.device.CreateRenderTargetView(
                     &back,
@@ -3420,7 +3434,7 @@ mod present_plane_tests {
     use super::*;
 
     #[test]
-    fn compositor_failure_preserves_single_plane_presentation() {
+    fn compositor_failure_presents_primary_in_the_same_frame() {
         let Some(host) = host() else {
             eprintln!("skipping PresentX recovery: no D3D12 device");
             return;
@@ -3463,7 +3477,7 @@ mod present_plane_tests {
             }
         };
         let scene = make_plane(32, 32, &[1.0, 0.0, 0.0, 1.0]);
-        let overlay = make_plane(32, 32, &[0.0, 0.0, 128.0 / 255.0, 128.0 / 255.0]);
+        let overlay = make_plane(64, 64, &[0.0, 0.0, 128.0 / 255.0, 128.0 / 255.0]);
         list.close();
         host.execute(&[&list]);
         let state = D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32;
@@ -3471,55 +3485,60 @@ mod present_plane_tests {
             host.present(&[(&scene, state)], 1).is_some(),
             "single-plane control"
         );
+        let first_pixel =
+            |buffer: &ID3D12Resource, footprint: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT| {
+                let mut mapped = std::ptr::null_mut();
+                // SAFETY: the present copy has completed. The footprint names
+                // a live RGBA pixel inside the readback buffer.
+                let rgba = unsafe {
+                    buffer.Map(0, None, Some(&mut mapped)).unwrap();
+                    let rgba = mapped
+                        .cast::<u8>()
+                        .add(footprint.Offset as usize)
+                        .cast::<[u8; 4]>()
+                        .read();
+                    buffer.Unmap(0, None);
+                    rgba
+                };
+                (footprint.Footprint.Width, footprint.Footprint.Height, rgba)
+            };
+
         let mut attempted = false;
-        assert!(
-            host.present_with_compositor(
-                &[(&scene, state), (&overlay, state)],
-                2,
-                |_, _| {
-                    attempted = true;
-                    Err(windows::core::Error::from_hresult(
-                        windows::Win32::Foundation::E_FAIL,
-                    ))
-                },
-                |_, _| {},
-            )
-            .is_none(),
-            "injected compositor failure"
+        let mut fallback = None;
+        let shown = host.present_with_compositor(
+            &[(&scene, state), (&overlay, state)],
+            2,
+            |_, _| {
+                attempted = true;
+                Err(windows::core::Error::from_hresult(
+                    windows::Win32::Foundation::E_FAIL,
+                ))
+            },
+            |buffer, footprint| fallback = Some(first_pixel(buffer, footprint)),
         );
         assert!(attempted);
         assert!(
-            host.present(&[(&scene, state)], 3).is_some(),
-            "single-plane presentation after compositor initialization failed"
+            shown.is_some(),
+            "the primary plane must still be shown in this frame"
         );
-        let mut pixel = None;
+        assert_eq!(fallback, Some((32, 32, [255, 0, 0, 255])));
+        let presentation = host.presenter.lock().unwrap_or_else(|e| e.into_inner());
+        let swap_chain = presentation.presenter.as_ref().unwrap();
+        assert_eq!((swap_chain.width, swap_chain.height), (32, 32));
+        drop(presentation);
+
+        let mut composite = None;
         assert!(
             host.present_with_compositor(
                 &[(&scene, state), (&overlay, state)],
-                4,
+                3,
                 Compositor::new,
-                |buffer, footprint| {
-                    let mut mapped = std::ptr::null_mut();
-                    // SAFETY: execute waited for the pre-Present copy. Read one
-                    // RGBA pixel from its footprint, before unmapping the buffer.
-                    unsafe {
-                        buffer.Map(0, None, Some(&mut mapped)).unwrap();
-                        pixel = Some(
-                            mapped
-                                .cast::<u8>()
-                                .add(footprint.Offset as usize)
-                                .cast::<[u8; 4]>()
-                                .read(),
-                        );
-                        buffer.Unmap(0, None);
-                    }
-                },
+                |buffer, footprint| composite = Some(first_pixel(buffer, footprint)),
             )
             .is_some(),
             "compositor initialization can be retried after failure"
         );
-        // Premultiplied half-blue over opaque red: neither an ignored overlay
-        // (red) nor a replaced scene (blue) may pass this check.
-        assert_eq!(pixel, Some([127, 0, 128, 255]));
+        // Premultiplied half-blue over opaque red.
+        assert_eq!(composite, Some((64, 64, [127, 0, 128, 255])));
     }
 }
