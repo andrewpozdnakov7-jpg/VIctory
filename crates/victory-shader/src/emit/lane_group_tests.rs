@@ -300,6 +300,22 @@ fn quad_reads_run_on_any_host_wave() {
     }
 }
 
+fn quad_xmask() -> Read {
+    Read {
+        words: dpp16(0x163, 0x6, 0xB),
+        text: "v_mov_b32 v2, v1 row_xmask:3 row_mask:0x6 bank_mask:0xb",
+        lane: |c| masked(c, 0x6, 0xB).then_some(c ^ 3),
+    }
+}
+
+#[test]
+fn quad_xmask_runs_on_four_lane_warp() {
+    for wave64 in [false, true] {
+        let ran = run(&[&quad_xmask()], wave64);
+        assert!(ran.contains(&"warp"), "wave64 {wave64}: ran on {ran:?}");
+    }
+}
+
 #[test]
 fn row_reads_run_on_host_waves_of_16_lanes() {
     for wave64 in [false, true] {
@@ -321,6 +337,7 @@ fn half_reads_of_wave64_run_on_host_waves_of_32_lanes() {
 fn lane_groups_set_the_fewest_host_lanes() {
     for (reads, wave64, lanes, size) in [
         (vec![quad_perm(), quad_swizzle()], false, 4, None),
+        (vec![quad_xmask()], true, 4, None),
         (vec![dpp8()], true, 8, None),
         (vec![row_shr(), quad_perm()], false, 16, None),
         (vec![row_swizzle()], true, 16, None),

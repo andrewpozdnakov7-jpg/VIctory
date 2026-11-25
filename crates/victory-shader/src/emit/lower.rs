@@ -425,9 +425,14 @@ fn lane_group(st: &Structured, i: &Inst, wave: u32) -> u32 {
         Fields::Valu(v) if v.dpp.is_some() => match v.dpp {
             Some(Dpp::Lanes { .. }) => 8,
             Some(Dpp::Row { ctrl: 0..=0xFF, .. }) => 4,
+            // XOR changes only the lane bits set in the mask.
+            Some(Dpp::Row {
+                ctrl: ctrl @ 0x160..=0x16F,
+                ..
+            }) => (u32::from(ctrl & 0xF) + 1).next_power_of_two(),
             // GFX10 has no row broadcasts or wave shifts: these stay in a row.
             Some(Dpp::Row {
-                ctrl: 0x101..=0x10F | 0x111..=0x11F | 0x121..=0x12F | 0x140 | 0x141 | 0x150..=0x16F,
+                ctrl: 0x101..=0x10F | 0x111..=0x11F | 0x121..=0x12F | 0x140 | 0x141 | 0x150..=0x15F,
                 ..
             }) => 16,
             _ => wave,
