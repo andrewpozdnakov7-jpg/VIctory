@@ -1908,6 +1908,86 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn an_unknown_depth_view_clears_its_typeless_host_texture() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::{
+            DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_UNKNOWN,
+        };
+
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let null = std::ptr::null();
+        let title_desc = ResourceDesc {
+            flags: DEPTH,
+            ..texture(4, 4, DXGI_FORMAT_D32_FLOAT.0 as u32, 1)
+        };
+        let mut depth = null;
+        assert_eq!(
+            create_committed(
+                null, &PROPERTIES, 0, &title_desc, 0, std::ptr::null(),
+                &RESOURCE_IIDS[0], &mut depth,
+            ),
+            S_OK
+        );
+        let texture = host_resource(depth).expect("a host depth texture");
+        // SAFETY: a live host texture.
+        let host_desc = unsafe { texture.GetDesc() };
+        assert_eq!(host_desc.Format, DXGI_FORMAT_R32_TYPELESS);
+
+        let mut record = [0u64; 16];
+        let at = record.as_mut_ptr() as u64;
+        let described = D3D12_DEPTH_STENCIL_VIEW_DESC {
+            Format: DXGI_FORMAT_UNKNOWN,
+            ViewDimension: D3D12_DSV_DIMENSION_TEXTURE2D,
+            ..Default::default()
+        };
+        crate::descriptor::create_dsv(null, depth, std::ptr::from_ref(&described).cast(), at);
+        let view = crate::descriptor::dsv_record(at).unwrap().depth_desc().unwrap();
+        assert_eq!(view.Format, DXGI_FORMAT_D32_FLOAT, "format passed to the host");
+
+        let list = host.new_list().unwrap();
+        crate::list::ensure_state(&list, depth, D3D12_RESOURCE_STATE_DEPTH_WRITE.0 as u32);
+        let handle = host.dsv(texture, Some(&view));
+        let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+        let mut bytes = 0;
+        // SAFETY: an open list, a live DSV and room for one footprint.
+        unsafe {
+            list.list.ClearDepthStencilView(handle, D3D12_CLEAR_FLAG_DEPTH, 0.375, 0, None);
+            host.device.GetCopyableFootprints(
+                &host_desc, 0, 1, 0, Some(&mut footprint), None, None, Some(&mut bytes),
+            );
+        }
+        let (out, data) = host.shared_buffer(bytes).unwrap();
+        crate::list::ensure_state(&list, depth, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32);
+        // SAFETY: the texture is in COPY_SOURCE and the buffer fits the footprint.
+        // The copy locations carry borrowed COM pointers.
+        unsafe {
+            let src = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(texture),
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+            };
+            let dst = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&out),
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: footprint },
+            };
+            list.list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+        }
+        list.close();
+        host.execute(&[&list]);
+        for y in 0..4 {
+            let offset = footprint.Offset as usize + y * footprint.Footprint.RowPitch as usize;
+            // SAFETY: four D32 pixels from a completed copy, inside the mapped buffer.
+            let row = unsafe { data.add(offset).cast::<[f32; 4]>().read_unaligned() };
+            assert_eq!(row, [0.375; 4], "depth row {y}");
+        }
+        assert_eq!(slot::<Release>(depth, 0x10)(depth), 0);
+    }
+
     fn heap(size: u64) -> This {
         let desc = HeapDesc {
             size,
