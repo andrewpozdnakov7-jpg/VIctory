@@ -1285,9 +1285,10 @@ fn transition(
 pub enum View<'a> {
     /// An RGBA32F texture SRV (width, height, texels).
     Texture(u32, u32, &'a [[f32; 4]]),
-    /// A typed texture SRV with tightly packed texels in the view's format.
+    /// A typed texture SRV with tightly packed texels of each mip level in turn.
     TextureBits {
         size: [u32; 2],
+        levels: u32,
         format: DXGI_FORMAT,
         data: &'a [u8],
         texel_bytes: u32,
@@ -1512,10 +1513,11 @@ impl Host {
                             View::MippedCube(n, l, t) => (n, n, 6, l, rgba32(t)),
                             View::TextureBits {
                                 size: [w, h],
+                                levels,
                                 format,
                                 data,
                                 texel_bytes,
-                            } => (w, h, 1, 1, (data.as_ptr(), data.len(), format, texel_bytes)),
+                            } => (w, h, 1, levels, (data.as_ptr(), data.len(), format, texel_bytes)),
                             _ => unreachable!(),
                         };
                         // Each variant borrows initialized texture bytes from the dispatch.

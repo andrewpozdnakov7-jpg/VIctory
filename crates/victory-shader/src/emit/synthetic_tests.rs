@@ -489,6 +489,7 @@ fn d16_image_load_rounds_normalized_texels_to_nearest() {
             }
             let view = View::TextureBits {
                 size: [256, rows],
+                levels: 1,
                 format,
                 data: &data,
                 texel_bytes: 4 * bits / 8,
@@ -568,6 +569,7 @@ fn d16_point_and_linear_samples_round_correctly() {
     let views = [
         View::TextureBits {
             size: [2, 1],
+            levels: 1,
             format,
             data: &[0, 0, 0, 0, 0, 0, 0, 0, 9, 0, 9, 0, 9, 0, 9, 0],
             texel_bytes: 8,
@@ -635,6 +637,7 @@ fn d16_point_and_linear_samples_round_correctly() {
             let point_views = [
                 View::TextureBits {
                     size: [1, 1],
+                    levels: 1,
                     format,
                     data: &texel,
                     texel_bytes: 8,
@@ -659,6 +662,15 @@ fn d16_point_and_linear_samples_round_correctly() {
 
 #[test]
 fn d16_integer_image_load_keeps_integer_channels() {
+    check_d16_integer_image_load(false);
+}
+
+#[test]
+fn d16_integer_image_load_mip_reads_the_selected_level() {
+    check_d16_integer_image_load(true);
+}
+
+fn check_d16_integer_image_load(mipped: bool) {
     use windows::Win32::Graphics::Dxgi::Common::*;
 
     use super::host::texture_view_tag;
@@ -671,13 +683,14 @@ fn d16_integer_image_load_keeps_integer_channels() {
         0xF408_0A02,
         0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
         0x7E02_0280, // v_mov_b32 v1, 0
+        0x7E04_0281, // v_mov_b32 v2, 1 (LOD for image_load_mip)
         0x3408_0083, // v_lshlrev_b32 v4, 3, v0
         0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
-        0xF000_1F08,
-        0x8003_0200, // image_load v[2:3], v[0:1], s[12:19] dmask:0xf dim:2D d16
+        if mipped { 0xF004_1F08 } else { 0xF000_1F08 },
+        0x8003_0500, // image_load[_mip] d16: coords v[0:1], optional LOD v2, result v[5:6]
         0xBF8C_3F70, // s_waitcnt vmcnt(0)
         0xE074_1000,
-        0x800A_0204, // buffer_store_dwordx2 v[2:3], v4, s[40:43], 0 offen
+        0x800A_0504, // buffer_store_dwordx2 v[5:6], v4, s[40:43], 0 offen
         0xBF81_0000, // s_endpgm
     ])
     .expect("lower a D16 image load");
@@ -736,12 +749,12 @@ fn d16_integer_image_load_keeps_integer_channels() {
         };
         // These FP32 subnormals look like small unsigned integers in their
         // raw representation. A value-based integer guess corrupts them.
-        let floats = [[7, 0x0123, 0x8000, 0].map(f32::from_bits); 32];
+        let (width, levels, base_texels) = if mipped { (64, 2, 64) } else { (32, 1, 0) };
+        let mut floats = vec![[1.0; 4]; base_texels];
+        floats.extend([[7, 0x0123, 0x8000, 0].map(f32::from_bits); 32]);
+        let view = View::Mipped(width, 1, levels, &floats);
         assert_eq!(
-            read(
-                View::Texture(32, 1, &floats),
-                DXGI_FORMAT_R32G32B32A32_FLOAT
-            ),
+            read(view, DXGI_FORMAT_R32G32B32A32_FLOAT),
             [0; 64],
             "{label}: FLOAT"
         );
@@ -790,10 +803,13 @@ fn d16_integer_image_load_keeps_integer_channels() {
             for value in channels {
                 texel.extend_from_slice(&value.to_le_bytes()[..channel_bytes]);
             }
-            let pixels = texel.repeat(32);
+            // The base level is zeroed so a load from it cannot match level 1.
+            let mut pixels = vec![0; base_texels * texel.len()];
+            pixels.extend(texel.repeat(32));
             let out = read(
                 View::TextureBits {
-                    size: [32, 1],
+                    size: [width, 1],
+                    levels,
                     format,
                     data: &pixels,
                     texel_bytes: (4 * channel_bytes) as u32,
