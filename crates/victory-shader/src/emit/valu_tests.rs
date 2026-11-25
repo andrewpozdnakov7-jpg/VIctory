@@ -1623,6 +1623,19 @@ fn v_cmp_class_f64_preserves_all_binary64_classes() {
     });
 }
 
+#[test]
+fn v_cmpx_class_f64_filters_stores() {
+    let shader = build_valu_cs(&[
+        0x7c00_0000 | 0x0b8 << 17 | 3 << 9 | vgpr(1) as u32, // v_cmpx_class_f64 v[1:2], v3
+        vop1(1, 0, 129),                                     // v_mov_b32 v0, 1
+    ]);
+    run_cases(
+        &shader,
+        &[[1, 0, 1 << 7, 1], [1, 0, 1 << 6, 0]],
+        |label, _, input, actual| assert_eq!(actual, input[3], "{label}: {input:08x?}"),
+    );
+}
+
 /// A compute program in an `ACCC` part, as the AMD upscaler's are: `body`
 /// leaves its result in v0, stored to the raw UAV of the table at user data
 /// 4 (root parameter 1). Translated from the container's bytes.
