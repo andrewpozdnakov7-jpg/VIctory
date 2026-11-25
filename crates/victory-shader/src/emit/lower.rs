@@ -201,7 +201,7 @@ struct Lower<'a> {
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
     /// Rows with an emitted isolated P10 read and its byte offset.
-    isolated_p10_rows: BTreeMap<u8, usize>,
+    coefficient_rows: BTreeMap<u8, usize>,
     handles: HashMap<(usize, Site, u8, bool, u32), V>,
     /// Blocks splitting the edge from one IR block to another.
     edges: HashMap<(usize, usize), usize>,
@@ -609,7 +609,7 @@ impl<'a> Lower<'a> {
             scalar: x.res.scalar.iter().copied().collect(),
             exports: x.io.exports.iter().map(|e| (e.site, e)).collect(),
             interps: x.io.interps.iter().map(|(s, i)| (*s, i)).collect(),
-            isolated_p10_rows: BTreeMap::new(),
+            coefficient_rows: BTreeMap::new(),
             handles: HashMap::new(),
             edges: HashMap::new(),
             exported: vec![false; p.blocks.len()],
@@ -1310,7 +1310,7 @@ impl<'a> Lower<'a> {
         self.fill_phis()?;
         // The signature writer aligns unread float inputs with the row's
         // decided mode. Reject a live read or fixed mode it cannot change.
-        for (&row, &offset) in &self.isolated_p10_rows {
+        for (&row, &offset) in &self.coefficient_rows {
             if self.s.inputs.iter().any(|e| {
                 e.row == Some(u32::from(row))
                     && e.interp != 1
@@ -1318,7 +1318,7 @@ impl<'a> Lower<'a> {
             }) {
                 return Err(unsupported(
                     offset,
-                    "isolated P10 sharing an input row with a different interpolation mode",
+                    "isolated coefficient sharing an input row with a different interpolation mode",
                 ));
             }
         }
@@ -7423,8 +7423,7 @@ impl<'a> Lower<'a> {
         let Some(&interp) = self.interps.get(&site) else {
             return Err("the first half of an interpolation");
         };
-        let p10 = matches!(interp, Interp::Vertex { vertex: 0, .. });
-        let (attribute, mode) = match interp {
+        let (attribute, mode, coefficient_corner) = match interp {
             Interp::Interpolated { unless, .. } if !self.avoids(site, unless) => {
                 return Err("an interpolation with computed barycentrics");
             }
@@ -7443,13 +7442,17 @@ impl<'a> Lower<'a> {
                     Barycentric::LinearSample => 7,
                     Barycentric::PerspectivePullModel => return Err("pull-model interpolation"),
                 },
+                None,
             ),
             // P0, the provoking vertex: a flat (nointerpolation) input.
             Interp::Vertex {
                 attribute,
                 vertex: 2,
-            } => (attribute, 1),
-            Interp::Vertex { attribute, vertex: 0 } => (attribute, 1),
+            } => (attribute, 1, None),
+            Interp::Vertex {
+                attribute,
+                vertex: selector @ 0..=1,
+            } => (attribute, 1, Some(selector + 1)),
             Interp::Vertex { .. } => return Err("a non-provoking vertex value"),
         };
         let dst = match &inst.fields {
@@ -7483,12 +7486,12 @@ impl<'a> Lower<'a> {
             _ => None,
         };
         let f16 = inst.name().ends_with("_f16");
-        let x = match packing {
-            None if p10 => self.isolated_p10(attribute, inst.machine.offset)?,
-            Some(_) if p10 => return Err("a non-provoking vertex value"),
-            None if f16 || attribute.high => return Err("a 16-bit read of a 32-bit input"),
-            None => channel(self, attribute.row, attribute.channel)?,
-            Some(pack2) => {
+        let x = match (packing, coefficient_corner) {
+            (None, Some(corner)) => self.isolated_coefficient(attribute, inst.machine.offset, corner)?,
+            (Some(_), Some(_)) => return Err("a non-provoking vertex value"),
+            (None, None) if f16 || attribute.high => return Err("a 16-bit read of a 32-bit input"),
+            (None, None) => channel(self, attribute.row, attribute.channel)?,
+            (Some(pack2), None) => {
                 // 16-bit values: one in the low half of each dword, or two
                 // per dword (`packed_half`); the host's are 32-bit floats.
                 let half = |l: &mut Self, h: u8| -> Result<Option<V>, Why> {
@@ -7531,9 +7534,13 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
-    /// Read the float32 parameter coefficient P10 as P1 - P0, using the
-    /// host triangle's vertex order.
-    fn isolated_p10(&mut self, attribute: &Attribute, offset: usize) -> Result<V, Why> {
+    /// Read P10 or P20 as P1 - P0 or P2 - P0 in the host triangle's vertex order.
+    fn isolated_coefficient(
+        &mut self,
+        attribute: &Attribute,
+        offset: usize,
+        corner: u8,
+    ) -> Result<V, Why> {
         const UNSUPPORTED: Why = "a non-provoking vertex value";
         let StageIo::Ps { inputs, .. } = &self.x.native.io else {
             return Err(UNSUPPORTED);
@@ -7562,9 +7569,7 @@ impl<'a> Lower<'a> {
         }
         e.interp = 1;
         e.usage |= 1 << col;
-        self.isolated_p10_rows
-            .entry(attribute.row)
-            .or_insert(offset);
+        self.coefficient_rows.entry(attribute.row).or_insert(offset);
         self.s.flags |= flags::BARYCENTRICS;
 
         let c = self.cur;
@@ -7583,8 +7588,8 @@ impl<'a> Lower<'a> {
             )
         };
         let p0 = vertex(0);
-        let p1 = vertex(1);
-        let delta = self.s.m.bin(c, Bin::Sub, p1, p0);
+        let p = vertex(corner);
+        let delta = self.s.m.bin(c, Bin::Sub, p, p0);
         Ok(self.s.m.cast(c, Cast::Bitcast, delta, self.s.t.i32))
     }
 
