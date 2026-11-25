@@ -548,6 +548,91 @@ fn compile() -> windows::core::Result<Converter> {
 mod tests {
     use super::*;
 
+    /// A twin created during recording sees the clear from its list.
+    /// The previous list starts the depth texture with a distinct value.
+    #[test]
+    fn a_late_depth_twin_receives_the_clear_in_its_list() {
+        let Some(host) = host() else { return };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 4,
+            Height: 4,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R32_TYPELESS,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+            ..Default::default()
+        };
+        let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+        let mut texture = None;
+        // SAFETY: a valid depth texture description and resource output.
+        unsafe {
+            host.device.CreateCommittedResource(
+                &heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON,
+                None, &mut texture,
+            ).unwrap();
+        }
+        let depth = Arc::new(HostTexture::new(texture.unwrap(), 0, Vec::new()));
+        let dsv_desc = D3D12_DEPTH_STENCIL_VIEW_DESC {
+            Format: DXGI_FORMAT_D32_FLOAT,
+            ViewDimension: D3D12_DSV_DIMENSION_TEXTURE2D,
+            ..Default::default()
+        };
+        let dsv = host.dsv(&depth.texture, Some(&dsv_desc));
+        let clear = |list: &HostList, value| {
+            assert!(list.move_texture(&depth, DEPTH_WRITE).is_none());
+            // SAFETY: the prelude moves the live texture to depth write.
+            unsafe { list.list.ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, value, 0, None) };
+        };
+        let first = host.new_list().unwrap();
+        clear(&first, 0.125);
+        first.close();
+        host.execute(&[&first]);
+
+        let list = host.new_list().unwrap();
+        clear(&list, 0.375);
+        assert!(depth.twin.get().is_none());
+        let twin = depth.twin.get_or_init(|| make(DXGI_FORMAT_D32_FLOAT.0 as u32, &depth.texture))
+            .as_ref().expect("writable depth twin");
+        assert!(route(&list, &depth, twin, UNORDERED_ACCESS));
+        let plane = &twin.planes[0];
+        let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+        let mut bytes = 0;
+        // SAFETY: the twin plane is live and these outputs hold one footprint.
+        unsafe {
+            host.device.GetCopyableFootprints(
+                &plane.texture.GetDesc(), 0, 1, 0, Some(&mut footprint), None, None, Some(&mut bytes),
+            );
+        }
+        let (out, data) = host.shared_buffer(bytes).unwrap();
+        let before_read = list.move_texture(plane, COPY_SOURCE).expect("transition from unordered access");
+        // SAFETY: both resources are live; these locations borrow their COM pointers.
+        unsafe {
+            list.list.ResourceBarrier(&[before_read]);
+            let source = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&plane.texture),
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+            };
+            let dest = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&out),
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: footprint },
+            };
+            list.list.CopyTextureRegion(&dest, 0, 0, 0, &source, None);
+        }
+        list.close();
+        host.execute(&[&list]);
+        for row in 0..4 {
+            let offset = footprint.Offset as usize + row * footprint.Footprint.RowPitch as usize;
+            // SAFETY: four f32 values in the mapped copy output, after its fence.
+            let got = unsafe { data.add(offset).cast::<[f32; 4]>().read_unaligned() };
+            assert_eq!(got, [0.375; 4], "writable twin row {row}");
+        }
+    }
+
+
     /// The material-depth frame of Grand Theft Auto VI: written through
     /// unordered views, read as a shader resource in the same list, written
     /// again; read in the next list; tested as depth in a later one; the
