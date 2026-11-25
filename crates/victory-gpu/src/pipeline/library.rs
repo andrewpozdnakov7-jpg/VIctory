@@ -925,6 +925,19 @@ mod tests {
             !again._blob.bytes().is_empty(),
             "the stored library, not an empty one"
         );
+        // Publish the next snapshot while the old library still owns its view.
+        // The new file has a pipeline the old mapping has never seen.
+        made.store(N, &codes[N]);
+        // SAFETY: the library is live and no other thread is storing pipelines.
+        let size = unsafe { made.2.GetSerializedSize() };
+        write_library(dir.path(), size, |bytes| unsafe { made.2.Serialize(bytes) })
+            .expect("publish the updated library");
+        assert!(!dir.path().join(NEXT_FILE).exists(), "the canonical file was replaced");
+        let reopened = open(&device, Blob::of(dir.path())).expect("open the published library");
+        Shared(device.clone(), root.clone(), reopened.library.clone())
+            .load(N, &codes[N])
+            .expect("the newly published pipeline");
+
         let shared = Shared(device, root, again.library.clone());
         let stores = Mutex::new(());
         std::thread::scope(|s| {
