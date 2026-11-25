@@ -854,6 +854,73 @@ mod tests {
     }
 
     #[test]
+    fn cache_files_are_retried_after_a_failed_save() {
+        // Each run needs its own process because the cache directory and
+        // pipeline library are initialized once for the process.
+        const BLOCKED: &str = "VICTORY_TEST_BLOCKED_PIPELINE_CACHE_FILE";
+        if let Ok(file) = std::env::var(BLOCKED) {
+            let dir = tempfile::tempdir().unwrap();
+            use_pipeline_cache(dir.path().to_owned());
+            if library().is_none() {
+                eprintln!("no D3D12 pipeline library; skipped");
+                return;
+            }
+
+            let blocked = dir.path().join(&file);
+            std::fs::create_dir(&blocked).unwrap();
+            match file.as_str() {
+                PREBUILT_FILE => {
+                    keep_early_list();
+                    note_prebuilt("recorded-pipeline".to_owned());
+                }
+                EARLY_FILE => note_used("used-pipeline"),
+                _ => panic!("unknown cache file {file}"),
+            }
+
+            save(true);
+            let blob = dir.path().join(LIBRARY_FILE);
+            assert!(blob.is_file(), "the save reached the file writes");
+            assert!(blocked.is_dir(), "the cache file was blocked");
+            std::fs::remove_dir(&blocked).unwrap();
+
+            save(true);
+            let contents = std::fs::read(&blocked)
+                .unwrap_or_else(|error| panic!("{file} was not retried: {error}"));
+            if file == PREBUILT_FILE {
+                let bytes = std::fs::read(blob).unwrap();
+                assert_eq!(
+                    listed(&contents, &tag(&bytes)),
+                    HashSet::from(["recorded-pipeline".to_owned()])
+                );
+            } else {
+                assert_eq!(contents, b"used-pipeline");
+            }
+            eprintln!("recovered {file}");
+            return;
+        }
+
+        let mut passed = true;
+        for file in [PREBUILT_FILE, EARLY_FILE] {
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "pipeline::library::tests::cache_files_are_retried_after_a_failed_save",
+                    "--nocapture",
+                ])
+                .env(BLOCKED, file)
+                .output()
+                .expect("run isolated cache test");
+            eprintln!(
+                "{file}:\n{}{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            passed &= result.status.success();
+        }
+        assert!(passed, "cache publication did not recover");
+    }
+
+    #[test]
     fn a_rejected_blob_gives_an_empty_library() {
         let Some(device) = crate::host::host().and_then(|h| h.device.cast::<ID3D12Device1>().ok()) else {
             return; // no host GPU here
