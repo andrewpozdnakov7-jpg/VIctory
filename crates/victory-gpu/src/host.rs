@@ -981,10 +981,22 @@ impl Host {
         // Pages shaders marked first: the copy-backs below end what the
         // copies keep for them.
         crate::shadow::copy_back_marks(&back);
+        let mut withheld = std::collections::HashMap::<_, Vec<_>>::new();
+        for (shadow, address, len, goes_back) in &back {
+            if !goes_back {
+                withheld
+                    .entry(std::sync::Arc::as_ptr(shadow))
+                    .or_default()
+                    .push((*address, address + len));
+            }
+        }
         for (shadow, address, len, goes_back) in &back {
             let (address, len) = (*address, *len);
             if *goes_back {
-                let written = shadow.copy_back(address, len);
+                let excluded = withheld
+                    .get(&std::sync::Arc::as_ptr(shadow))
+                    .map_or(&[][..], Vec::as_slice);
+                let written = shadow.copy_back(address, len, excluded);
                 COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
             } else {
                 shadow.keep_writes(address, len);
