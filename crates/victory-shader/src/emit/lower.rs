@@ -8043,6 +8043,7 @@ impl<'a> Lower<'a> {
         let h = self.handle(site, src, false, props)?;
         let fu = self.s.m.undef(self.s.t.f32);
         let iu = self.s.m.undef(self.s.t.i32);
+        let mut texel = op == 66 || op == 73;
         let r = if sample {
             let ss = self
                 .descriptors
@@ -8067,6 +8068,16 @@ impl<'a> Lower<'a> {
             let cmp = matches!(op, 64 | 65);
             if cmp && (*a16 || dmask.count_ones() != 1) {
                 return Err("a comparison sample of 16-bit coordinates or several channels");
+            }
+            // A static point sampler selects one texel. Its UNORM16 and
+            // SNORM16 values need the same exact rounding as an image load.
+            if *d16
+                && !texel
+                && !cmp
+                && let Source::Constant(words) = ss
+                && let Some(words) = words.get(..4).and_then(|w| w.try_into().ok())
+            {
+                texel = super::sampler::StaticSampler::from_words(words).filter == 0;
             }
             let sh = self.handle(site, ss, true, (14 | if cmp { 0x8000 } else { 0 }, 0))?;
             // Texel offsets (`_o`) come first: x in bits 0-5, y in 8-13,
@@ -8378,7 +8389,7 @@ impl<'a> Lower<'a> {
             .collect();
         // shortcut: integer image formats would keep 16 integer bits.
         let mut xs = if *d16 {
-            self.image_d16(h, &channels, op == 66 || op == 73)?
+            self.image_d16(h, &channels, texel)?
         } else {
             channels.into_iter().map(|x| self.as_int(x)).collect()
         };

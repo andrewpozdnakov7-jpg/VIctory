@@ -526,10 +526,12 @@ fn d16_image_load_rounds_normalized_texels_to_nearest() {
 }
 
 #[test]
-fn d16_image_sample_keeps_fractional_normalized_texels() {
-    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_UNORM;
+fn d16_point_and_linear_samples_round_correctly() {
+    use windows::Win32::Graphics::Dxgi::Common::{
+        DXGI_FORMAT_R16G16B16A16_SNORM, DXGI_FORMAT_R16G16B16A16_UNORM,
+    };
 
-    let shader = |d16| {
+    let shader = |d16, filter| {
         build_with_threads(
             &[
                 0xBE84_0300, // s_mov_b32 s4, s0
@@ -542,7 +544,7 @@ fn d16_image_sample_keeps_fractional_normalized_texels() {
                 0xBE89_03FF,
                 0x00C0_0000, // s_mov_b32 s9, 0xc00000
                 0xBE8A_03FF,
-                0x1850_0000, // s_mov_b32 s10, 0x18500000 (linear filter)
+                filter,      // s_mov_b32 s10, sampler filters
                 0xBE8B_0380, // s_mov_b32 s11, 0
                 0x7E00_02F0, // v_mov_b32 v0, 0.5
                 0x7E02_02F0, // v_mov_b32 v1, 0.5
@@ -576,13 +578,14 @@ fn d16_image_sample_keeps_fractional_normalized_texels() {
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
         .unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
     for (label, warp) in [("hardware", false), ("warp", true)] {
         let Ok(host) = Host::new(warp) else {
             eprintln!("no SM 6.6 {label} device; skipped");
             continue;
         };
-        let read = |d16| {
-            let shader = shader(d16);
+        let read = |d16, filter, views: &[View<'_>], format| {
+            let shader = shader(d16, filter);
             let (root, pso) = host.compute_pipeline(&shader).expect("sampling pipeline");
             let mut roots = vec![(
                 0,
@@ -602,7 +605,7 @@ fn d16_image_sample_keeps_fractional_normalized_texels() {
                 &pso,
                 &Dispatch {
                     roots,
-                    views: &views,
+                    views,
                     samplers: &[],
                     groups: [1, 1, 1],
                 },
@@ -611,15 +614,43 @@ fn d16_image_sample_keeps_fractional_normalized_texels() {
         };
         // Use the host's own filtered F32 result as the reference. A
         // hardware sampler may round the interpolation in the source format.
-        let f = f32::from_bits(read(false));
+        let f = f32::from_bits(read(false, 0x1850_0000, &views, format));
         assert!(f > 0.0 && f < 9.0 / 65535.0, "{label}: sample {f}");
         assert_eq!(
-            read(true),
+            read(true, 0x1850_0000, &views, format),
             super::semantics_tests::to_f16(f64::from(f), false),
             "{label}"
         );
-        eprintln!("{label}: linear RGBA16_UNORM sample matched");
+        let point_cases = [
+            (DXGI_FORMAT_R16G16B16A16_UNORM, 65455u16, 0x3bfd),
+            (DXGI_FORMAT_R16G16B16A16_UNORM, 65519, 0x3bff),
+            (DXGI_FORMAT_R16G16B16A16_SNORM, 32759, 0x3bff),
+            (DXGI_FORMAT_R16G16B16A16_SNORM, (-32759i16) as u16, 0xbbff),
+        ];
+        for (format, code, expected) in point_cases {
+            let texel = code.to_le_bytes().repeat(4);
+            let point_views = [
+                View::TextureBits {
+                    size: [1, 1],
+                    format,
+                    data: &texel,
+                    texel_bytes: 8,
+                },
+                View::Buffer {
+                    data: &[0; 4],
+                    stride: Stride::Structured(16),
+                },
+                View::RawUav(1),
+            ];
+            assert_eq!(
+                read(true, 0x0400_0000, &point_views, format),
+                expected,
+                "{label} point sample {format:?}, stored code {code:#x}"
+            );
+        }
+        ran += 1;
     }
+    assert!(ran > 0, "no SM 6.6 device ran the samples");
 }
 
 #[test]
