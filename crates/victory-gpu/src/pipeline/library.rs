@@ -302,11 +302,12 @@ pub(crate) fn save(now: bool) {
         }
         *last = Some(std::time::Instant::now());
     }
-    let (blob, prebuilt) = {
+    let (blob, prebuilt, dirty) = {
         let mut l = library.lock().unwrap_or_else(|e| e.into_inner());
-        if l.added == 0 && !l.prebuilt_changed && !USED_CHANGED.swap(false, Ordering::Relaxed) {
+        let l = &mut *l;
+        let Some(dirty) = Dirty::take(&mut l.added, &mut l.prebuilt_changed, &USED_CHANGED) else {
             return;
-        }
+        };
         // SAFETY: a buffer of the size the library asks for.
         let bytes = unsafe {
             let mut bytes = vec![0u8; l.library.GetSerializedSize()];
@@ -314,15 +315,14 @@ pub(crate) fn save(now: bool) {
         };
         match bytes {
             Ok(bytes) => {
-                l.added = 0;
-                l.prebuilt_changed = false;
                 // Kept beside the bytes it holds for (also when a run adds
                 // pipelines).
                 let prebuilt = (!l.prebuilt.is_empty()).then(|| list(&tag(&bytes), &l.prebuilt));
-                (bytes, prebuilt)
+                (bytes, prebuilt, dirty)
             }
             Err(e) => {
                 tracing::warn!(error = %e, "host pipeline library not serialised");
+                dirty.restore(&mut l.added, &mut l.prebuilt_changed, &USED_CHANGED);
                 return;
             }
         }
@@ -350,7 +350,41 @@ pub(crate) fn save(now: bool) {
             shaders_translated,
             "host pipeline library saved"
         ),
-        Err(e) => tracing::warn!(error = %e, "host pipeline library not saved"),
+        Err(e) => {
+            tracing::warn!(error = %e, "host pipeline library not saved");
+            let mut l = library.lock().unwrap_or_else(|e| e.into_inner());
+            let l = &mut *l;
+            dirty.restore(&mut l.added, &mut l.prebuilt_changed, &USED_CHANGED);
+        }
+    }
+}
+
+/// What changed since the last save, taken by the save that writes it and
+/// given back if that save fails, so that the next one tries again.
+struct Dirty {
+    added: u64,
+    prebuilt_changed: bool,
+    used_changed: bool,
+}
+
+impl Dirty {
+    /// The marks, cleared; none if nothing changed.
+    fn take(added: &mut u64, prebuilt_changed: &mut bool, used_changed: &AtomicBool) -> Option<Dirty> {
+        let dirty = Dirty {
+            added: std::mem::take(added),
+            prebuilt_changed: std::mem::take(prebuilt_changed),
+            used_changed: used_changed.swap(false, Ordering::Relaxed),
+        };
+        (dirty.added != 0 || dirty.prebuilt_changed || dirty.used_changed).then_some(dirty)
+    }
+
+    /// The marks, back (with what changed meanwhile).
+    fn restore(self, added: &mut u64, prebuilt_changed: &mut bool, used_changed: &AtomicBool) {
+        *added += self.added;
+        *prebuilt_changed |= self.prebuilt_changed;
+        if self.used_changed {
+            used_changed.store(true, Ordering::Relaxed);
+        }
     }
 }
 
@@ -466,6 +500,19 @@ mod tests {
         assert_eq!(list.len(), EARLY_MAX);
         assert!(used.now.iter().all(|k| list.contains(k)));
         assert_eq!(list.iter().collect::<HashSet<_>>().len(), EARLY_MAX, "no key twice");
+    }
+
+    /// A save that fails gives its changes back for the next to write.
+    #[test]
+    fn a_failed_save_leaves_its_changes_to_the_next() {
+        let (mut added, mut prebuilt, used) = (3u64, true, AtomicBool::new(true));
+        let dirty = Dirty::take(&mut added, &mut prebuilt, &used).expect("changes");
+        assert_eq!((added, prebuilt, used.load(Ordering::Relaxed)), (0, false, false), "taken");
+        assert!(Dirty::take(&mut added, &mut prebuilt, &used).is_none(), "nothing more to save");
+        added = 2; // pipelines stored while the save wrote
+        dirty.restore(&mut added, &mut prebuilt, &used);
+        assert_eq!((added, prebuilt, used.load(Ordering::Relaxed)), (5, true, true));
+        assert!(Dirty::take(&mut added, &mut prebuilt, &used).is_some(), "the next save writes them");
     }
 
     /// The pre-build's list holds only for the library bytes it was
