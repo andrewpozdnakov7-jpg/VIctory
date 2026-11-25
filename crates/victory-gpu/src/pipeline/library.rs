@@ -312,11 +312,16 @@ pub(crate) fn save(now: bool) {
         }
         *last = Some(std::time::Instant::now());
     }
-    save_to(dir, library);
+    save_to(dir, library, &USED, &USED_CHANGED);
 }
 
-fn save_to(dir: &std::path::Path, library: Option<&Mutex<Library>>) {
-    let early_changed = USED_CHANGED.swap(false, Ordering::Relaxed);
+fn save_to(
+    dir: &std::path::Path,
+    library: Option<&Mutex<Library>>,
+    used: &Mutex<Option<Used>>,
+    used_changed: &AtomicBool,
+) {
+    let early_changed = used_changed.swap(false, Ordering::Relaxed);
     let serialized = library.and_then(|library| {
         let mut l = library.lock().unwrap_or_else(|e| e.into_inner());
         if l.added == 0 && !l.prebuilt_changed {
@@ -345,14 +350,21 @@ fn save_to(dir: &std::path::Path, library: Option<&Mutex<Library>>) {
     if serialized.is_none() && !early_changed {
         return;
     }
+    let restore_prebuilt = |pending: bool| {
+        if pending && let Some(library) = library {
+            // The list still needs to be published with the matching library.
+            library.lock().unwrap_or_else(|e| e.into_inner()).prebuilt_changed = true;
+        }
+    };
     if let Err(e) = std::fs::create_dir_all(dir) {
+        restore_prebuilt(serialized.as_ref().is_some_and(|(_, list)| list.is_some()));
         if early_changed {
-            USED_CHANGED.store(true, Ordering::Relaxed);
+            used_changed.store(true, Ordering::Relaxed);
         }
         tracing::warn!(error = %e, "pipeline cache directory not created");
         return;
     }
-    let used = USED
+    let used = used
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .as_ref()
@@ -361,7 +373,7 @@ fn save_to(dir: &std::path::Path, library: Option<&Mutex<Library>>) {
     let early_res = write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes());
     if let Err(ref e) = early_res {
         if early_changed {
-            USED_CHANGED.store(true, Ordering::Relaxed);
+            used_changed.store(true, Ordering::Relaxed);
         }
         if serialized.is_none() {
             tracing::warn!(error = %e, "early pipeline list not saved");
@@ -390,7 +402,10 @@ fn save_to(dir: &std::path::Path, library: Option<&Mutex<Library>>) {
                 shaders_translated,
                 "host pipeline library saved"
             ),
-            Err(e) => tracing::warn!(error = %e, "host pipeline library not saved"),
+            Err(e) => {
+                restore_prebuilt(prebuilt.is_some());
+                tracing::warn!(error = %e, "host pipeline library not saved");
+            }
         }
     } else {
         tracing::info!(
@@ -696,6 +711,63 @@ mod tests {
     }
 
     #[test]
+    fn a_prebuilt_list_is_retried_after_a_failed_publication() {
+        let Some(device) = crate::host::host().and_then(|h| h.device.cast::<ID3D12Device1>().ok()) else {
+            return; // no host GPU here
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(PREBUILT_FILE);
+        // A directory at the destination stops the staged file from replacing it.
+        std::fs::create_dir(&path).unwrap();
+        let mut library = open(&device, Vec::new()).expect("an empty library");
+        library.prebuilt_changed |= library.prebuilt.insert("recorded".to_owned());
+        let library = Mutex::new(library);
+        let used = Mutex::new(None);
+        let used_changed = AtomicBool::new(false);
+
+        save_to(dir.path(), Some(&library), &used, &used_changed);
+        assert!(dir.path().join(LIBRARY_FILE).is_file(), "the library was saved");
+        assert!(path.is_dir(), "the prebuilt list was blocked");
+        std::fs::remove_dir(&path).unwrap();
+
+        save_to(dir.path(), Some(&library), &used, &used_changed);
+        let records = std::fs::read(&path).expect("the next save retries the prebuilt list");
+        let blob = std::fs::read(dir.path().join(LIBRARY_FILE)).unwrap();
+        assert_eq!(listed(&records, &tag(&blob)), HashSet::from(["recorded".to_owned()]));
+        assert!(!library.lock().unwrap().prebuilt_changed);
+    }
+
+    #[test]
+    fn an_early_list_is_retried_after_a_failed_publication() {
+        let Some(device) = crate::host::host().and_then(|h| h.device.cast::<ID3D12Device1>().ok()) else {
+            return; // no host GPU here
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(EARLY_FILE);
+        std::fs::create_dir(&path).unwrap();
+        let mut library = open(&device, Vec::new()).expect("an empty library");
+        let prebuilt_keys = HashSet::from(["recorded".to_owned()]);
+        library.prebuilt = prebuilt_keys.clone();
+        library.prebuilt_changed = true;
+        let library = Mutex::new(library);
+        let keys = HashSet::from(["used".to_owned()]);
+        let used = Mutex::new(Some(Used { before: HashSet::new(), now: keys.clone() }));
+        let used_changed = AtomicBool::new(true);
+
+        save_to(dir.path(), Some(&library), &used, &used_changed);
+        assert!(path.is_dir(), "the early list was blocked");
+        assert!(used_changed.load(Ordering::Relaxed));
+        std::fs::remove_dir(&path).unwrap();
+
+        save_to(dir.path(), Some(&library), &used, &used_changed);
+        assert_eq!(read_early_list(dir.path()), keys);
+        assert!(!used_changed.load(Ordering::Relaxed));
+        let records = std::fs::read(dir.path().join(PREBUILT_FILE)).expect("the pending prebuilt list was saved");
+        let blob = std::fs::read(dir.path().join(LIBRARY_FILE)).unwrap();
+        assert_eq!(listed(&records, &tag(&blob)), prebuilt_keys);
+    }
+
+    #[test]
     fn a_rejected_blob_gives_an_empty_library() {
         let Some(device) = crate::host::host().and_then(|h| h.device.cast::<ID3D12Device1>().ok()) else {
             return; // no host GPU here
@@ -737,7 +809,7 @@ mod tests {
         USED_CHANGED.store(false, Ordering::Relaxed);
 
         // No dirty flag set: saving without a host library creates nothing.
-        save_to(&cache_dir, None);
+        save_to(&cache_dir, None, &USED, &USED_CHANGED);
         assert!(!cache_dir.join(EARLY_FILE).exists());
         assert!(!cache_dir.join(LIBRARY_FILE).exists());
 
@@ -747,7 +819,7 @@ mod tests {
         note_used("gfx:alpha_key");
         assert!(USED_CHANGED.load(Ordering::Relaxed));
 
-        save_to(&cache_dir, None);
+        save_to(&cache_dir, None, &USED, &USED_CHANGED);
         assert!(cache_dir.join(EARLY_FILE).exists());
         assert!(!cache_dir.join(LIBRARY_FILE).exists());
 
@@ -773,7 +845,7 @@ mod tests {
             assert!(reloaded.contains("cs:beta_key"));
             assert!(!reloaded.contains("gfx:missing_key"));
             note_used("gfx:gamma_key");
-            save_to(&cache_dir, None);
+            save_to(&cache_dir, None, &USED, &USED_CHANGED);
         }
 
         let reloaded = read_early_list(&cache_dir);
