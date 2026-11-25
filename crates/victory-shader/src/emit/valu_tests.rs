@@ -1751,19 +1751,19 @@ fn relative_moves_reach_only_what_their_clamped_index_can() {
 #[test]
 fn s_buffer_load_truncates_terms_independently() {
     let words = [
-        s_mov_b32(5, 0x80),                         // s[4:5] = table offset 0
-        0xF408_0202,                                // s_load_dwordx4 s[8:11], s[4:5], 0x0 (UAV)
+        s_mov_b32(5, 0x80), // s[4:5] = table offset 0
+        0xF408_0202,        // s_load_dwordx4 s[8:11], s[4:5], 0x0 (UAV)
         125 << 25,
-        0xF408_0302,                                // s_load_dwordx4 s[12:15], s[4:5], 0x20 (SRV)
+        0xF408_0302, // s_load_dwordx4 s[12:15], s[4:5], 0x20 (SRV)
         125 << 25 | 0x20,
-        0xBF8C_C07F,                                // s_waitcnt lgkmcnt(0)
-        0xF420_0406,                                // s_buffer_load_dword s16, s[12:15], s0, offset:3
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xF420_0406, // s_buffer_load_dword s16, s[12:15], s0, offset:3
         0x0000_0003,
-        0xF420_0446,                                // s_buffer_load_dword s17, s[12:15], s0, offset:7
+        0xF420_0446, // s_buffer_load_dword s17, s[12:15], s0, offset:7
         0x0000_0007,
-        0xBF8C_C07F,                                // s_waitcnt lgkmcnt(0)
-        vop1(0x001, 0, sgpr(16)),                   // v0 = s16
-        vop1(0x001, 1, sgpr(17)),                   // v1 = s17
+        0xBF8C_C07F,              // s_waitcnt lgkmcnt(0)
+        vop1(0x001, 0, sgpr(16)), // v0 = s16
+        vop1(0x001, 1, sgpr(17)), // v1 = s17
         buffer_store_dword(0, 8, 0)[0],
         buffer_store_dword(0, 8, 0)[1],
         buffer_store_dword(1, 8, 4)[0],
@@ -1825,33 +1825,12 @@ fn s_buffer_load_truncates_terms_independently() {
     let st = st.unwrap();
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
     let io = io::raise(&p, &native).unwrap();
-    let lowered = lower::lower(&lower::Parts {
-        native: &native,
-        p: &p,
-        st: &st,
-        io: &io,
-        res: &res,
-        inputs: Vec::new(),
-        outputs: Vec::new(),
-        prims: Vec::new(),
-        mesh_stride: 0,
-    })
-    .unwrap();
-    let shader = HostShader {
-        stage: HwStage::Cs,
-        dxil: lowered.dxil,
-        user_data: lowered.user_data,
-        samplers: Vec::new(),
-        static_samplers: Vec::new(),
-        root_cbvs: lowered.root_cbvs,
-        root_srvs: lowered.root_srvs,
-        root_uavs: lowered.root_uavs,
-        memory: lowered.memory,
-        memory_writes: lowered.memory_writes,
-        view_addresses: lowered.view_addresses,
-        heap: lowered.heap,
-        heap_writes: lowered.heap_writes,
+    let container = crate::Container {
+        digest: [0; 16],
+        version: (1, 0),
+        parts: Vec::new(),
     };
+    let shader = super::emit(&container, &native, &p, &st, &io, &res).unwrap();
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         let mut copy = shader.dxil.clone();
         v.validate(&mut copy).expect("DXIL validation");
