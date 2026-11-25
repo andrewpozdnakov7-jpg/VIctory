@@ -1405,6 +1405,140 @@ mod tests {
     use super::*;
     use crate::object::slot;
 
+    /// The title's CPU texture contents precede a queued host copy, even if
+    /// the write was recorded first. A read queued after the copy sees GPU data.
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
+    fn texture_copy_reads_follow_submission_order() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let null = std::ptr::null();
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        let mut allocator = null;
+        assert_eq!(
+            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
+        let list = || {
+            let mut out = null;
+            assert_eq!(
+                create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut out),
+                S_OK
+            );
+            out
+        };
+
+        #[repr(align(8))]
+        struct TextureWords([u32; 14]);
+        let desc = TextureWords([3, 0, 0, 0, 4, 0, 4, 1 | 1 << 16, 28, 1, 0, 1, 0, 0]);
+        let heap = [1u32, 0, 0, 0, 0];
+        let iid = crate::object::guid(
+            0x696442be,
+            0xa72e,
+            0x4059,
+            [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+        );
+        let texture = |color| {
+            let mut out = null;
+            assert_eq!(
+                crate::resource::create_committed(
+                    null,
+                    heap.as_ptr().cast(),
+                    0,
+                    desc.0.as_ptr().cast(),
+                    0,
+                    null.cast(),
+                    &iid,
+                    &mut out,
+                ),
+                S_OK
+            );
+            let (memory, desc) = crate::resource::texture_memory(out).unwrap();
+            let size = crate::resource::texture_layout(&desc).unwrap().size as usize;
+            // SAFETY: all bytes belong to this committed title texture.
+            unsafe {
+                std::slice::from_raw_parts_mut(memory.cast_mut().cast::<u32>(), size / 4)
+                    .fill(color);
+            }
+            out
+        };
+
+        const TITLE: u32 = 0xff3366cc;
+        const GPU: u32 = 0xffcc6633;
+        let mut results = Vec::new();
+        for record_write_first in [false, true] {
+            for submit_write_first in [false, true] {
+                let (target, source, snapshot) = (texture(TITLE), texture(GPU), texture(0));
+                let (reading, writing) = (list(), list());
+                let record_read = || {
+                    copy_resource(reading, snapshot, target);
+                    let list = host_list(reading).unwrap();
+                    ensure_state(list, snapshot, COPY_SOURCE);
+                    let texture = crate::resource::host_resource(snapshot).unwrap();
+                    let readback =
+                        crate::capture::read_back(&host.device, &list.list, texture).unwrap();
+                    assert_eq!(close(reading), S_OK);
+                    readback
+                };
+                let record_write = || {
+                    copy_resource(writing, target, source);
+                    assert_eq!(close(writing), S_OK);
+                };
+                let (readback, footprint) = if record_write_first {
+                    record_write();
+                    record_read()
+                } else {
+                    let result = record_read();
+                    record_write();
+                    result
+                };
+                let (a, b) = if submit_write_first {
+                    (writing, reading)
+                } else {
+                    (reading, writing)
+                };
+                host.execute(&[host_list(a).unwrap(), host_list(b).unwrap()]);
+                let want = if submit_write_first { GPU } else { TITLE };
+                let mut data = std::ptr::null_mut();
+                // SAFETY: the copy completed and this readback has four 4-texel rows.
+                let (matched, first) = unsafe {
+                    readback.Map(0, None, Some(&mut data)).unwrap();
+                    let start = data.cast::<u8>().add(footprint.Offset as usize);
+                    let row_pitch = footprint.Footprint.RowPitch as usize;
+                    let matched: usize = (0..4)
+                        .map(|y| {
+                            let row = start.add(y * row_pitch).cast::<u32>();
+                            std::slice::from_raw_parts(row, 4)
+                                .iter()
+                                .filter(|&&p| p == want)
+                                .count()
+                        })
+                        .sum();
+                    let first = start.cast::<u32>().read();
+                    readback.Unmap(0, None);
+                    (matched, first)
+                };
+                results.push((record_write_first, submit_write_first, matched, first));
+                for object in [reading, writing, target, source, snapshot] {
+                    assert_eq!(release(object), 0);
+                }
+            }
+        }
+        assert_eq!(release(allocator), 0);
+        // SAFETY: a plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+        assert_eq!(
+            results,
+            [
+                (false, false, 16, TITLE),
+                (false, true, 16, GPU),
+                (true, false, 16, TITLE),
+                (true, true, 16, GPU),
+            ]
+        );
+    }
+
     #[test]
     fn every_inline_command_falls_back_to_the_table() {
         let null = std::ptr::null();
