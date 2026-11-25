@@ -31,6 +31,11 @@ pub(crate) struct HostHeap {
     /// read there is a GPU page fault (the console reads stale memory).
     /// With it the view's own copy of title memory, if it has one.
     kept: Mutex<Vec<Kept>>,
+    /// Skip the draw-time backing check on heaps without placed buffers.
+    has_placed_buffers: std::sync::atomic::AtomicBool,
+    placed_buffers: Mutex<PlacedBuffers>,
+    /// Each recorded list retains a clone while it can execute with this heap.
+    heap_lease: Mutex<std::sync::Arc<()>>,
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
     next: Mutex<(u32, Vec<bool>)>,
@@ -57,6 +62,12 @@ pub(crate) struct HostHeap {
     addresses: std::sync::OnceLock<Option<(ID3D12Resource, usize, u64)>>,
     /// What the title slots view that title memory feeds (`crate::bindless`).
     pub(crate) viewed: std::sync::Arc<crate::bindless::Viewed>,
+}
+
+#[derive(Default)]
+struct PlacedBuffers {
+    slots: std::collections::BTreeSet<u32>,
+    refreshed: u64,
 }
 
 /// Host heaps' GPU ranges (start, bytes, bytes per slot, sampler), for
@@ -194,6 +205,9 @@ impl HostHeap {
             sampler,
             made: Mutex::new(vec![0; count as usize]),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
+            has_placed_buffers: false.into(),
+            placed_buffers: Mutex::default(),
+            heap_lease: Mutex::default(),
             next: Mutex::new((0, vec![false; extra as usize])),
             pairs: Mutex::new((count + extra, Vec::new())),
             pairs_end: match victory_shader::emit::NULL_BUFFER_VIEW {
@@ -740,6 +754,7 @@ impl HostHeap {
                 made[index as usize] = 0;
                 self.make_null(index);
                 self.note_address(index, None);
+                self.remember_placed_buffer(index, false);
             }
             return None;
         };
@@ -767,8 +782,95 @@ impl HostHeap {
                 self.viewed.set(index, Some(&view), kept.is_some());
             }
             self.keep(index, kept.flatten());
+            self.remember_placed_buffer(index, matches!(view, View::Placed(_, [1, ..], _)));
         }
         Some(view)
+    }
+
+    fn remember_placed_buffer(&self, index: u32, placed: bool) {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        if !placed && !self.has_placed_buffers.load(Relaxed) {
+            return;
+        }
+        let mut buffers = self.placed_buffers.lock().unwrap_or_else(|e| e.into_inner());
+        if placed {
+            buffers.slots.insert(index);
+        } else {
+            buffers.slots.remove(&index);
+        }
+        self.has_placed_buffers.store(!buffers.slots.is_empty(), Relaxed);
+    }
+
+    /// Pins persistent descriptors until the list resets or is dropped. A
+    /// recorded list can be submitted again, even after its fence completed.
+    /// Refresh slots before the first list binds an idle heap. An older
+    /// list can index the heap through either a table array or bindless
+    /// access, so a fence or the set of named table entries is insufficient.
+    pub(crate) fn lease_for_list(&self) -> std::sync::Arc<()> {
+        let lease = self.heap_lease.lock().unwrap_or_else(|e| e.into_inner());
+        if std::sync::Arc::strong_count(&lease) == 1 {
+            self.refresh_placed_buffers();
+        }
+        lease.clone()
+    }
+
+    fn refresh_placed_buffers(&self) {
+        if !self.has_placed_buffers.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        let generation = crate::shadow::binding_generation();
+        // Mirror changes the placed-slot set under the made lock.
+        let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        let mut buffers = self.placed_buffers.lock().unwrap_or_else(|e| e.into_inner());
+        if buffers.refreshed == generation {
+            return;
+        }
+        let mut complete = true;
+        for &index in &buffers.slots {
+            // Use the record mirrored in the host slot. A title thread
+            // can be writing guest slots outside the current draw's table.
+            let key = made[index as usize];
+            let Some(view @ View::Placed(_, [1, ..], _)) = view_at(key as u32, (key >> 32) as u32) else {
+                continue;
+            };
+            if self.placed_buffer_is_stale(index, &view) {
+                let (kept, mark) = make_marked(&view, self.cpu(index));
+                if let Some(kept) = kept {
+                    self.set_mark(index, mark);
+                    self.viewed.set(index, Some(&view), true);
+                    self.keep(index, kept);
+                } else {
+                    complete = false; // try again after the next retirement
+                }
+            }
+        }
+        if complete {
+            buffers.refreshed = generation;
+        }
+    }
+
+    /// A placed buffer can acquire a registered copy while another list
+    /// still uses the old persistent slot. Such tables need dynamic slots.
+    pub(crate) fn placed_buffer_binding_changed(&self, index: u32, handle: u64) -> bool {
+        if !self.has_placed_buffers.load(std::sync::atomic::Ordering::Relaxed) {
+            return false;
+        }
+        let placed = self.placed_buffers.lock().unwrap_or_else(|e| e.into_inner()).slots.contains(&index);
+        if !placed {
+            return false;
+        }
+        super::view(handle).is_some_and(|view| self.placed_buffer_is_stale(index, &view))
+    }
+
+    fn placed_buffer_is_stale(&self, index: u32, view: &View) -> bool {
+        let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+        let Some((buffer, _)) = &kept[index as usize] else {
+            return false;
+        };
+        let buffer = buffer.clone();
+        drop(kept);
+        placed_buffer_copy(view).is_some_and(|copy| copy.buffer != buffer)
     }
 
     /// The view host slot `index` was made from, in a few words, with the
@@ -932,6 +1034,14 @@ pub(crate) fn view_copy(view: &View) -> Option<(std::sync::Arc<crate::shadow::Sh
     let (address, len) = buffer_range(view)?;
     let (shadow, _) = crate::shadow::for_view(address, len, u64::from(view_stride(view)))?;
     Some((shadow, address, len))
+}
+
+/// The copy a placed buffer view would use if mirrored now.
+pub(crate) fn placed_buffer_copy(view: &View) -> Option<std::sync::Arc<crate::shadow::Shadow>> {
+    if !matches!(view, View::Placed(_, resource, _) if resource[0] == 1) {
+        return None;
+    }
+    view_copy(view).map(|(copy, _, _)| copy)
 }
 
 /// [`buffer_range`] of an unordered access view of memory at `base`.

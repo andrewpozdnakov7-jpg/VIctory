@@ -662,6 +662,8 @@ struct Deferred {
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
     kept: Vec<windows::core::IUnknown>,
+    /// View heaps with persistent descriptors held by this recorded list.
+    view_heaps: std::collections::HashMap<usize, std::sync::Arc<()>>,
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
@@ -1763,6 +1765,11 @@ impl HostList {
         if let Ok(object) = object.cast::<windows::core::IUnknown>() {
             self.deferred().kept.push(object);
         }
+    }
+
+    pub(crate) fn hold_view_heap(&self, heap: &crate::descriptor::host::HostHeap) {
+        let lease = heap.lease_for_list();
+        self.deferred().view_heaps.entry(heap.heap.as_raw() as usize).or_insert(lease);
     }
 
     /// Whether this is the first time since the reset that the list asks

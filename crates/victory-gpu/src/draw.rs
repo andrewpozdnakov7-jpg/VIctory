@@ -844,8 +844,14 @@ impl State {
                 .heaps
                 .iter()
                 .filter(|&&h| h != 0)
-                .filter_map(|&h| crate::descriptor::heap(h as This).host())
-                .map(|h| Some(h.heap.clone()))
+                .filter_map(|&h| {
+                    let heap = crate::descriptor::heap(h as This);
+                    let host = heap.host()?;
+                    if !heap.samplers() {
+                        list.hold_view_heap(host);
+                    }
+                    Some(Some(host.heap.clone()))
+                })
                 .collect();
             if memory_heap && let Some(h) = crate::memory::heap() {
                 heaps.insert(0, Some(h.heap.clone()));
@@ -1093,6 +1099,7 @@ impl State {
         // unmakeable slot where the shader expects an unordered access view
         // or another resource kind than the shared null 2D SRV, are made
         // afresh in dynamic slots so shared empty title slots stay intact.
+        // A changed placed-buffer backing also needs its own slots.
         let mut accessed: Vec<(u8, u32)> = used
             .iter()
             .filter(tables)
@@ -1122,7 +1129,7 @@ impl State {
                 fresh.push(slot);
                 continue;
             };
-            if index >= host.count() {
+            if index >= host.count() || host.placed_buffer_binding_changed(index, at) {
                 fresh.push(slot);
                 continue;
             };
@@ -1184,7 +1191,7 @@ impl State {
                 .max()
                 .unwrap_or(1);
             // The table, what its entries hold (record words) and the handle
-            // annotations its empty slots take.
+            // annotations its empty slots take, plus the backing of any placed buffer.
             let key = {
                 use std::hash::{Hash, Hasher};
                 let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -1195,6 +1202,13 @@ impl State {
                         unsafe { (at as *const [u32; 3]).read_unaligned() }
                     });
                     record.hash(&mut h);
+                    if record.is_some()
+                        && let Some(copy) = crate::descriptor::view(at)
+                            .as_ref()
+                            .and_then(crate::descriptor::host::placed_buffer_copy)
+                    {
+                        copy.buffer.as_raw().hash(&mut h);
+                    }
                     table_entry_props(slot, k * 8, used, table_views).hash(&mut h);
                 }
                 (table, h.finish())
@@ -2019,6 +2033,9 @@ pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
     // SAFETY: an open list.
     unsafe { list.list.OMSetStencilRef(reference) };
 }
+
+#[cfg(all(test, feature = "diagnostics"))]
+mod placed_buffer_tests;
 
 #[cfg(test)]
 mod tests {

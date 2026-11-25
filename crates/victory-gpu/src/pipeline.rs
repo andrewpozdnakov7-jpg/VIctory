@@ -682,6 +682,34 @@ pub fn wanted_early(key: &str) -> bool {
     library::wanted_early(key)
 }
 
+/// Makes a pipeline from a synthetic native compute program for a GPU test.
+#[cfg(all(test, windows, feature = "diagnostics"))]
+pub(crate) fn test_compute_pipeline(native: victory_shader::NativeProgram, out: *mut This) -> HRESULT {
+    use victory_shader::{Container, emit, io, ir, resource, structure};
+
+    // Compute has no input/output signatures. Supply just the DXBC header.
+    let mut container = vec![0; 32];
+    container[..4].copy_from_slice(b"DXBC");
+    container[20..24].copy_from_slice(&1u32.to_le_bytes());
+    container[24..28].copy_from_slice(&32u32.to_le_bytes());
+    let c = Container::parse(&container).unwrap();
+    let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+    let st = structure::structure(&p).unwrap();
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+    let io = io::raise(&p, &native).unwrap();
+    let host = emit::emit(&c, &native, &p, &st, &io, &res).unwrap();
+    let shader = Arc::new(Shader {
+        stage: "compute",
+        hash: blake3::hash(&native.code).to_hex()[..16].to_owned(),
+        container,
+        translated: OnceLock::from(Some(Translated {
+            host,
+            used: native.used,
+        })),
+    });
+    hand_out(vec![shader], None, &PIPELINE_IIDS[0], out)
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(all(windows, feature = "diagnostics"))]

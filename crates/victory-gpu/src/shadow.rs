@@ -803,21 +803,34 @@ fn changed() {
     GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
 }
 
+/// Changes when resolution of a placed buffer's title address may change.
+static BINDINGS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn binding_generation() -> u64 {
+    BINDINGS.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// A title buffer exists at `start` (`len` bytes).
 pub(crate) fn register(resource: usize, start: u64, len: u64) {
-    buffers().insert(
+    let mut map = buffers();
+    map.insert(
         (start, resource),
         Entry {
             end: start + len,
             shadow: None,
         },
     );
+    BINDINGS.fetch_add(1, std::sync::atomic::Ordering::Release);
 }
 
 /// The title released it; lists that still hold its copy keep it alive.
 pub(crate) fn unregister(resource: usize, start: u64) {
-    if buffers().remove(&(start, resource)).is_some_and(|e| e.shadow.is_some()) {
-        changed();
+    let mut map = buffers();
+    if let Some(entry) = map.remove(&(start, resource)) {
+        BINDINGS.fetch_add(1, std::sync::atomic::Ordering::Release);
+        if entry.shadow.is_some() {
+            changed();
+        }
     }
 }
 
