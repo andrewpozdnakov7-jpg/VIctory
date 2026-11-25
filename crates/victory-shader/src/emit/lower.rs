@@ -8,10 +8,10 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use super::UserData;
 use super::bitcode::{Attr, Bin, Cast, Term, V, pred};
 use super::container::SigElement;
 use super::shader::{Shader, VIEW_STRIDES, flags};
+use super::{TableView, UserData};
 use crate::ShaderError;
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
 use crate::io::{Barycentric, Elsewhere, Export, Input, Interp, Io, Target};
@@ -52,6 +52,7 @@ pub(crate) struct Lowered {
     /// marks").
     pub view_marks: bool,
     pub user_data: Vec<UserData>,
+    pub table_views: Vec<TableView>,
     pub samplers: Vec<[u32; 4]>,
     /// Heap handles made with a non-uniform index.
     #[cfg(test)]
@@ -192,6 +193,7 @@ struct Lower<'a> {
     params: HashMap<Value, (usize, u32)>,
     user_data: Option<V>,
     user_reads: BTreeMap<u32, UserData>,
+    table_views: BTreeMap<(u8, u32), (u32, u32)>,
     /// Handles of root SRVs and UAVs read as bounded views, by user-data
     /// dword ([`Lower::root_view`]).
     root_views: HashMap<u32, V>,
@@ -596,6 +598,7 @@ impl<'a> Lower<'a> {
             params: x.res.params.iter().map(|&(v, p, d)| (v, (p, d))).collect(),
             user_data: None,
             user_reads: BTreeMap::new(),
+            table_views: BTreeMap::new(),
             root_views: HashMap::new(),
             samplers: Vec::new(),
             descriptors: x
@@ -1306,6 +1309,11 @@ impl<'a> Lower<'a> {
         }
         self.fill_phis()?;
         let user_data = self.user_reads.values().copied().collect();
+        let table_views = self
+            .table_views
+            .iter()
+            .map(|(&(slot, dword), &props)| TableView { slot, dword, props })
+            .collect();
         self.s.samplers = self.samplers.len() as u32;
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
         let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect();
@@ -1333,6 +1341,7 @@ impl<'a> Lower<'a> {
             rovs: self.s.flags & flags::ROVS != 0,
             dxil: self.s.finish(),
             user_data,
+            table_views,
             samplers: self.samplers,
         })
     }
@@ -4863,6 +4872,9 @@ impl<'a> Lower<'a> {
             self.heap[0] = true;
             self.heap[1] |= props.0 & 0x1000 != 0;
         }
+        if !sampler {
+            self.note_table_views(src, props);
+        }
         match src {
             Source::Loaded { load, first } => {
                 let key = (self.cur, *load, *first, sampler, props.0);
@@ -5053,6 +5065,41 @@ impl<'a> Lower<'a> {
         let null = super::NULL_BUFFER_VIEW - u32::from(props.0 & 0x1000 != 0);
         let null = self.s.m.i32(null);
         self.s.m.select(c, none, null, index)
+    }
+
+    /// Records constant-offset table descriptor loads and the handle
+    /// properties they expect (preferring unordered access when a slot is
+    /// annotated both ways).
+    fn note_table_views(&mut self, src: &Source, props: (u32, u32)) {
+        for leaf in src.leaves() {
+            let Source::Loaded { load, first } = leaf else {
+                continue;
+            };
+            if self.x.res.waterfall.loads.contains(load) {
+                continue;
+            }
+            let Some(a) = self.scalar.get(load).filter(|a| a.dynamic.is_none()) else {
+                continue;
+            };
+            let Some(rp) = self
+                .x
+                .native
+                .layout
+                .get(a.param)
+                .filter(|rp| rp.root == RootType::Table)
+            else {
+                continue;
+            };
+            let dword = (a.offset / 4).wrapping_add(u32::from(*first));
+            self.table_views
+                .entry((rp.slot, dword))
+                .and_modify(|cur| {
+                    if props.0 & 0x1000 != 0 && cur.0 & 0x1000 == 0 {
+                        *cur = props;
+                    }
+                })
+                .or_insert(props);
+        }
     }
 
     /// Whether a descriptor comes from the resource heap itself (root type

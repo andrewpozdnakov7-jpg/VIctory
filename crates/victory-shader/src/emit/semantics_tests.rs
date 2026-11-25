@@ -299,6 +299,7 @@ fn lower_program(words: &[u32]) -> Result<HostShader, String> {
         stage: HwStage::Cs,
         dxil: lowered.dxil,
         user_data: lowered.user_data,
+        table_views: lowered.table_views,
         samplers: lowered.samplers,
         static_samplers: Vec::new(),
         root_cbvs: lowered.root_cbvs,

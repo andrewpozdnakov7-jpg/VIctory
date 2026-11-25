@@ -368,6 +368,23 @@ impl HostHeap {
         self.count
     }
 
+    pub(crate) fn is_sampler(&self) -> bool {
+        self.sampler
+    }
+
+    /// Whether slot `index` holds a live host view (always true for sampler
+    /// heaps; false on view heaps when empty or left null after `make`
+    /// refused the title's view).
+    pub(crate) fn has_view(&self, index: u32) -> bool {
+        self.sampler
+            || self
+                .kept
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(index as usize)
+                .is_some_and(Option::is_some)
+    }
+
     /// Gives back `n` dynamic slots from `first` (an index [`dynamic`]
     /// returned).
     ///
@@ -383,16 +400,80 @@ impl HostHeap {
         }
     }
 
+    /// Makes slot `index` (a dynamic one) from `view`, returning false
+    /// without writing a fallback if the host cannot make `view`.
+    pub(crate) fn try_make_at(&self, index: u32, view: &View) -> bool {
+        let (kept, mark) = make_marked(view, self.cpu(index));
+        let Some(kept) = kept else {
+            return false;
+        };
+        self.keep(index, kept);
+        self.set_stride(index, Some(view));
+        self.set_mark(index, mark);
+        true
+    }
+
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
     /// host cannot.
     pub(crate) fn make_at(&self, index: u32, view: &View) {
-        let (kept, mark) = make_marked(view, self.cpu(index));
-        if kept.is_none() {
+        if self.try_make_at(index, view) {
+            return;
+        }
+        if self.sampler {
+            self.null_sampler(index);
+        } else {
             null_for(view, self.cpu(index));
         }
-        self.keep(index, kept.flatten());
+        self.keep(index, None);
         self.set_stride(index, Some(view));
-        self.set_mark(index, mark);
+        self.set_mark(index, None);
+    }
+
+    /// Makes dynamic slot `index` a null view of the kind a shader handle's
+    /// `dx.types.ResourceProperties` `props` expects, so unordered writes
+    /// are dropped and reads give zeros without a type or dimension mismatch.
+    pub(crate) fn make_null_for(&self, index: u32, props: (u32, u32)) {
+        if self.sampler {
+            self.null_sampler(index);
+            self.keep(index, None);
+            return;
+        }
+        let stride = match null_desc_for_props(props) {
+            Some((NullDesc::Uav(desc), stride)) => {
+                if let Some(host) = host() {
+                    // SAFETY: a slot of our heap; a null resource is allowed with a desc.
+                    unsafe {
+                        host.device.CreateUnorderedAccessView(
+                            None::<&ID3D12Resource>,
+                            None::<&ID3D12Resource>,
+                            Some(&desc),
+                            self.cpu(index),
+                        );
+                    }
+                }
+                stride
+            }
+            Some((NullDesc::Srv(desc), stride)) => {
+                if let Some(host) = host() {
+                    // SAFETY: a slot of our heap; a null resource is allowed with a desc.
+                    unsafe {
+                        host.device.CreateShaderResourceView(
+                            None::<&ID3D12Resource>,
+                            Some(&desc),
+                            self.cpu(index),
+                        );
+                    }
+                }
+                stride
+            }
+            None => {
+                null_view(self.cpu(index));
+                0
+            }
+        };
+        self.keep(index, None);
+        self.write_stride(index, stride);
+        self.set_mark(index, None);
     }
 
     /// Makes slot `index` (a dynamic one) a raw view, shader resource or
@@ -1265,13 +1346,13 @@ pub(crate) fn placed_texture(view: &View) -> Option<View> {
 fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     let Some(host) = host() else { return };
     let is_buffer = |r: &usize| crate::resource::buffer_bytes(*r as crate::object::This).is_some();
-    // Unordered views: whether a buffer, and the title's view dimension.
-    let (buffer, dimension) = match view {
+    // Unordered views: whether a buffer, and the title's view words.
+    let (buffer, words) = match view {
         View::Unordered(r, _, desc) => (
             is_buffer(r) || desc.is_some_and(|d| d[1] == 1),
-            desc.map(|d| d[1]),
+            desc.as_ref().map(|d| d.as_slice()),
         ),
-        View::Placed(true, resource, desc) => (resource[0] == 1, Some(desc[1])),
+        View::Placed(true, resource, desc) => (resource[0] == 1, Some(&desc[..10])),
         // Shader views of buffers read nothing through a null buffer view:
         // a null 2D view where the shader expects a buffer is a mismatch
         // the hardware does not survive in general (GPU-based validation
@@ -1291,13 +1372,46 @@ fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
         _ => return null_view(at),
     };
     let desc = if buffer {
-        D3D12_UNORDERED_ACCESS_VIEW_DESC {
-            Format: DXGI_FORMAT_R32_UINT,
-            ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
-            ..Default::default()
+        let raw = words.is_some_and(|w| w[8] & 1 != 0);
+        let stride = words.map_or(0, |w| w[5]);
+        if raw {
+            D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                Format: DXGI_FORMAT_R32_TYPELESS,
+                ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+                Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                    Buffer: D3D12_BUFFER_UAV {
+                        NumElements: 1,
+                        Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+                        ..Default::default()
+                    },
+                },
+            }
+        } else if stride > 0 {
+            D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                Format: DXGI_FORMAT_UNKNOWN,
+                ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+                Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                    Buffer: D3D12_BUFFER_UAV {
+                        NumElements: 1,
+                        StructureByteStride: stride,
+                        ..Default::default()
+                    },
+                },
+            }
+        } else {
+            D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                Format: DXGI_FORMAT_R32_UINT,
+                ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+                Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                    Buffer: D3D12_BUFFER_UAV {
+                        NumElements: 1,
+                        ..Default::default()
+                    },
+                },
+            }
         }
     } else {
-        null_uav_desc(dimension)
+        null_uav_desc(words.map(|w| w[1]))
     };
     // SAFETY: a slot of our heap; a null resource is allowed with a desc.
     unsafe {
@@ -1422,6 +1536,275 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
         host.device
             .CreateShaderResourceView(None::<&ID3D12Resource>, Some(&desc), at)
     };
+}
+
+enum NullDesc {
+    Srv(D3D12_SHADER_RESOURCE_VIEW_DESC),
+    Uav(D3D12_UNORDERED_ACCESS_VIEW_DESC),
+}
+
+/// Maps DXIL `dx.types.ResourceProperties` words to a null SRV or UAV
+/// description and its byte stride in `VIEW_STRIDES` (0 for textures).
+fn null_desc_for_props((props0, props1): (u32, u32)) -> Option<(NullDesc, u32)> {
+    let kind = props0 & 0xFF;
+    let uav = props0 & 0x1000 != 0;
+    let comp = props1 & 0xFF;
+    let r32 = match comp {
+        9 => DXGI_FORMAT_R32_FLOAT,
+        4 => DXGI_FORMAT_R32_SINT,
+        _ => DXGI_FORMAT_R32_UINT,
+    };
+    let srv_tex_format = match comp {
+        4 => DXGI_FORMAT_R32_SINT,
+        5 => DXGI_FORMAT_R32_UINT,
+        _ => DXGI_FORMAT_R8G8B8A8_UNORM,
+    };
+    if uav {
+        let desc = match kind {
+            1 => D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                Format: r32,
+                ViewDimension: D3D12_UAV_DIMENSION_TEXTURE1D,
+                ..Default::default()
+            },
+            2 => D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                Format: r32,
+                ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
+                ..Default::default()
+            },
+            4 => D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                Format: r32,
+                ViewDimension: D3D12_UAV_DIMENSION_TEXTURE3D,
+                Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                    Texture3D: D3D12_TEX3D_UAV {
+                        WSize: u32::MAX,
+                        ..Default::default()
+                    },
+                },
+            },
+            6 => D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                Format: r32,
+                ViewDimension: D3D12_UAV_DIMENSION_TEXTURE1DARRAY,
+                Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                    Texture1DArray: D3D12_TEX1D_ARRAY_UAV {
+                        ArraySize: 1,
+                        ..Default::default()
+                    },
+                },
+            },
+            7 => D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                Format: r32,
+                ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2DARRAY,
+                Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                    Texture2DArray: D3D12_TEX2D_ARRAY_UAV {
+                        ArraySize: 1,
+                        ..Default::default()
+                    },
+                },
+            },
+            10 => {
+                return Some((
+                    NullDesc::Uav(D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                        Format: r32,
+                        ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+                        Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                            Buffer: D3D12_BUFFER_UAV {
+                                NumElements: 1,
+                                ..Default::default()
+                            },
+                        },
+                    }),
+                    4,
+                ));
+            }
+            11 => {
+                return Some((
+                    NullDesc::Uav(D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                        Format: DXGI_FORMAT_R32_TYPELESS,
+                        ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+                        Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                            Buffer: D3D12_BUFFER_UAV {
+                                NumElements: 1,
+                                Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+                                ..Default::default()
+                            },
+                        },
+                    }),
+                    4,
+                ));
+            }
+            12 if props1 > 0 => {
+                return Some((
+                    NullDesc::Uav(D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                        Format: DXGI_FORMAT_UNKNOWN,
+                        ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+                        Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                            Buffer: D3D12_BUFFER_UAV {
+                                NumElements: 1,
+                                StructureByteStride: props1,
+                                ..Default::default()
+                            },
+                        },
+                    }),
+                    props1,
+                ));
+            }
+            _ => return None,
+        };
+        return Some((NullDesc::Uav(desc), 0));
+    }
+
+    let map = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    let desc = match kind {
+        1 => D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: srv_tex_format,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE1D,
+            Shader4ComponentMapping: map,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture1D: D3D12_TEX1D_SRV {
+                    MipLevels: 1,
+                    ..Default::default()
+                },
+            },
+        },
+        2 => D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: srv_tex_format,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+            Shader4ComponentMapping: map,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_SRV {
+                    MipLevels: 1,
+                    ..Default::default()
+                },
+            },
+        },
+        3 => D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: srv_tex_format,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2DMS,
+            Shader4ComponentMapping: map,
+            ..Default::default()
+        },
+        4 => D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: srv_tex_format,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE3D,
+            Shader4ComponentMapping: map,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture3D: D3D12_TEX3D_SRV {
+                    MipLevels: 1,
+                    ..Default::default()
+                },
+            },
+        },
+        5 => D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: srv_tex_format,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURECUBE,
+            Shader4ComponentMapping: map,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                TextureCube: D3D12_TEXCUBE_SRV {
+                    MipLevels: 1,
+                    ..Default::default()
+                },
+            },
+        },
+        6 => D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: srv_tex_format,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE1DARRAY,
+            Shader4ComponentMapping: map,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture1DArray: D3D12_TEX1D_ARRAY_SRV {
+                    MipLevels: 1,
+                    ArraySize: 1,
+                    ..Default::default()
+                },
+            },
+        },
+        7 => D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: srv_tex_format,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2DARRAY,
+            Shader4ComponentMapping: map,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2DArray: D3D12_TEX2D_ARRAY_SRV {
+                    MipLevels: 1,
+                    ArraySize: 1,
+                    ..Default::default()
+                },
+            },
+        },
+        8 => D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: srv_tex_format,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY,
+            Shader4ComponentMapping: map,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2DMSArray: D3D12_TEX2DMS_ARRAY_SRV {
+                    ArraySize: 1,
+                    ..Default::default()
+                },
+            },
+        },
+        9 => D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: srv_tex_format,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURECUBEARRAY,
+            Shader4ComponentMapping: map,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                TextureCubeArray: D3D12_TEXCUBE_ARRAY_SRV {
+                    MipLevels: 1,
+                    NumCubes: 1,
+                    ..Default::default()
+                },
+            },
+        },
+        10 => {
+            return Some((
+                NullDesc::Srv(D3D12_SHADER_RESOURCE_VIEW_DESC {
+                    Format: r32,
+                    ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+                    Shader4ComponentMapping: map,
+                    Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                        Buffer: D3D12_BUFFER_SRV {
+                            NumElements: 1,
+                            ..Default::default()
+                        },
+                    },
+                }),
+                4,
+            ));
+        }
+        11 => {
+            return Some((
+                NullDesc::Srv(D3D12_SHADER_RESOURCE_VIEW_DESC {
+                    Format: DXGI_FORMAT_R32_TYPELESS,
+                    ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+                    Shader4ComponentMapping: map,
+                    Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                        Buffer: D3D12_BUFFER_SRV {
+                            NumElements: 1,
+                            Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                            ..Default::default()
+                        },
+                    },
+                }),
+                4,
+            ));
+        }
+        12 if props1 > 0 => {
+            return Some((
+                NullDesc::Srv(D3D12_SHADER_RESOURCE_VIEW_DESC {
+                    Format: DXGI_FORMAT_UNKNOWN,
+                    ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+                    Shader4ComponentMapping: map,
+                    Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                        Buffer: D3D12_BUFFER_SRV {
+                            NumElements: 1,
+                            StructureByteStride: props1,
+                            ..Default::default()
+                        },
+                    },
+                }),
+                props1,
+            ));
+        }
+        _ => return None,
+    };
+    Some((NullDesc::Srv(desc), 0))
 }
 
 #[cfg(test)]
@@ -1562,5 +1945,57 @@ mod tests {
         let last = first + heap.dynamic - 1;
         heap.release(last, 1);
         assert_eq!(heap.dynamic(2), None);
+    }
+
+    #[test]
+    fn null_desc_for_props_covers_buffers_and_textures() {
+        assert!(null_desc_for_props((3 | 0x1000, 0x409)).is_none());
+        assert!(null_desc_for_props((5 | 0x1000, 0x409)).is_none());
+        assert!(null_desc_for_props((8 | 0x1000, 0x409)).is_none());
+        assert!(null_desc_for_props((9 | 0x1000, 0x409)).is_none());
+        assert!(null_desc_for_props((12, 0)).is_none());
+        assert!(null_desc_for_props((14, 0)).is_none());
+
+        let cases = [
+            ((10, 0x409), 4),
+            ((10 | 0x1000, 0x105), 4),
+            ((10 | 0x1000, 0x104), 4),
+            ((11, 0), 4),
+            ((11 | 0x1000, 0), 4),
+            ((12, 16), 16),
+            ((12 | 0x1000, 24), 24),
+            ((1, 0x409), 0),
+            ((2, 0x105), 0),
+            ((3, 0x409), 0),
+            ((4, 0x409), 0),
+            ((5, 0x409), 0),
+            ((6, 0x409), 0),
+            ((7, 0x409), 0),
+            ((8, 0x409), 0),
+            ((9, 0x409), 0),
+            ((1 | 0x1000, 0x409), 0),
+            ((2 | 0x1000, 0x105), 0),
+            ((4 | 0x1000, 0x409), 0),
+            ((6 | 0x1000, 0x409), 0),
+            ((7 | 0x1000, 0x409), 0),
+        ];
+        for &(props, want_stride) in &cases {
+            let (_, stride) = null_desc_for_props(props).expect("supported props");
+            assert_eq!(stride, want_stride, "props {props:#x?}");
+        }
+
+        let Some(host) = host() else { return };
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return;
+        };
+        let _ = host.log_messages();
+        let first = heap.dynamic(cases.len() as u32).unwrap();
+        for (i, &(props, _)) in cases.iter().enumerate() {
+            heap.make_null_for(first + i as u32, props);
+        }
+        heap.release(first, cases.len() as u32);
+        assert_eq!(host.log_messages(), None, "D3D12 debug layer error");
+        // SAFETY: a plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
 }

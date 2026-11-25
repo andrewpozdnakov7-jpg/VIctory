@@ -200,6 +200,7 @@ fn build(
         stage: HwStage::Cs,
         dxil: lowered.dxil,
         user_data: lowered.user_data,
+        table_views: lowered.table_views,
         static_samplers: lowered
             .samplers
             .iter()
@@ -573,4 +574,138 @@ fn a_sampler_chosen_by_a_uniform_branch_samples_as_chosen() {
         ran += 1;
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+#[test]
+fn table_views_record_constant_entries_prefer_uav_and_skip_dynamic() {
+    use super::TableView;
+
+    // s0: table with raw SRV (+0), raw UAV (+8), structured UAV (+16, stride 12),
+    // and dynamic-offset UAV (+s1*32).
+    const TABLE_MIX_WAVE32: &[u32] = &[
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF408_0202,
+        0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0
+        0xF408_0302,
+        0xFA00_0020, // s_load_dwordx4 s[12:15], s[4:5], 0x20
+        0xF408_0402,
+        0xFA00_0040, // s_load_dwordx4 s[16:19], s[4:5], 0x40
+        0x8F06_8501, // s_lshl_b32 s6, s1, 5
+        0xF408_0502,
+        0x0C00_0000, // s_load_dwordx4 s[20:23], s[4:5], s6
+        0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xE030_1000,
+        0x8002_0201, // buffer_load_dword v2, v1, s[8:11], 0 offen
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0xE070_1000,
+        0x8003_0201, // buffer_store_dword v2, v1, s[12:15], 0 offen
+        0xE070_2000,
+        0x8004_0200, // buffer_store_dword v2, v0, s[16:19], 0 idxen
+        0xE070_1000,
+        0x8005_0201, // buffer_store_dword v2, v1, s[20:23], 0 offen
+        0xBF81_0000, // s_endpgm
+    ];
+    let used_entry = |kind, offset_dwords, stride| UsedResource {
+        kind,
+        root: RootType::Table,
+        table_offset_dwords: offset_dwords,
+        lower_bound: 0,
+        stride,
+        dwords: 4,
+        user_data: 0,
+        slot: 0,
+    };
+    let shader = build(
+        TABLE_MIX_WAVE32,
+        vec![param(RootType::Table, 0), param(RootType::Constants, 1)],
+        vec![
+            used_entry(ResourceType::Srv, 0, 0),
+            used_entry(ResourceType::Uav, 8, 0),
+            used_entry(ResourceType::Uav, 16, 12),
+            used_entry(ResourceType::Uav, 24, 0),
+        ],
+        32,
+    );
+    assert_eq!(
+        shader.table_views,
+        vec![
+            TableView {
+                slot: 0,
+                dword: 0,
+                props: (11, 0),
+            },
+            TableView {
+                slot: 0,
+                dword: 8,
+                props: (0x100b, 0),
+            },
+            TableView {
+                slot: 0,
+                dword: 16,
+                props: (0x100c, 12),
+            },
+        ]
+    );
+
+    // Control-flow join (`Phi`) and dual SRV/UAV access on the same entries:
+    // both arms of the branch are recorded, and UAV wins regardless of order.
+    const PHI_AND_UAV_PREF_WAVE32: &[u32] = &[
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF408_0302,
+        0xFA00_0000, // s_load_dwordx4 s[12:15], s[4:5], 0x0
+        0xBF06_8001, // s_cmp_eq_u32 s1, 0
+        0xBF85_0003, // s_cbranch_scc1 -> arm_b
+        0xF408_0202,
+        0xFA00_0020, // s_load_dwordx4 s[8:11], s[4:5], 0x20
+        0xBF82_0002, // s_branch -> join
+        0xF408_0202,
+        0xFA00_0040, // arm_b: s_load_dwordx4 s[8:11], s[4:5], 0x40
+        0x3402_0082, // join: v_lshlrev_b32 v1, 2, v0
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        // Store then load on s0+0; load then store on the phi of s0+8 / s0+16.
+        0xE070_1000,
+        0x8003_0001, // buffer_store_dword v0, v1, s[12:15], 0 offen
+        0xE030_1000,
+        0x8003_0201, // buffer_load_dword v2, v1, s[12:15], 0 offen
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0xE030_1000,
+        0x8002_0301, // buffer_load_dword v3, v1, s[8:11], 0 offen
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0xE070_1000,
+        0x8002_0301, // buffer_store_dword v3, v1, s[8:11], 0 offen
+        0xBF81_0000, // s_endpgm
+    ];
+    let phi_shader = build(
+        PHI_AND_UAV_PREF_WAVE32,
+        vec![param(RootType::Table, 0), param(RootType::Constants, 1)],
+        vec![
+            used_entry(ResourceType::Srv, 0, 0),
+            used_entry(ResourceType::Srv, 8, 0),
+            used_entry(ResourceType::Srv, 16, 0),
+        ],
+        32,
+    );
+    assert_eq!(
+        phi_shader.table_views,
+        vec![
+            TableView {
+                slot: 0,
+                dword: 0,
+                props: (0x100b, 0),
+            },
+            TableView {
+                slot: 0,
+                dword: 8,
+                props: (0x100b, 0),
+            },
+            TableView {
+                slot: 0,
+                dword: 16,
+                props: (0x100b, 0),
+            },
+        ]
+    );
 }

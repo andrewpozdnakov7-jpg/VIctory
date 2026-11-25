@@ -269,6 +269,9 @@ pub struct HostShader {
     pub dxil: Vec<u8>,
     /// The user-data dwords the shader reads.
     pub user_data: Vec<UserData>,
+    /// Resource descriptors loaded from descriptor tables at constant offsets,
+    /// with the handle annotations they expect.
+    pub table_views: Vec<TableView>,
     /// Immediate samplers: the four sampler words of `s<n>`.
     pub samplers: Vec<[u32; 4]>,
     /// The same samplers decoded, `s<n>` at position n: the static sampler
@@ -348,6 +351,16 @@ pub struct UserData {
     /// [`ROOT_SRV_VIEW`], [`ROOT_UAV_VIEW`] or [`ROOT_VIEW_OFFSET`] name
     /// its view's heap index or its offset in that view instead.
     pub dword: u32,
+}
+
+/// A resource descriptor a shader loads from a descriptor table at a constant
+/// offset, with the `dx.types.ResourceProperties` words its handle is
+/// annotated with (`props.0 & 0x1000 != 0` for unordered access).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TableView {
+    pub slot: u8,
+    pub dword: u32,
+    pub props: (u32, u32),
 }
 
 /// How a translation is made.
@@ -497,6 +510,7 @@ pub fn emit_with(
         stage: native.stage,
         dxil: l.dxil,
         user_data: l.user_data,
+        table_views: l.table_views,
         static_samplers: l
             .samplers
             .iter()
@@ -867,6 +881,7 @@ mod tests {
             stage: crate::HwStage::Ps,
             dxil: constant_color(),
             user_data: Vec::new(),
+            table_views: Vec::new(),
             samplers: Vec::new(),
             static_samplers: Vec::new(),
             root_cbvs: Vec::new(),
@@ -884,6 +899,7 @@ mod tests {
                 stage,
                 dxil: std::fs::read(p).unwrap(),
                 user_data: Vec::new(),
+                table_views: Vec::new(),
                 samplers: Vec::new(),
                 static_samplers: Vec::new(),
                 root_cbvs: Vec::new(),

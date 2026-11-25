@@ -20,7 +20,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use victory_pipeline::{Cache, Converter};
-use victory_shader::emit::{HostShader, StaticSampler, UserData};
+use victory_shader::emit::{HostShader, StaticSampler, TableView, UserData};
 use victory_shader::{HwStage, RootType};
 
 static CACHE: OnceLock<Cache> = OnceLock::new();
@@ -201,6 +201,7 @@ fn encode(translation: &Result<HostShader, String>) -> Vec<u8> {
         stage,
         dxil,
         user_data,
+        table_views,
         samplers,
         static_samplers,
         root_cbvs,
@@ -222,6 +223,12 @@ fn encode(translation: &Result<HostShader, String>) -> Vec<u8> {
     word(&mut out, user_data.len() as u32);
     for u in user_data {
         for v in [u.index, u32::from(u.slot), root_code(u.root), u.dword] {
+            word(&mut out, v);
+        }
+    }
+    word(&mut out, table_views.len() as u32);
+    for t in table_views {
+        for v in [u32::from(t.slot), t.dword, t.props.0, t.props.1] {
             word(&mut out, v);
         }
     }
@@ -302,6 +309,15 @@ fn decode(bytes: &[u8]) -> Option<Result<HostShader, String>> {
         });
     }
     let n = r.word()? as usize;
+    let mut table_views = Vec::with_capacity(n.min(256));
+    for _ in 0..n {
+        table_views.push(TableView {
+            slot: u8::try_from(r.word()?).ok()?,
+            dword: r.word()?,
+            props: (r.word()?, r.word()?),
+        });
+    }
+    let n = r.word()? as usize;
     let mut samplers = Vec::with_capacity(n.min(256));
     for _ in 0..n {
         samplers.push([r.word()?, r.word()?, r.word()?, r.word()?]);
@@ -328,6 +344,7 @@ fn decode(bytes: &[u8]) -> Option<Result<HostShader, String>> {
         stage,
         dxil,
         user_data,
+        table_views,
         samplers,
         static_samplers,
         root_cbvs,
@@ -355,6 +372,11 @@ mod tests {
                 slot: 1,
                 root: RootType::Table,
                 dword: 0,
+            }],
+            table_views: vec![TableView {
+                slot: 1,
+                dword: 8,
+                props: (0x100b, 0),
             }],
             samplers: vec![[0x400, 0xc0_0000, 0x18f0_0000, 0]],
             static_samplers: vec![StaticSampler::from_words([

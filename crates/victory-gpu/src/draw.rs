@@ -588,7 +588,7 @@ impl State {
         for stage in &p.stages {
             let t = stage.translated();
             self.table_failed = false;
-            let made = self.tables(list, &t.used, compute);
+            let made = self.tables(list, &t.used, &t.host.table_views, compute);
             // A depth copy of ours made readable a texture the tables hold
             // (`crate::twin`), with a compute pipeline: this one's again
             // (root arguments are set below).
@@ -1079,28 +1079,59 @@ impl State {
     ///
     /// Within a list, the same table holding the same descriptors is made
     /// once.
-    fn tables(&mut self, list: &HostList, used: &[UsedResource], compute: bool) -> Vec<(u8, u32)> {
+    fn tables(
+        &mut self,
+        list: &HostList,
+        used: &[UsedResource],
+        table_views: &[victory_shader::emit::TableView],
+        compute: bool,
+    ) -> Vec<(u8, u32)> {
         let tables = |u: &&UsedResource| u.root == RootType::Table;
         let mut fresh: Vec<u8> = Vec::new();
         // Tables reaching past a host heap smaller than the title's (the
-        // host's limit, 1,000,000 views on NVIDIA) are made afresh too: the
-        // title's slots there have no host slot of their own.
-        for u in used.iter().filter(tables) {
-            if fresh.contains(&u.slot) {
+        // host's limit, 1,000,000 views on NVIDIA), or holding an empty or
+        // unmakeable slot where the shader expects an unordered access view
+        // or another resource kind than the shared null 2D SRV, are made
+        // afresh in dynamic slots so shared empty title slots stay intact.
+        let mut accessed: Vec<(u8, u32)> = used
+            .iter()
+            .filter(tables)
+            .map(|u| (u.slot, u.table_offset_dwords / 8))
+            .chain(table_views.iter().map(|tv| (tv.slot, tv.dword / 8)))
+            .collect();
+        accessed.sort_unstable();
+        accessed.dedup();
+        for &(slot, k) in &accessed {
+            if fresh.contains(&slot) {
                 continue;
             }
-            let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
+            let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
                 continue;
             };
-            let end = table + u64::from(u.table_offset_dwords) * 4;
             let Some(heap) = self.heap_of(table) else {
                 continue;
             };
-            let (Some(host), Some(index)) = (heap.host(), heap.index(end)) else {
+            let Some(host) = heap.host() else {
+                continue;
+            };
+            if host.is_sampler() {
+                continue;
+            }
+            let at = table + u64::from(k) * 32;
+            let Some(index) = heap.index(at) else {
+                fresh.push(slot);
                 continue;
             };
             if index >= host.count() {
-                fresh.push(u.slot);
+                fresh.push(slot);
+                continue;
+            };
+            let mirrored = host.mirror(index, at, true);
+            if !host.has_view(index) {
+                let props = table_entry_props(slot, k * 8, used, table_views);
+                if mirrored.is_some() || !matches_plain_null_srv(props) {
+                    fresh.push(slot);
+                }
             }
         }
         fresh.sort_unstable();
@@ -1109,6 +1140,19 @@ impl State {
             if !fresh.contains(&u.slot) {
                 self.table_entry(list, u, compute);
             }
+        }
+        for tv in table_views {
+            if fresh.contains(&tv.slot)
+                || used.iter().any(|u| {
+                    u.root == RootType::Table
+                        && u.slot == tv.slot
+                        && u.table_offset_dwords / 8 == tv.dword / 8
+                })
+            {
+                continue;
+            }
+            let syn = used_from_table_view(tv);
+            self.table_entry(list, &syn, compute);
         }
         let mut made = Vec::new();
         for slot in fresh {
@@ -1129,24 +1173,47 @@ impl State {
             let n = entries
                 .iter()
                 .map(|u| u.table_offset_dwords / 8 + 1)
+                .chain(
+                    table_views
+                        .iter()
+                        .filter(|tv| tv.slot == slot)
+                        .map(|tv| tv.dword / 8 + 1),
+                )
                 .max()
                 .unwrap_or(1);
-            // The table and what its entries hold (record words).
+            // The table, what its entries hold (record words) and the handle
+            // annotations its empty slots take.
             let key = {
                 use std::hash::{Hash, Hasher};
                 let mut h = std::collections::hash_map::DefaultHasher::new();
                 for k in 0..n {
                     let at = table + u64::from(k) * 32;
-                    // SAFETY: a descriptor slot in title memory.
-                    unsafe { (at as *const [u32; 3]).read_unaligned() }.hash(&mut h);
+                    let record = heap.index(at).map(|_| {
+                        // SAFETY: `at` lies within `heap`'s descriptor memory.
+                        unsafe { (at as *const [u32; 3]).read_unaligned() }
+                    });
+                    record.hash(&mut h);
+                    table_entry_props(slot, k * 8, used, table_views).hash(&mut h);
                 }
                 (table, h.finish())
             };
             if let Some(&first) = self.fresh_tables.get(&key) {
-                for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
-                    let handle = table + u64::from(u.table_offset_dwords) * 4;
-                    if let Some(view) = crate::descriptor::view(handle) {
+                for k in 0..n {
+                    let at = table + u64::from(k) * 32;
+                    let Some(view) = heap.index(at).and_then(|_| crate::descriptor::view(at))
+                    else {
+                        continue;
+                    };
+                    if let Some(u) = entries
+                        .iter()
+                        .find(|u| u.table_offset_dwords / 8 == k && u.kind != ResourceType::Cbv)
+                    {
                         readable(list, u, &view, true);
+                    } else if let Some(tv) = table_views
+                        .iter()
+                        .find(|tv| tv.slot == slot && tv.dword / 8 == k)
+                    {
+                        readable(list, &used_from_table_view(tv), &view, true);
                     }
                 }
                 made.push((slot, first * 32));
@@ -1168,17 +1235,29 @@ impl State {
             // used-resource list names (descriptor arrays).
             for k in 0..n {
                 let index = first + k;
-                let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
-                match crate::descriptor::view(table + u64::from(k) * 32) {
-                    Some(view) => {
-                        host.make_at(index, &view);
-                        if let Some(u) = used {
+                let entry_u = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
+                let props = table_entry_props(slot, k * 8, used, table_views);
+                let at = table + u64::from(k) * 32;
+                match heap.index(at).and_then(|_| crate::descriptor::view(at)) {
+                    Some(view) if host.try_make_at(index, &view) => {
+                        if let Some(u) = entry_u {
                             readable(list, u, &view, true);
+                        } else if let Some(tv) = table_views
+                            .iter()
+                            .find(|tv| tv.slot == slot && tv.dword / 8 == k)
+                        {
+                            readable(list, &used_from_table_view(tv), &view, true);
                         }
                     }
-                    None => {
-                        host.make_null(index);
-                        if used.is_some() {
+                    Some(view) if props.is_none() => {
+                        host.make_at(index, &view);
+                    }
+                    other => {
+                        match props {
+                            Some(p) => host.make_null_for(index, p),
+                            None => host.make_null(index),
+                        }
+                        if other.is_none() && (entry_u.is_some() || props.is_some()) {
                             once!(slot, "a table entry without a view");
                         }
                     }
@@ -1828,6 +1907,70 @@ fn describe(view: Option<&View>) -> String {
 /// A user-data entry that takes the heap index of a root view's view.
 fn is_root_view(u: &victory_shader::emit::UserData) -> bool {
     u.root == RootType::Descriptor && u.dword >= victory_shader::emit::ROOT_SRV_VIEW
+}
+
+/// The `dx.types.ResourceProperties` annotation expected for table entry
+/// `(slot, dword)`, falling back to `used` when no constant-offset load
+/// annotated it.
+fn table_entry_props(
+    slot: u8,
+    dword: u32,
+    used: &[UsedResource],
+    table_views: &[victory_shader::emit::TableView],
+) -> Option<(u32, u32)> {
+    if let Some(tv) = table_views
+        .iter()
+        .find(|tv| tv.slot == slot && tv.dword == dword)
+    {
+        return Some(tv.props);
+    }
+    let u = used
+        .iter()
+        .find(|u| u.root == RootType::Table && u.slot == slot && u.table_offset_dwords == dword)?;
+    let structured = u.stride >= 4 && u.stride.is_multiple_of(4);
+    match u.kind {
+        ResourceType::Uav if u.dwords == 4 => Some(if structured {
+            (12 | 0x1000, u.stride)
+        } else {
+            (11 | 0x1000, 0)
+        }),
+        ResourceType::Uav => Some((2 | 0x1000, 0x409)),
+        ResourceType::Cbv => Some((11, 0)),
+        ResourceType::Srv if u.dwords == 4 => {
+            Some(if structured { (12, u.stride) } else { (11, 0) })
+        }
+        _ => None,
+    }
+}
+
+/// Whether the default null 2D float SRV (`null_view`) satisfies `props`.
+fn matches_plain_null_srv(props: Option<(u32, u32)>) -> bool {
+    match props {
+        None => true,
+        Some((2, p1)) => p1 & 0xFF == 9,
+        _ => false,
+    }
+}
+
+fn used_from_table_view(tv: &victory_shader::emit::TableView) -> UsedResource {
+    UsedResource {
+        kind: if tv.props.0 & 0x1000 != 0 {
+            ResourceType::Uav
+        } else {
+            ResourceType::Srv
+        },
+        root: RootType::Table,
+        table_offset_dwords: tv.dword,
+        lower_bound: 0,
+        stride: 0,
+        dwords: if (10..=12).contains(&(tv.props.0 & 0xFF)) {
+            4
+        } else {
+            8
+        },
+        user_data: 0,
+        slot: tv.slot,
+    }
 }
 
 /// Whether a shader reads root views through views the host makes.
@@ -2491,5 +2634,430 @@ void main(uint3 id : SV_DispatchThreadID) {
         drop(found);
         slots.make_null(0);
         assert!(shown.upgrade().is_none(), "released with the slot");
+    }
+
+    #[test]
+    fn unbound_table_uavs_and_shared_null_slots_execute_cleanly() {
+        use victory_shader::emit::TableView;
+
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+
+        // Compute shader writing 5 unbound UAVs (raw buffer, structured buffer,
+        // 1D/2D/3D textures), reading an explicit-null 1D title slot annotated
+        // as 2D SRV, and writing a live output raw UAV in slot 6 of the table.
+        const WRITE_UNBOUND_CS: &str = r#"
+#define RS "DescriptorTable(UAV(u0, numDescriptors = 5), SRV(t0, offset = 5), UAV(u5, offset = 6))"
+RWByteAddressBuffer u_raw : register(u0);
+RWStructuredBuffer<uint4> u_struct : register(u1);
+RWTexture1D<float4> u_tex1d : register(u2);
+RWTexture2D<uint> u_tex2d : register(u3);
+RWTexture3D<float4> u_tex3d : register(u4);
+Texture2D<float4> t_mismatch : register(t0);
+RWByteAddressBuffer out_uav : register(u5);
+[RootSignature(RS)]
+[numthreads(16, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    u_raw.Store(id.x * 4u, 0xDEAD0000u + id.x);
+    u_struct[id.x] = uint4(id.x, 1u, 2u, 3u);
+    u_tex1d[id.x] = float4(1.0, 2.0, 3.0, 4.0);
+    uint old_val;
+    InterlockedAdd(u_tex2d[uint2(id.x, 0u)], 7u, old_val);
+    u_tex3d[uint3(id.x, 0u, 0u)] = float4(5.0, 6.0, 7.0, 8.0);
+    uint leaked = asuint(t_mismatch.Load(int3(0, 0, 0)).x) + old_val;
+    out_uav.Store(id.x * 4u, 0x50800000u + id.x + leaked);
+}
+"#;
+
+        // Second shader reading shared empty title slot 0 in-place as a 2D SRV.
+        const READ_SHARED_NULL_CS: &str = r#"
+#define RS "DescriptorTable(SRV(t0)), UAV(u0)"
+Texture2D<float4> shared_null : register(t0);
+RWByteAddressBuffer out_srv : register(u0);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main() {
+    float4 v = shared_null.Load(int3(0, 0, 0));
+    out_srv.Store(0u, asuint(v.x + v.y + v.z + v.w));
+}
+"#;
+
+        // Graphics VS + PS writing an unbound 2D UAV and a live raw buffer UAV.
+        const GFX_SHADER: &str = r#"
+#define RS "DescriptorTable(UAV(u1), UAV(u2, offset = 6))"
+RWTexture2D<float4> u_unbound : register(u1);
+RWByteAddressBuffer u_gfx_out : register(u2);
+[RootSignature(RS)]
+float4 vs_main(uint vid : SV_VertexID) : SV_Position {
+    float2 p = float2((vid << 1) & 2, vid & 2);
+    return float4(p * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);
+}
+[RootSignature(RS)]
+void ps_main(float4 pos : SV_Position) {
+    u_unbound[uint2(pos.xy)] = float4(9.0, 8.0, 7.0, 6.0);
+    u_gfx_out.Store(64u, 0xCAFE5080u);
+}
+"#;
+
+        let null = std::ptr::null();
+        // Place the 16-slot title heap (512 B) flush against a `PAGE_NOACCESS`
+        // guard page so any out-of-bounds read past slot 15 faults immediately.
+        let placed_start = {
+            use windows_sys::Win32::System::Memory::{
+                MEM_COMMIT, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc,
+            };
+            // SAFETY: reserve 2 pages, commit only the first page.
+            unsafe {
+                let region = VirtualAlloc(std::ptr::null(), 8192, MEM_RESERVE, PAGE_NOACCESS);
+                assert!(!region.is_null());
+                let committed = VirtualAlloc(region, 4096, MEM_COMMIT, PAGE_READWRITE);
+                assert!(!committed.is_null());
+                region as u64 + 4096 - 16 * 32
+            }
+        };
+        let heap_desc: [u32; 8] = [
+            0,
+            16,
+            1,
+            0,
+            placed_start as u32,
+            (placed_start >> 32) as u32,
+            16 * 32,
+            0,
+        ];
+        let mut heap = null;
+        let iid = crate::object::guid(
+            0x8efb471d,
+            0x616c,
+            0x4f49,
+            [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
+        );
+        assert_eq!(
+            crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap),
+            S_OK
+        );
+        let title_heap = crate::descriptor::heap(heap);
+        let heap_host = title_heap.host().expect("host view heap");
+        let _ = host.log_messages();
+
+        // Slots 0..5 stay completely unbound; slot 5 holds an explicit-null 1D
+        // SRV (mismatched against `Texture2D` in `WRITE_UNBOUND_CS`); slot 6
+        // holds a live raw buffer UAV (`dst`).
+        let tex1d_null_srv: [u32; 10] = [28, 2, 0x1688, 0, 0, 1, 0, 0, 0, 0];
+        crate::descriptor::create_srv(null, null, &tex1d_null_srv, title_heap.start + 5 * 32);
+
+        let dst = buffer(256);
+        let (dst_bytes, _) = crate::resource::buffer_bytes(dst).unwrap();
+        let raw_uav: [u32; 10] = [39, 1, 0, 0, 64, 0, 0, 0, 1, 0];
+        crate::descriptor::create_uav(null, dst, null, &raw_uav, title_heap.start + 6 * 32);
+        let dst_shadow = crate::shadow::find(dst_bytes as u64, 256).unwrap();
+
+        let (srv_out_buf, srv_out_ptr) = host.shared_buffer(256).unwrap();
+        // SAFETY: live shared buffer.
+        unsafe { srv_out_ptr.cast::<u32>().write_volatile(0xFFFF_FFFF) };
+
+        let (cs_root, cs_pso) = compile_cs(WRITE_UNBOUND_CS);
+        let (srv_root, srv_pso) = compile_cs(READ_SHARED_NULL_CS);
+        let (gfx_root, gfx_pso) = {
+            let (mut vs, mut ps): (Option<ID3DBlob>, Option<ID3DBlob>) = (None, None);
+            // SAFETY: static HLSL source and entry names.
+            unsafe {
+                D3DCompile(
+                    GFX_SHADER.as_ptr().cast(),
+                    GFX_SHADER.len(),
+                    s!("gfx"),
+                    None,
+                    None,
+                    s!("vs_main"),
+                    s!("vs_5_1"),
+                    0,
+                    0,
+                    &mut vs,
+                    None,
+                )
+                .unwrap();
+                D3DCompile(
+                    GFX_SHADER.as_ptr().cast(),
+                    GFX_SHADER.len(),
+                    s!("gfx"),
+                    None,
+                    None,
+                    s!("ps_main"),
+                    s!("ps_5_1"),
+                    0,
+                    0,
+                    &mut ps,
+                    None,
+                )
+                .unwrap();
+                let vs = vs.unwrap();
+                let ps = ps.unwrap();
+                let vs_b = std::slice::from_raw_parts(
+                    vs.GetBufferPointer().cast::<u8>(),
+                    vs.GetBufferSize(),
+                );
+                let ps_b = std::slice::from_raw_parts(
+                    ps.GetBufferPointer().cast::<u8>(),
+                    ps.GetBufferSize(),
+                );
+                let root: ID3D12RootSignature = host.device.CreateRootSignature(0, ps_b).unwrap();
+                let mut desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    VS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: vs_b.as_ptr().cast(),
+                        BytecodeLength: vs_b.len(),
+                    },
+                    PS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: ps_b.as_ptr().cast(),
+                        BytecodeLength: ps_b.len(),
+                    },
+                    BlendState: D3D12_BLEND_DESC::default(),
+                    SampleMask: u32::MAX,
+                    RasterizerState: D3D12_RASTERIZER_DESC {
+                        FillMode: D3D12_FILL_MODE_SOLID,
+                        CullMode: D3D12_CULL_MODE_NONE,
+                        ..Default::default()
+                    },
+                    PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+                    SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
+                        Count: 1,
+                        Quality: 0,
+                    },
+                    ..Default::default()
+                };
+                desc.DepthStencilState.DepthEnable = false.into();
+                let pso: ID3D12PipelineState =
+                    host.device.CreateGraphicsPipelineState(&desc).unwrap();
+                (root, pso)
+            }
+        };
+
+        let entry = |kind, offset_dwords, stride, dwords| UsedResource {
+            kind,
+            root: RootType::Table,
+            table_offset_dwords: offset_dwords,
+            lower_bound: 0,
+            stride,
+            dwords,
+            user_data: 0,
+            slot: 0,
+        };
+
+        let list = host.new_list().unwrap();
+
+        // 1. A table reading only the shared unbound 2D SRV at slot 0 stays in-place.
+        let mut srv_state = State::default();
+        srv_state.set_heaps(&[heap]);
+        srv_state.set_table(true, 0, title_heap.start);
+        let srv_made = srv_state.tables(
+            &list,
+            &[entry(ResourceType::Srv, 0, 0, 8)],
+            &[TableView {
+                slot: 0,
+                dword: 0,
+                props: (2, 0x409),
+            }],
+            true,
+        );
+        assert!(
+            srv_made.is_empty(),
+            "2D float SRV on empty slot needs no copy"
+        );
+
+        // 2. A table whose entries are all live bound views (`slot 6`) also stays in-place.
+        let mut bound_state = State::default();
+        bound_state.set_heaps(&[heap]);
+        bound_state.set_table(true, 0, title_heap.start + 6 * 32);
+        let bound_made = bound_state.tables(
+            &list,
+            &[entry(ResourceType::Uav, 0, 0, 4)],
+            &[TableView {
+                slot: 0,
+                dword: 0,
+                props: (0x100b, 0),
+            }],
+            true,
+        );
+        assert!(
+            bound_made.is_empty(),
+            "fully bound UAV table stays in-place"
+        );
+
+        // 3. The mixed table with 5 unbound UAVs + 1D-vs-2D mismatch is rebuilt in
+        // dynamic slots with typed null descriptors, leaving title slot 0 untouched.
+        let mut uav_state = State::default();
+        uav_state.set_heaps(&[heap]);
+        uav_state.set_table(true, 0, title_heap.start);
+        let uav_used = [
+            entry(ResourceType::Uav, 0, 0, 4),
+            entry(ResourceType::Uav, 8, 16, 4),
+            entry(ResourceType::Uav, 16, 0, 8),
+            entry(ResourceType::Uav, 24, 0, 8),
+            entry(ResourceType::Uav, 32, 0, 8),
+            entry(ResourceType::Srv, 40, 0, 8),
+            entry(ResourceType::Uav, 48, 0, 4),
+        ];
+        let uav_views = [
+            TableView {
+                slot: 0,
+                dword: 0,
+                props: (11 | 0x1000, 0),
+            },
+            TableView {
+                slot: 0,
+                dword: 8,
+                props: (12 | 0x1000, 16),
+            },
+            TableView {
+                slot: 0,
+                dword: 16,
+                props: (1 | 0x1000, 0x409),
+            },
+            TableView {
+                slot: 0,
+                dword: 24,
+                props: (2 | 0x1000, 0x105),
+            },
+            TableView {
+                slot: 0,
+                dword: 32,
+                props: (4 | 0x1000, 0x409),
+            },
+            TableView {
+                slot: 0,
+                dword: 40,
+                props: (2, 0x409),
+            },
+            TableView {
+                slot: 0,
+                dword: 48,
+                props: (11 | 0x1000, 0),
+            },
+        ];
+        let made = uav_state.tables(&list, &uav_used, &uav_views, true);
+        assert_eq!(made.len(), 1);
+        let fresh_first = made[0].1 / 32;
+        assert!(fresh_first >= heap_host.count());
+        assert!(!heap_host.has_view(0), "shared title slot 0 stays null");
+
+        // Reuse within the same list hits `fresh_tables`.
+        let made_again = uav_state.tables(&list, &uav_used, &uav_views, true);
+        assert_eq!(made_again, made);
+
+        // 4. A table bound at the last slot (`slot 15`, where `k = 1..=6` sit
+        // inside the unmapped guard page past the heap end) does not read past
+        // `heap.desc.count`, populates every out-of-bounds entry with its typed
+        // null descriptor, and hits `fresh_tables` cleanly on reuse.
+        let mut tail_state = State::default();
+        tail_state.set_heaps(&[heap]);
+        tail_state.set_table(true, 0, title_heap.start + 15 * 32);
+        let tail_made = tail_state.tables(&list, &uav_used, &uav_views, true);
+        assert_eq!(tail_made.len(), 1);
+        let tail_first = tail_made[0].1 / 32;
+        assert!(tail_first >= heap_host.count());
+        assert_eq!(
+            tail_state.tables(&list, &uav_used, &uav_views, true),
+            tail_made
+        );
+
+        // Graphics stage (`compute = false`) with an unbound 2D float UAV at
+        // slot 0 + live buffer UAV at slot 6 also builds a fresh typed-null table.
+        let mut gfx_state = State::default();
+        gfx_state.set_heaps(&[heap]);
+        gfx_state.set_table(false, 0, title_heap.start);
+        let gfx_made = gfx_state.tables(
+            &list,
+            &[
+                entry(ResourceType::Uav, 0, 0, 8),
+                entry(ResourceType::Uav, 48, 0, 4),
+            ],
+            &[
+                TableView {
+                    slot: 0,
+                    dword: 0,
+                    props: (2 | 0x1000, 0x409),
+                },
+                TableView {
+                    slot: 0,
+                    dword: 48,
+                    props: (11 | 0x1000, 0),
+                },
+            ],
+            false,
+        );
+        let gfx_first = gfx_made[0].1 / 32;
+        assert!(gfx_first >= heap_host.count());
+
+        // Execute shared-slot SRV read, Compute unbound-UAV dispatch, and
+        // Graphics PS unbound-UAV draw in the same command list.
+        // SAFETY: open command list and live objects.
+        unsafe {
+            list.list
+                .SetDescriptorHeaps(&[Some(heap_host.heap.clone())]);
+
+            list.list.SetComputeRootSignature(&srv_root);
+            list.list.SetComputeRootDescriptorTable(0, heap_host.gpu(0));
+            list.list
+                .SetComputeRootUnorderedAccessView(1, srv_out_buf.GetGPUVirtualAddress());
+            list.list.SetPipelineState(&srv_pso);
+            list.list.Dispatch(1, 1, 1);
+
+            list.list.SetComputeRootSignature(&cs_root);
+            list.list
+                .SetComputeRootDescriptorTable(0, heap_host.gpu(fresh_first));
+            list.list.SetPipelineState(&cs_pso);
+            list.list.Dispatch(1, 1, 1);
+
+            list.list
+                .SetComputeRootDescriptorTable(0, heap_host.gpu(tail_first));
+            list.list.Dispatch(1, 1, 1);
+
+            let vp = D3D12_VIEWPORT {
+                TopLeftX: 0.0,
+                TopLeftY: 0.0,
+                Width: 4.0,
+                Height: 4.0,
+                MinDepth: 0.0,
+                MaxDepth: 1.0,
+            };
+            let sc = RECT {
+                left: 0,
+                top: 0,
+                right: 4,
+                bottom: 4,
+            };
+            list.list.RSSetViewports(&[vp]);
+            list.list.RSSetScissorRects(&[sc]);
+            list.list.OMSetRenderTargets(0, None, false, None);
+            list.list.SetGraphicsRootSignature(&gfx_root);
+            list.list
+                .SetGraphicsRootDescriptorTable(0, heap_host.gpu(gfx_first));
+            list.list.SetPipelineState(&gfx_pso);
+            list.list.IASetPrimitiveTopology(
+                windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
+            );
+            list.list.DrawInstanced(3, 1, 0, 0);
+        }
+        list.close();
+        host.execute(&[&list]);
+
+        assert_eq!(
+            host.log_messages(),
+            None,
+            "D3D12 debug layer error on unbound UAV / shared null SRV"
+        );
+        // SAFETY: plain device health query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+
+        // SAFETY: shared buffer idle after `host.execute`.
+        let srv_got = unsafe { srv_out_ptr.cast::<u32>().read_volatile() };
+        assert_eq!(srv_got, 0, "shared empty slot 0 still reads 0.0 as 2D SRV");
+
+        let want: Vec<u32> = (0..16)
+            .map(|i| 0x5080_0000 + i)
+            .chain([0xCAFE_5080])
+            .collect();
+        assert_eq!(dst_shadow.read_host(dst_bytes as u64, 17), want);
     }
 }
