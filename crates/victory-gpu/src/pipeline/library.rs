@@ -467,6 +467,93 @@ mod tests {
         assert!(library_file(true).ends_with(".bin"));
     }
 
+    /// Cache state is process-global, so use fresh WARP processes to save
+    /// and reload the library while the hardware path holds unrelated bytes.
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn warp_cache_save_and_reload_preserve_the_hardware_file() {
+        const STEP: &str = "VICTORY_TEST_WARP_CACHE_STEP";
+        const CACHE: &str = "VICTORY_TEST_WARP_CACHE_DIR";
+        const NAME: &str =
+            "pipeline::library::tests::warp_cache_save_and_reload_preserve_the_hardware_file";
+        const KEY: &str = "synthetic-warp-cache-key";
+        const NO_LIBRARY: &str = "WARP pipeline libraries unavailable";
+        const HARDWARE_BYTES: &[u8] = b"synthetic bytes from a different adapter";
+
+        if let Ok(step) = std::env::var(STEP) {
+            use_pipeline_cache(PathBuf::from(std::env::var_os(CACHE).unwrap()));
+            if step == "save" {
+                if library().is_none() {
+                    println!("{NO_LIBRARY}");
+                    return;
+                }
+                note_prebuilt(KEY.to_owned());
+                save(true);
+            } else {
+                assert_eq!(step, "reload");
+                assert!(prebuilt(KEY), "WARP cache did not reload its saved library");
+            }
+            return;
+        }
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir()
+            .join(format!("victory-warp-cache-{}-{unique}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let hardware = dir.join("host-pipelines.bin");
+        let software = dir.join("host-pipelines-warp.bin");
+        std::fs::write(&hardware, HARDWARE_BYTES).unwrap();
+
+        let run = |step| {
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", NAME, "--nocapture"])
+                .env(STEP, step)
+                .env(CACHE, &dir)
+                .env("VICTORY_D3D12_WARP", "1")
+                .env("VICTORY_D3D12_DEBUG", "0")
+                .env("VICTORY_D3D12_GBV", "0")
+                .output()
+                .unwrap()
+        };
+        let saved = run("save");
+        let message = String::from_utf8_lossy(&saved.stdout);
+        if saved.status.success() && message.contains(NO_LIBRARY) {
+            std::fs::remove_dir_all(&dir).unwrap();
+            eprintln!("{NO_LIBRARY}; skipped");
+            return;
+        }
+        let hardware_after = std::fs::read(&hardware).unwrap();
+        let software_after = std::fs::read(&software).unwrap_or_default();
+        println!(
+            "WARP save: hardware file {} -> {} bytes, WARP file {} bytes",
+            HARDWARE_BYTES.len(),
+            hardware_after.len(),
+            software_after.len(),
+        );
+
+        let reloaded = (!software_after.is_empty()).then(|| run("reload"));
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(
+            saved.status.success(),
+            "{message}\n{}",
+            String::from_utf8_lossy(&saved.stderr),
+        );
+        assert!(
+            hardware_after == HARDWARE_BYTES,
+            "WARP save replaced the hardware file",
+        );
+        let reloaded = reloaded.expect("WARP library file not written");
+        assert!(
+            reloaded.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&reloaded.stdout),
+            String::from_utf8_lossy(&reloaded.stderr),
+        );
+    }
+
     #[test]
     fn names_change_with_what_goes_into_the_pipeline() {
         let a = name("graphics", b"root", &[b"vs", b"ps"], "state");
