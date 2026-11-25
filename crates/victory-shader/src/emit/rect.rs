@@ -224,6 +224,62 @@ mod tests {
         s.finish()
     }
 
+    /// Validate the emitted phi and read the value selected through its
+    /// folded predecessor from the host render target.
+    #[test]
+    fn folded_constant_branch_draws_the_taken_phi_value() {
+        let mut s = Shader::new(true);
+        let entry = s.entry;
+        let taken = s.m.new_block();
+        let join = s.m.new_block();
+        let condition = s.m.bool(true);
+        let selected = s.m.f32(0.25f32.to_bits());
+        let discarded = s.m.f32(0.75f32.to_bits());
+        s.m.terminate(entry, Term::CondBr(condition, taken, join));
+        s.m.terminate(taken, Term::Br(join));
+        let red = s.m.phi(join, s.t.f32);
+        s.m.set_phi(red, vec![(selected, taken), (discarded, entry)]);
+        s.outputs.push(element("SV_Target", 16, 0, 0, 4));
+        let zero = s.m.f32(0);
+        let one = s.m.f32(1f32.to_bits());
+        for (col, value) in [red, zero, zero, one].into_iter().enumerate() {
+            let args = [s.m.i32(0), s.m.i32(0), s.m.i8(col as u8), value];
+            s.op(join, "storeOutput.f32", Attr::NoUnwind, s.t.void, 5, &args);
+        }
+        s.m.terminate(join, Term::Ret);
+        let ps = s.finish();
+
+        let path = super::super::validator::Validator::default_path();
+        match super::super::validator::Validator::load(path.as_deref()) {
+            Ok(mut validator) => validator
+                .validate(&mut ps.clone())
+                .expect("the folded phi has one incoming edge"),
+            Err(e) => eprintln!("no DXIL validator ({e}); validation skipped"),
+        }
+        let host = match Host::new(true) {
+            Ok(host) => host,
+            Err(e) => {
+                eprintln!("no WARP device ({e}); draw skipped");
+                return;
+            }
+        };
+        let root = host.root_signature_for(&[]).unwrap();
+        let pso = host.pipeline_with(&root, &shader(false), &ps).unwrap();
+        let vertex = |x, y| [x, y, 0.5, 1.0, 0.0, 0.0];
+        let vertices = [vertex(-1.0, -1.0), vertex(-1.0, 3.0), vertex(3.0, -1.0)].concat();
+        let draw = Draw {
+            roots: Vec::new(),
+            textures: &[],
+            samplers: &[],
+            vertices: &vertices,
+            stride: 24,
+            size: (2, 2),
+            mesh_groups: 0,
+        };
+        let texels = host.draw(&root, &pso, &draw).unwrap();
+        assert_eq!(texels, [[0.25, 0.0, 0.0, 1.0]; 4]);
+    }
+
     /// One rectangle with a coordinate attribute, its right angle at each of
     /// the three corners in turn (the blits' top left, bottom left, bottom
     /// right; the tiled lighting's top left, bottom left, top right; and
