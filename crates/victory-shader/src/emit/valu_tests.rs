@@ -663,6 +663,29 @@ fn v_cvt_off_f32_i4_uses_the_signed_low_nibble() {
 }
 
 #[test]
+fn v_sat_pk_u8_i16_clamps_each_half_and_keeps_the_high_word() {
+    let copy = vop1(0x001, 0, vgpr(2));
+    let [op, src] = vop3(0x1e2, 0, vgpr(1), 0, 0);
+    let programs = [
+        vec![copy, vop1(0x062, 0, vgpr(1))],
+        vec![copy, op, src],
+    ];
+    let cases = [
+        [0x0100_7fff, 0xdead_beef, 0, 0xdead_ffff],
+        [0xffff_8000, 0x1234_5678, 0, 0x1234_0000],
+        [0x0080_007f, 0xface_12cf, 0, 0xface_807f],
+        [0x0012_fe80, 0x19ac_ffff, 0, 0x19ac_1200],
+        [0xfffe_00ff, 0x8118_8888, 0, 0x8118_00ff],
+    ];
+    for words in programs {
+        let shader = build_valu_cs(&words);
+        run_cases(&shader, &cases, |backend, _, input, actual| {
+            assert_eq!(actual, input[3], "{backend}: {input:08x?}");
+        });
+    }
+}
+
+#[test]
 fn v_fract_f32_never_returns_one() {
     // v_fract_f32 v0, v1 (VOP1 opcode 0x020)
     let shader = build_valu_cs(&[vop1(0x020, 0, vgpr(1))]);
