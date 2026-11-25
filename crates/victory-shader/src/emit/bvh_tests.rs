@@ -761,7 +761,7 @@ fn run_cases(wide: bool, batches: usize, memory: bool) {
             }
             let roots = vec![
                 (0, Root::Constants(ud.clone())),
-                (1, Root::View { srv: true, data: page_table(1, 3) }),
+                (1, Root::View { srv: true, data: page_table(&[(TITLE, 1)], 3) }),
                 (2, Root::Uav(2 * 4096 / 32)),
             ];
             let views = [
@@ -813,19 +813,26 @@ fn intersections_with_64_bit_pointers_on_the_gpu_equal_the_reference() {
 /// The title address of the rays and nodes in the title-memory runs.
 const TITLE: u64 = 0x12_3450_0000;
 
-/// The page table (`emit` "Title memory") for one copy of title memory at
-/// [`TITLE`] (under 64 KiB) with its views at heap index `view`, the null
-/// pair at `null`.
-fn page_table(view: u32, null: u32) -> Vec<u32> {
-    let (hi, lo) = ((TITLE >> 32) as u32, TITLE as u32);
-    let mut t = vec![0u32; 4096];
-    t[(hi << 4 | lo >> 28) as usize] = 1;
-    for _ in 0..2 * 4096 {
-        t.extend([null, 0]);
+/// A title-memory page table for 64 KiB pages, each with its own view
+/// pair. Unmapped entries name the null pair.
+fn page_table(pages: &[(u64, u32)], null: u32) -> Vec<u32> {
+    let mut table = vec![0u32; 4096];
+    for _ in 0..4096 {
+        table.extend([null, 0]);
     }
-    let entry = 4096 + 2 * (4096 + (lo >> 16 & 0xFFF) as usize);
-    t[entry..entry + 2].copy_from_slice(&[view, lo]);
-    t
+    for &(address, view) in pages {
+        let region = (address >> 28) as usize;
+        if table[region] == 0 {
+            table[region] = ((table.len() - 4096) / (2 * 4096)) as u32;
+            for _ in 0..4096 {
+                table.extend([null, 0]);
+            }
+        }
+        let page = (address >> 16 & 0xFFF) as usize;
+        let entry = 4096 + 2 * (4096 * table[region] as usize + page);
+        table[entry..entry + 2].copy_from_slice(&[view, address as u32]);
+    }
+    table
 }
 
 /// The BVH at a pointer the program has in root constants: nodes (and
@@ -834,4 +841,113 @@ fn page_table(view: u32, null: u32) -> Vec<u32> {
 fn intersections_on_nodes_in_title_memory_equal_the_reference() {
     run_cases(false, 4, true);
     run_cases(true, 4, true);
+}
+
+/// A BVH built from a root SRV uses the descriptor's aligned base and
+/// both words of the node pointer, even beyond the first 4 GiB.
+#[test]
+fn root_built_bvh_uses_aligned_base_and_wide_node_offsets() {
+    const RAY_PAD: u64 = 128;
+    const NODE_OFFSET: u64 = 0x5000;
+    const FOUR_GIB: u64 = 4 << 30;
+    const THIRTY_TWO_GIB: u64 = 32 << 30;
+    const PAGE_WORDS: usize = (64 << 10) / 4;
+    let shader = build(true, false);
+    assert!(shader.memory);
+    let ray = along_x();
+    let node = |child| {
+        let mut leaves = [EMPTY; 4];
+        leaves[child] = unit(1.0);
+        box32(leaves)
+    };
+    let nodes = [node(0), node(1), node(2), node(3)];
+    let mut pages = [[0u32; PAGE_WORDS]; 3];
+    let node_at = (NODE_OFFSET / 4) as usize;
+    for (page, node) in pages.iter_mut().zip(&nodes) {
+        page[node_at..node_at + node.len()].copy_from_slice(node);
+    }
+    // A valid but different node at the old unaligned address.
+    let decoy_at = node_at + (RAY_PAD / 4) as usize;
+    pages[0][decoy_at..decoy_at + nodes[3].len()].copy_from_slice(&nodes[3]);
+    let mapped = [
+        (TITLE, 1),
+        (TITLE + FOUR_GIB, 3),
+        (TITLE + THIRTY_TWO_GIB, 5),
+    ];
+    let cases = [
+        (TITLE, NODE_OFFSET, 0),
+        (TITLE + RAY_PAD, NODE_OFFSET, 0),
+        (TITLE, FOUR_GIB + NODE_OFFSET, 1),
+        (TITLE, THIRTY_TWO_GIB + NODE_OFFSET, 2),
+    ];
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host.compute_pipeline(&shader).expect("BVH pipeline");
+        let mut results = Vec::new();
+        for (title, offset, child) in cases {
+            let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            for u in &shader.user_data {
+                ud[u.index as usize] = match (u.root, u.slot) {
+                    (RootType::Table, 1) => 0,
+                    (RootType::Descriptor, 0) => (title >> (32 * u.dword)) as u32,
+                    _ => panic!("{u:?}"),
+                };
+            }
+            let start = ((title - TITLE) / 4) as usize;
+            let ptr = offset >> 3 | 5;
+            for lane in pages[0][start..start + LANES * 16].as_chunks_mut::<16>().0 {
+                lane[0] = ptr as u32;
+                lane[1] = ray.extent.to_bits();
+                for k in 0..3 {
+                    lane[2 + k] = ray.origin[k].to_bits();
+                    lane[5 + k] = ray.dir[k].to_bits();
+                    lane[8 + k] = ray.inv[k].to_bits();
+                }
+                lane[11] = (ptr >> 32) as u32;
+            }
+            let views = [
+                View::RawUav((LANES * 4) as u32),
+                View::Memory(&pages[0]),
+                View::Pair,
+                View::Memory(&pages[1]),
+                View::Pair,
+                View::Memory(&pages[2]),
+                View::Pair,
+                View::NullPair,
+                View::Pair,
+            ];
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![
+                            (0, Root::Constants(ud)),
+                            (1, Root::View { srv: true, data: page_table(&mapped, 7) }),
+                            (2, Root::Uav(2 * 4096 / 32)),
+                        ],
+                        views: &views,
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label}: BVH dispatch failed: {e}"));
+            eprintln!("{label}: root {title:#x}, node offset {offset:#x}, child {}", out[0][0]);
+            results.push((title, offset, intersect(&nodes[child], 5, &ray), out));
+        }
+        for (title, offset, want, out) in results {
+            for got in out[0].as_chunks::<4>().0 {
+                assert_eq!(*got, want, "{label}: root {title:#x}, node offset {offset:#x}");
+            }
+        }
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
 }
