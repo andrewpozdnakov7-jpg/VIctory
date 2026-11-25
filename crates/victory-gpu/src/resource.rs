@@ -774,9 +774,8 @@ pub(crate) struct HostTexture {
     /// Formats views may take besides the texture's own family: the host
     /// took them as castable formats when it made the texture.
     pub(crate) castable: Vec<u32>,
-    /// A host copy or resolve wrote it: its contents are the host's, not
-    /// title memory's (`crate::texture`).
-    pub(crate) host_written: std::sync::atomic::AtomicBool,
+    /// The title memory's state when a host copy or resolve wrote the texture.
+    pub(crate) host_written: std::sync::Mutex<Option<crate::texture::HostWriteSnapshot>>,
     /// Its uploads from title memory (`crate::texture`), made on first use.
     pub(crate) staging: std::sync::Mutex<Option<std::sync::Arc<crate::texture::Staging>>>,
     /// A depth texture's writable twin (`crate::twin`), made with its first
@@ -806,7 +805,7 @@ impl HostTexture {
             texture,
             state: state.into(),
             castable,
-            host_written: false.into(),
+            host_written: std::sync::Mutex::new(None),
             staging: std::sync::Mutex::new(None),
             twin: std::sync::OnceLock::new(),
             bytes,

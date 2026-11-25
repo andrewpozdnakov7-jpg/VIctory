@@ -49,7 +49,8 @@ pub(crate) struct Staging {
     /// The memory's pages changed since detiled (none: not the runtime's
     /// memory, hashed instead).
     tracked: Option<crate::watch::Tracked>,
-    /// Set when a title write invalidates `host_written` via `tracked.take`.
+    /// A snapshot consumed a watched update, or a host copy replaced
+    /// the last upload.
     pending_refresh: std::sync::atomic::AtomicBool,
     last: Mutex<Last>,
 }
@@ -68,64 +69,89 @@ unsafe impl Send for Staging {}
 // SAFETY: as above.
 unsafe impl Sync for Staging {}
 
-/// A host copy or resolve writes `resource`: its host texture's contents
-/// are the host's until the title writes its watched memory.
+pub(crate) enum HostWriteSnapshot {
+    Watched,
+    Hashed {
+        memory: usize,
+        size: usize,
+        hash: Option<blake3::Hash>,
+    },
+}
+
+fn title_hash(memory: *const u8, size: usize) -> Option<blake3::Hash> {
+    (size != 0 && size <= isize::MAX as usize && committed(memory, size)).then(|| {
+        // SAFETY: committed readable memory that backs the texture.
+        let tiled = unsafe { std::slice::from_raw_parts(memory, size) };
+        blake3::hash(tiled)
+    })
+}
+
+/// A host copy or resolve writes `resource`: the GPU contents win until
+/// the title updates the underlying texture memory.
 pub(crate) fn host_written(resource: This) {
+    use std::sync::atomic::Ordering::Relaxed;
+
     let Some(copy) = crate::resource::host_copy(resource) else {
         return;
     };
-    if let Some(staging) = copy.staging.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
-        let size = staging.layout.size as usize;
-        if let Some(tracked) = &staging.tracked {
-            // Ignore title writes that happened before this host copy, but
-            // preserve any already-dirty range for an earlier list's deferred refresh.
-            let start = staging.memory as usize;
-            if !tracked.take(start, start + size).is_empty() {
-                staging
-                    .pending_refresh
-                    .store(true, std::sync::atomic::Ordering::Relaxed);
-            }
-        } else if committed(staging.memory, size) {
-            // SAFETY: committed memory of the texture's layout size.
-            let tiled = unsafe { std::slice::from_raw_parts(staging.memory, size) };
-            let mut last = staging.last.lock().unwrap_or_else(|e| e.into_inner());
-            last.hash = Some(blake3::hash(tiled));
-        }
+    if !title_written(&copy.texture) {
+        return;
     }
-    copy.host_written.store(true, std::sync::atomic::Ordering::Relaxed);
+
+    let mut written = copy.host_written.lock().unwrap_or_else(|e| e.into_inner());
+    let staging = copy.staging.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(staging) = staging.as_deref()
+        && staging.tracked.is_some()
+    {
+        // Keep any earlier deferred refresh due when consuming old writes.
+        if staging.take_watched_writes() {
+            staging.pending_refresh.store(true, Relaxed);
+        }
+        *written = Some(HostWriteSnapshot::Watched);
+        return;
+    }
+
+    // Record the copy-time hash independently of the staging buffer, even
+    // if this texture has never needed an upload.
+    let title_range = if let Some(staging) = staging.as_deref() {
+        Some((staging.memory, staging.layout.size as usize))
+    } else {
+        crate::resource::texture_memory(resource).and_then(|(memory, desc)| {
+            let texture = crate::resource::texture_layout(&desc)?;
+            let layout = &texture.planes[0].layout;
+            (!layout.desc.swizzle.xor()).then_some((memory, layout.size as usize))
+        })
+    };
+    *written = title_range.map(|(memory, size)| HostWriteSnapshot::Hashed {
+        memory: memory as usize,
+        size,
+        hash: title_hash(memory, size),
+    });
 }
 
 fn copy_host_written(copy: &crate::resource::HostTexture) -> bool {
-    if !copy.host_written.load(std::sync::atomic::Ordering::Relaxed) {
+    let mut written = copy.host_written.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(snapshot) = written.as_ref() else {
         return false;
-    }
-    if let Some(staging) = copy.staging.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
-        let size = staging.layout.size as usize;
-        let invalidated = if let Some(tracked) = &staging.tracked {
-            let start = staging.memory as usize;
-            if !tracked.take(start, start + size).is_empty() {
-                staging
-                    .pending_refresh
-                    .store(true, std::sync::atomic::Ordering::Relaxed);
-                true
-            } else {
-                false
-            }
-        } else if committed(staging.memory, size) {
-            // SAFETY: committed memory of the texture's layout size.
-            let tiled = unsafe { std::slice::from_raw_parts(staging.memory, size) };
-            let hash = blake3::hash(tiled);
-            let last = staging.last.lock().unwrap_or_else(|e| e.into_inner());
-            last.hash != Some(hash)
-        } else {
-            false
-        };
-        if invalidated {
-            copy.host_written.store(false, std::sync::atomic::Ordering::Relaxed);
-            return false;
+    };
+    let staging = copy.staging.lock().unwrap_or_else(|e| e.into_inner());
+    let changed = match *snapshot {
+        HostWriteSnapshot::Watched => staging.as_deref().is_some_and(Staging::take_watched_writes),
+        HostWriteSnapshot::Hashed { memory, size, hash } => {
+            title_hash(memory as *const u8, size).is_some_and(|current| Some(current) != hash)
         }
+    };
+    if changed {
+        if let Some(staging) = staging.as_deref() {
+            // The host copy replaced the last upload. Restore title contents
+            // even if its current bytes match what staging already held.
+            staging
+                .pending_refresh
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        *written = None;
     }
-    true
+    !changed
 }
 
 fn is_host_written(resource: This) -> bool {
@@ -245,8 +271,7 @@ pub(crate) fn alias_copy(list: &HostList, from: This, to: This) {
 /// submission if the memory changed. Leaves the texture in the copy
 /// destination state.
 pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) {
-    // shortcut: a texture the host copied into keeps the host's contents
-    // even if the title later writes its memory too.
+    // Keep the GPU contents of a copied texture until its title memory changes.
     // Once per list for each host texture, however many title textures of
     // its memory the list samples.
     if !list.first_use(texture.as_raw() as usize) || is_host_written(resource) {
@@ -337,6 +362,13 @@ fn record(list: &HostList, resource: This, texture: &ID3D12Resource, staging: &S
 }
 
 impl Staging {
+    fn take_watched_writes(&self) -> bool {
+        let start = self.memory as usize;
+        self.tracked
+            .as_ref()
+            .is_some_and(|tracked| !tracked.take(start, start + self.layout.size as usize).is_empty())
+    }
+
     /// Detiles the texture memory into the staging buffer if it changed
     /// since the last time (and is mapped at all): whether it did.
     pub(crate) fn refresh(&self) -> bool {
@@ -386,7 +418,10 @@ impl Staging {
         let hash = blake3::hash(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
-        if last.hash == Some(hash) {
+        let pending = self
+            .pending_refresh
+            .swap(false, std::sync::atomic::Ordering::Relaxed);
+        if last.hash == Some(hash) && !pending {
             return (size, false);
         }
         last.hash = Some(hash);
@@ -626,11 +661,11 @@ mod tests {
             .as_ref()
             .unwrap()
             .take(base, base + staging.layout.size as usize);
-        copy.host_written.store(true, std::sync::atomic::Ordering::Relaxed);
+        *copy.host_written.lock().unwrap() = Some(HostWriteSnapshot::Watched);
         assert!(copy_host_written(&copy));
         // SAFETY: `base` is a committed RW watch-tracked page.
         unsafe { (base as *mut u8).write_volatile(0x42) };
         assert!(!copy_host_written(&copy));
-        assert!(!copy.host_written.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(copy.host_written.lock().unwrap().is_none());
     }
 }

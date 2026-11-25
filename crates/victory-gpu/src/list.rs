@@ -1550,6 +1550,180 @@ mod tests {
     };
     use tracing::{Event, Metadata, Subscriber, span};
 
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
+    fn copied_textures_keep_a_separate_title_memory_snapshot() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let null = std::ptr::null();
+        let release = |object: This| {
+            assert_eq!(
+                slot::<extern "system" fn(This) -> u32>(object, 0x10)(object),
+                0
+            )
+        };
+        let mut allocator = null;
+        assert_eq!(
+            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
+        let list = || {
+            let mut out = null;
+            assert_eq!(
+                create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut out),
+                S_OK
+            );
+            out
+        };
+
+        #[repr(align(8))]
+        struct TextureWords([u32; 14]);
+        let desc = TextureWords([3, 0, 0, 0, 4, 0, 4, 1 | 1 << 16, 28, 1, 0, 1, 0, 0]);
+        let heap = [1u32, 0, 0, 0, 0];
+        let iid = crate::object::guid(
+            0x696442be,
+            0xa72e,
+            0x4059,
+            [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+        );
+        let fill = |resource, color| {
+            let (memory, desc) = crate::resource::texture_memory(resource).unwrap();
+            let size = crate::resource::texture_layout(&desc).unwrap().size as usize;
+            // SAFETY: these bytes belong to this committed title texture.
+            unsafe {
+                std::slice::from_raw_parts_mut(memory.cast_mut().cast::<u32>(), size / 4)
+                    .fill(color);
+            }
+        };
+        let texture = |color| {
+            let mut out = null;
+            assert_eq!(
+                crate::resource::create_committed(
+                    null,
+                    heap.as_ptr().cast(),
+                    0,
+                    desc.0.as_ptr().cast(),
+                    0,
+                    null.cast(),
+                    &iid,
+                    &mut out,
+                ),
+                S_OK
+            );
+            fill(out, color);
+            out
+        };
+        let capture = |reading, snapshot| {
+            let list = host_list(reading).unwrap();
+            ensure_state(list, snapshot, COPY_SOURCE);
+            let texture = crate::resource::host_resource(snapshot).unwrap();
+            let (readback, footprint) =
+                crate::capture::read_back(&host.device, &list.list, texture).unwrap();
+            assert_eq!(close(reading), S_OK);
+            (reading, readback, footprint)
+        };
+        let record_read = |target, snapshot| {
+            let reading = list();
+            copy_resource(reading, snapshot, target);
+            capture(reading, snapshot)
+        };
+        let read = |(reading, readback, footprint): (
+            This,
+            windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+            windows::Win32::Graphics::Direct3D12::D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+        )| {
+            host.execute(&[host_list(reading).unwrap()]);
+            release(reading);
+            let mut data = std::ptr::null_mut();
+            let mut pixels = [0u32; 16];
+            // SAFETY: the GPU completed the copy into four rows of four u32 texels.
+            unsafe {
+                readback.Map(0, None, Some(&mut data)).unwrap();
+                let start = data.cast::<u8>().add(footprint.Offset as usize);
+                let pitch = footprint.Footprint.RowPitch as usize;
+                for (y, row) in pixels.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+                    let src = start.add(y * pitch).cast::<u32>();
+                    row.copy_from_slice(std::slice::from_raw_parts(src, 4));
+                }
+                readback.Unmap(0, None);
+            }
+            pixels
+        };
+        let record_write = |target, source| {
+            let writing = list();
+            copy_resource(writing, target, source);
+            assert_eq!(close(writing), S_OK);
+            writing
+        };
+
+        const TITLE: u32 = 0xff3366cc;
+        const UPDATED: u32 = 0xff4455aa;
+        const GPU: u32 = 0xffcc6633;
+        let mut results = Vec::new();
+        let mut uploaded_again = None;
+        for warmed_up in [false, true] {
+            let (target, source, snapshot) = (texture(TITLE), texture(GPU), texture(0));
+            let copy = crate::resource::host_copy(target).unwrap();
+            let (memory, desc) = crate::resource::texture_memory(target).unwrap();
+            let size = crate::resource::texture_layout(&desc).unwrap().size as usize;
+            assert!(crate::watch::track(memory as usize, size, true).is_none());
+            let earlier_read = if warmed_up {
+                assert_eq!(read(record_read(target, snapshot)), [TITLE; 16]);
+                assert!(copy.staging.lock().unwrap().is_some());
+                fill(target, UPDATED);
+                Some(record_read(target, snapshot))
+            } else {
+                assert!(copy.staging.lock().unwrap().is_none());
+                None
+            };
+            let writing = record_write(target, source);
+            let earlier = earlier_read.map(read);
+            host.execute(&[host_list(writing).unwrap()]);
+            release(writing);
+            let unchanged = read(record_read(target, snapshot));
+            fill(target, if warmed_up { TITLE } else { UPDATED });
+            let changed = read(record_read(target, snapshot));
+            results.push((earlier, unchanged, changed));
+            if warmed_up {
+                // The CPU returns to the bytes staging already holds, but the GPU
+                // texture was overwritten by a copy in between.
+                fill(target, UPDATED);
+                let writing = record_write(target, source);
+                host.execute(&[host_list(writing).unwrap()]);
+                release(writing);
+                fill(target, TITLE);
+                let upload = list();
+                let uploaded = crate::texture::upload_changed(
+                    host_list(upload).unwrap(),
+                    target,
+                    &copy.texture,
+                );
+                uploaded_again = Some((uploaded, read(capture(upload, target))));
+            }
+            drop(copy);
+            for object in [target, source, snapshot] {
+                release(object);
+            }
+        }
+        release(allocator);
+        // SAFETY: a plain query on the live device.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+        assert_eq!(
+            results,
+            [
+                (None, [GPU; 16], [UPDATED; 16]),
+                (Some([UPDATED; 16]), [GPU; 16], [TITLE; 16]),
+            ],
+            "readback before the first upload and after a queued staging refresh"
+        );
+        assert_eq!(
+            uploaded_again,
+            Some((true, [TITLE; 16])),
+            "a host copy invalidates the last upload even if CPU bytes match it"
+        );
+    }
+
     struct PipelineBinds(Arc<AtomicUsize>);
 
     impl Subscriber for PipelineBinds {
