@@ -221,6 +221,7 @@ fn pump(held: &mut Holding, why: Why) {
         fence: &fence,
         run: &mut run,
         flush_after: &|s| s.has_read_backs(),
+        flush_before: &|piece, next| next.copies_need_prior_results(piece),
         signal: &mut signal,
     });
     if pumped.segments > 0 || pumped.unknown > 0 {

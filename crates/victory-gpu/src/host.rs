@@ -976,6 +976,8 @@ enum Step {
 struct Deferred {
     /// Destination, source, bytes.
     copies: Vec<Step>,
+    /// Source ranges read by deferred CPU copies.
+    copy_reads: Vec<(usize, usize)>,
     uploads: Vec<ID3D12Resource>,
     /// Host objects the list's commands name (pipelines, root signatures,
     /// descriptor heaps): the title may release its objects before it
@@ -2029,7 +2031,30 @@ impl HostList {
         deferred
             .copies
             .push(Step::Copy(dst as usize, src as usize, len));
+        if len != 0 {
+            let from = src as usize;
+            deferred.copy_reads.push((from, from.saturating_add(len)));
+        }
         deferred.refreshed.clear();
+    }
+
+    /// Whether a recorded GPU write can change a title-memory source range.
+    pub(crate) fn gpu_writes_overlap(&self, ranges: &[(usize, usize)]) -> bool {
+        !ranges.is_empty() && self.deferred().copies.iter().any(|step| {
+            let Step::GpuWrite(_, start, len, _, _) = step else {
+                return false;
+            };
+            let end = start.saturating_add(*len);
+            *len != 0 && ranges.iter().any(|&(from, to)| *start < to && from < end)
+        })
+    }
+
+    /// A producer in the current piece must finish before our CPU copies
+    /// read its writes from title memory.
+    pub(crate) fn copies_need_prior_results(&self, previous: &[std::sync::Arc<HostList>]) -> bool {
+        // A list can be submitted twice. Drop its lock before inspecting the piece.
+        let sources = self.deferred().copy_reads.clone();
+        !sources.is_empty() && previous.iter().any(|list| list.gpu_writes_overlap(&sources))
     }
 
     /// Copies `len` bytes of title memory at `src` into the list's upload

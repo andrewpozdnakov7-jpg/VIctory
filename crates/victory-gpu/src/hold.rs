@@ -118,6 +118,8 @@ pub(crate) struct World<'a, S> {
     /// Whether a segment writes title memory after its submission finishes
     /// (`read_back`), so following segments must run in a later piece.
     pub(crate) flush_after: &'a dyn Fn(&S) -> bool,
+    /// Whether preparing the next segment needs results from this piece.
+    pub(crate) flush_before: &'a dyn Fn(&[S], &S) -> bool,
     /// Signals a fence.
     pub(crate) signal: &'a mut dyn FnMut(usize, u64),
 }
@@ -182,6 +184,10 @@ impl<S> Held<S> {
                     moved = true;
                     match items.pop_front().map(|(item, ..)| item) {
                         Some(Item::Segment(s, _)) => {
+                            if !piece.is_empty() && (w.flush_before)(&piece, &s) {
+                                (w.run)(*queue, std::mem::take(&mut piece));
+                                done.pieces += 1;
+                            }
                             let flush = (w.flush_after)(&s);
                             piece.push(s);
                             done.segments += 1;
@@ -288,7 +294,14 @@ mod tests {
             f.fences.insert(fence, value);
             f.log.push(format!("signal {fence} {value}"));
         };
-        held.pump(&mut World { read: &read, fence: &fence, run: &mut run, flush_after: &|_| false, signal: &mut signal })
+        held.pump(&mut World {
+            read: &read,
+            fence: &fence,
+            run: &mut run,
+            flush_after: &|_| false,
+            flush_before: &|_, _| false,
+            signal: &mut signal,
+        })
     }
 
     #[test]
@@ -319,6 +332,7 @@ mod tests {
             fence: &fence,
             run: &mut run,
             flush_after: &|s| *s == "readback",
+            flush_before: &|_, _| false,
             signal: &mut signal,
         });
         assert_eq!(fake.borrow().log, ["q2: readback", "q2: consumer"]);

@@ -255,7 +255,10 @@ fn host_list_after_buffers<'a>(
     len: usize,
 ) -> Option<&'a crate::host::HostList> {
     let current = host_list(this)?;
-    if current.reads_after_read_back(src, len) || current.reads_after_read_back(dst, len) {
+    if current.reads_after_read_back(src, len)
+        || current.reads_after_read_back(dst, len)
+        || (len != 0 && current.gpu_writes_overlap(&[(src, src.saturating_add(len))]))
+    {
         cut_segment(this, current)
     } else {
         Some(current)
