@@ -2670,8 +2670,7 @@ pub(crate) mod tests {
         );
     }
 
-    #[test]
-    fn root_constant_zero_offsets_emit_to_dxil() {
+    fn root_constant_offset_shader() -> crate::emit::HostShader {
         use crate::native::{ComputeIo, NativeProgram, ResourceType, StageIo, UsedResource};
 
         let words: &[u32] = &[
@@ -2760,7 +2759,12 @@ pub(crate) mod tests {
             version: (1, 0),
             parts: Vec::new(),
         };
-        let shader = crate::emit::emit(&empty, &native, &p, &st, &io, &res).unwrap();
+        crate::emit::emit(&empty, &native, &p, &st, &io, &res).unwrap()
+    }
+
+    #[test]
+    fn root_constant_zero_offsets_emit_to_dxil() {
+        let shader = root_constant_offset_shader();
         assert!(!shader.memory);
         assert!(shader.user_data.contains(&crate::emit::UserData {
             index: 0,
@@ -2774,6 +2778,60 @@ pub(crate) mod tests {
         ) {
             v.validate(&mut shader.dxil.clone())
                 .expect("DXIL validation failed");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires Windows SM 6.6 WARP and the DXIL validator"]
+    fn root_constant_zero_offsets_dispatch_to_the_selected_buffer() {
+        use crate::emit::host::{Dispatch, Host, Root, Stride, View};
+
+        let mut shader = root_constant_offset_shader();
+        let mut validator = crate::emit::validator::Validator::load(
+            crate::emit::validator::Validator::default_path().as_deref(),
+        )
+        .expect("DXIL validator");
+        validator.validate(&mut shader.dxil).expect("validate shader");
+        let host = Host::new(true).expect("SM 6.6 WARP");
+        let (root, pso) = host.compute_pipeline(&shader).expect("compute pipeline");
+        let mut root_data = [0; 19];
+        root_data[2] = 3;
+        root_data[18] = 7;
+        let raw = |data| View::Buffer {
+            data,
+            stride: Stride::Raw,
+        };
+        let views = [
+            raw(&[100]),
+            View::RawUav(1),
+            raw(&[200]),
+            View::RawUav(1),
+            raw(&root_data),
+        ];
+        for (offset, expected) in [(0, [103, 0]), (64, [0, 207])] {
+            let mut data = vec![0; shader.user_data_dwords() as usize];
+            for value in &shader.user_data {
+                data[value.index as usize] = match (value.slot, value.dword) {
+                    (0, 0) => offset,
+                    (1, 0) | (2, crate::emit::ROOT_VIEW_OFFSET) => 0,
+                    (2, crate::emit::ROOT_SRV_VIEW) => 4,
+                    _ => panic!("unexpected user data {value:?}"),
+                };
+            }
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(data))],
+                        views: &views,
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .expect("WARP dispatch");
+            assert_eq!([out[0][0], out[1][0]], expected, "offset {offset}");
         }
     }
 
