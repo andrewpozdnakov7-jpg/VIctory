@@ -834,4 +834,43 @@ mod tests {
         assert_eq!(subs[8].start, 0x1234_5678);
         assert_eq!(release(c), 0);
     }
+
+    #[test]
+    fn tiling_window_crosses_into_the_third_packed_array_slice() {
+        let mut d = desc(256, 256, 7, 98, 0x10a);
+        d.depth_or_array = 3;
+        let c = create(&d);
+        let query: extern "system" fn(
+            This, *mut u32, *mut PackedMips, *mut [u32; 3],
+            *mut u32, u32, *mut SubresourceTiling,
+        ) -> HRESULT = slot(c, 10);
+        let sentinel = (0xDEAD, 0xBEEF, 0xCAFE, 0x1234_5678);
+        let query_window = |first, mut count: u32| {
+            let mut output: [SubresourceTiling; 12] = std::array::from_fn(|_| SubresourceTiling {
+                width: sentinel.0,
+                height: sentinel.1,
+                depth: sentinel.2,
+                start: sentinel.3,
+            });
+            let hr = query(
+                c, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(),
+                &mut count, first, output.as_mut_ptr(),
+            );
+            (hr, count, output.map(|s| (s.width, s.height, s.depth, s.start)))
+        };
+
+        // Index 12 is in slice 1's tail. Index 14 is slice 2's mip 0,
+        // and only nine slots lie within the requested resource range.
+        let (hr, count, output) = query_window(12, 12);
+        let beyond = query_window(21, 12);
+        assert_eq!(release(c), 0);
+        assert_eq!(hr, S_OK);
+        assert_eq!(count, 1, "one standard mip in the window");
+        let mut expected = [sentinel; 12];
+        expected[..9].fill((0, 0, 0, 0));
+        // One tile for the tail and one for mip 0 in each slice.
+        expected[2] = (1, 1, 1, 5);
+        assert_eq!(output, expected);
+        assert_eq!(beyond, (S_OK, 0, [sentinel; 12]));
+    }
 }
