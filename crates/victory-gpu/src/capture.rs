@@ -729,9 +729,14 @@ fn r32_integer_to_rgba(format: u32, words: impl Iterator<Item = u32>) -> Vec<u8>
     });
     // The full 32-bit span scaled by 255 fits in i64, without float rounding.
     let range = (high - low).max(1);
+    let flat_nonzero = high == low && low != 0;
     let mut out = Vec::with_capacity(values.len() * 4);
     for &value in &values {
-        let grey = ((value - low) * 255 / range) as u8;
+        let grey = if flat_nonzero {
+            255
+        } else {
+            ((value - low) * 255 / range) as u8
+        };
         out.extend([grey, grey, grey, 255]);
     }
 
@@ -894,6 +899,18 @@ mod tests {
 
         assert_eq!(super::to_rgba(42, 3, 1, 12, &unsigned), expected);
         assert_eq!(super::to_rgba(43, 3, 1, 12, &signed), expected);
+    }
+
+    #[test]
+    fn constant_r32_integer_captures_distinguish_nonzero_from_zero() {
+        for (format, value) in [(42, 7u32), (43, (-7i32) as u32)] {
+            let rows = [value; 2].map(u32::to_le_bytes).concat();
+            assert_eq!(super::to_rgba(format, 2, 1, 8, &rows), Some([255; 8].to_vec()));
+            assert_eq!(
+                super::to_rgba(format, 2, 1, 8, &[0; 8]),
+                Some([0, 0, 0, 255].repeat(2))
+            );
+        }
     }
 
     #[test]
