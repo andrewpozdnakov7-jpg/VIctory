@@ -278,6 +278,24 @@ impl Shadow {
             .insert((address, address + len));
         if marked && let Some(t) = &self.tracked {
             t.arm(address, address + len);
+            // A page left changed by an earlier partial copy-back gets no new
+            // title-side snapshot: its first write was already recorded. Keep
+            // this submission's host bytes instead, so its later GPU writes
+            // remain distinguishable from the title's.
+            let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+            for page in address / PAGE..(address + len).div_ceil(PAGE) {
+                if !t.changed(page) {
+                    continue;
+                }
+                let (from, to) = ((page * PAGE).max(start), ((page + 1) * PAGE).min(end));
+                let mut bytes = vec![0; PAGE].into_boxed_slice();
+                // SAFETY: `from..to` is inside this copy's persistent mapping.
+                let host = unsafe {
+                    std::slice::from_raw_parts(self.data.add(from - start), to - from)
+                };
+                bytes[from - page * PAGE..to - page * PAGE].copy_from_slice(host);
+                t.save_host(page, bytes);
+            }
             return;
         }
         let (from, to) = self.inside(address, len);
@@ -423,11 +441,12 @@ impl Shadow {
     /// submission: title memory where the title has not written the page
     /// since the copy took it, else what the page held when the title first
     /// wrote it ([`crate::watch::Tracked::saved`], if the page was armed).
-    /// Returns the bytes written.
+    /// `withheld` ranges stay in the copy and out of title memory, without
+    /// suppressing the page's other writes. Returns the bytes written.
     // shortcut: a page the title wrote that was not armed (a write through
     // the heap's views no list declared) keeps the title's bytes, losing
     // the shaders' there (counted).
-    pub(crate) fn copy_back_marked(&self, page: usize) -> usize {
+    pub(crate) fn copy_back_marked(&self, page: usize, withheld: &[(usize, usize)]) -> usize {
         let Some(t) = &self.tracked else {
             return 0;
         };
@@ -444,39 +463,46 @@ impl Shadow {
             crate::copystat::add(crate::copystat::C::MarkedKept, 1);
             return 0;
         }
-        let n = to - from;
-        // SAFETY: inside the mapping; only the submitting thread writes it.
-        let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(from - start), n) };
-        let mut title = vec![0u8; n];
-        if !crate::host::read_into(from as *const u8, &mut title) {
-            return 0;
-        }
-        let written = match &saved {
-            // The title's bytes are the copy's from before: what differs is
-            // the shaders'.
-            None => (*host != title[..]).then_some(host.as_ptr()),
-            Some(before) => {
-                let before = &before[from - page..to - page];
-                let mut changed = false;
-                for ((t, h), b) in title.iter_mut().zip(host.iter_mut()).zip(before) {
-                    if *h != *b && *t != *h {
-                        *t = *h;
-                        changed = true;
-                    }
-                    *h = *t;
-                }
-                changed.then_some(title.as_ptr())
+        let mut written = 0;
+        let mut synced = true;
+        for (from, to) in outside_withheld(from, to, withheld) {
+            let n = to - from;
+            // SAFETY: inside the mapping; only the submitting thread writes it.
+            let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(from - start), n) };
+            let mut title = vec![0u8; n];
+            if !crate::host::read_into(from as *const u8, &mut title) {
+                synced = false;
+                continue;
             }
-        };
-        if let Some(bytes) = written {
-            let _writing = crate::watch::writing(from, n);
-            crate::host::write_mapped(from as *mut u8, bytes, n);
+            let changed = match &saved {
+                // The title's bytes are the copy's from before: what differs is
+                // the shaders'.
+                None => (*host != title[..]).then_some(host.as_ptr()),
+                Some(before) => {
+                    let before = &before[from - page..to - page];
+                    let mut changed = false;
+                    for ((t, h), b) in title.iter_mut().zip(host.iter_mut()).zip(before) {
+                        if *h != *b && *t != *h {
+                            *t = *h;
+                            changed = true;
+                        }
+                        *h = *t;
+                    }
+                    changed.then_some(title.as_ptr())
+                }
+            };
+            if let Some(bytes) = changed {
+                let _writing = crate::watch::writing(from, n);
+                crate::host::write_mapped(from as *mut u8, bytes, n);
+                written += n;
+            }
         }
-        // Equal to title memory now: taken, unless it holds the page in part.
-        if from == page && to == page + PAGE {
+        // Equal to title memory now: taken, unless it holds the page in part
+        // or a withheld range was deliberately left different.
+        if synced && withheld.is_empty() && from == page && to == page + PAGE {
             t.taken(&[page / PAGE]);
         }
-        written.map_or(0, |_| n)
+        written
     }
 
     /// At submission: copies what changed of `[address, address + len)`
@@ -713,14 +739,43 @@ pub(crate) fn view_writes() -> Option<u64> {
     bitmap().map(|b| b.gpu)
 }
 
+/// The parts of `[from, to)` not covered by `withheld`, in order.
+fn outside_withheld(from: usize, to: usize, withheld: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    let mut held: Vec<(usize, usize)> = withheld
+        .iter()
+        .filter_map(|&(a, b)| {
+            let (a, b) = (a.max(from), b.min(to));
+            (a < b).then_some((a, b))
+        })
+        .collect();
+    held.sort_unstable();
+    let mut ranges = Vec::new();
+    let mut at = from;
+    for (a, b) in held {
+        if b <= at {
+            continue;
+        }
+        if at < a {
+            ranges.push((at, a));
+        }
+        at = b;
+        if at >= to {
+            return ranges;
+        }
+    }
+    if at < to {
+        ranges.push((at, to));
+    }
+    ranges
+}
+
 /// After a submission: every page its shaders marked as written through
-/// views goes back ([`Shadow::copy_back_marked`]), but for pages in
+/// views goes back ([`Shadow::copy_back_marked`]), except bytes in
 /// `withheld` (ranges of copies that lists whose writes stay out of title
 /// memory declared); the bitmap is cleared. Before the copy-backs of
 /// declared ranges, which disarm the copies.
-// shortcut: marks do not tell lists apart: a page that a withheld list and
-// another both wrote through views goes back unless the withheld list
-// declared it.
+// Marks do not tell lists apart: bytes in a withheld range stay out even if
+// another list also marked the page.
 pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)]) {
     let Some(b) = bitmap() else {
         return;
@@ -761,13 +816,12 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)]) {
             .collect()
     };
     for (copy, page) in pages {
-        if withheld
+        let held: Vec<(usize, usize)> = withheld
             .iter()
-            .any(|(c, a, n)| Arc::ptr_eq(c, &copy) && *a < page + PAGE && page < a + n)
-        {
-            continue;
-        }
-        let written = copy.copy_back_marked(page);
+            .filter(|(c, a, n)| Arc::ptr_eq(c, &copy) && *a < page + PAGE && page < a + n)
+            .map(|(_, a, n)| (*a, a + n))
+            .collect();
+        let written = copy.copy_back_marked(page, &held);
         #[cfg(feature = "diagnostics")]
         {
             crate::copystat::add(crate::copystat::C::MarkedPages, 1);
@@ -1141,6 +1195,133 @@ mod tests {
         assert_eq!(left, 0, "bits cleared");
         assert_eq!(copy.copy_back(p, len), 0, "nothing kept to compare");
         unregister(p, p as u64);
+    }
+
+    /// A withheld range (a list whose shaders read memory with no copy,
+    /// #1976) keeps its bytes out of title memory, but only its own: another
+    /// list's valid write on the same marked page still goes back, and the
+    /// withheld bytes stay in the copy. Subsequent marks, a withheld range on
+    /// another page, and a final submission without withholding are controls.
+    #[test]
+    fn a_withheld_range_does_not_suppress_the_pages_other_writes() {
+        let p = crate::watch::tests::pool(2);
+        let len = 2 * PAGE;
+        register(p, p as u64, len as u64);
+        let (Some(copy), Some(b)) = (find(p as u64, len as u64), bitmap()) else {
+            unregister(p, p as u64);
+            return; // no host GPU here
+        };
+        let base = copy.marks.expect("tracked memory gets mark bits") as usize;
+        let bits = b.data as *mut u32;
+        let mark = |page: usize| {
+            let n = base + page;
+            // SAFETY: a dword of the mapped bitmap.
+            unsafe { *bits.add(n / 32) |= 1 << (n % 32) };
+        };
+        // SAFETY: four-byte ranges of our pool.
+        let title = |at: usize| unsafe { ((p + at) as *const [u8; 4]).read_volatile() };
+        let host = |at: usize| {
+            let mut bytes = [0; 4];
+            // SAFETY: four bytes inside the copy's persistent mapping.
+            unsafe { std::ptr::copy_nonoverlapping(copy.data.add(at), bytes.as_mut_ptr(), 4) };
+            bytes
+        };
+        copy.update(p, len);
+        copy.writing(p, len, true);
+        // List A writes at 64 (valid), list B at 256 (withheld); one page.
+        copy.write_host((p + 64) as u64, &[0x5a; 4]);
+        copy.write_host((p + 256) as u64, &[0xa5; 4]);
+        mark(0);
+        copy_back_marks(&[(copy.clone(), p + 256, 4)]);
+        assert_eq!(title(64), [0x5a; 4], "the valid write on the shared page goes back");
+        assert_eq!(title(256), [0; 4], "the withheld write does not");
+        assert_eq!(host(256), [0xa5; 4], "and the copy keeps it");
+        // B on the next page instead: A's page goes back whole.
+        copy.writing(p, len, true);
+        copy.write_host((p + 128) as u64, &[0x3c; 4]);
+        copy.write_host((p + PAGE + 256) as u64, &[0xc3; 4]);
+        mark(0);
+        mark(1);
+        copy_back_marks(&[(copy.clone(), p + PAGE + 256, 4)]);
+        assert_eq!(title(128), [0x3c; 4]);
+        assert_eq!(title(PAGE + 256), [0; 4]);
+        // Nothing withheld: both pages' subsequent writes go back.
+        copy.writing(p, len, true);
+        copy.write_host((p + 512) as u64, &[0x77; 4]);
+        copy.write_host((p + PAGE + 512) as u64, &[0x88; 4]);
+        mark(0);
+        mark(1);
+        copy_back_marks(&[]);
+        assert_eq!((title(512), title(PAGE + 512)), ([0x77; 4], [0x88; 4]));
+        copy.copy_back(p, len);
+        unregister(p, p as u64);
+    }
+
+    /// A title write consumes its saved snapshot in the first copy-back, but
+    /// a withheld range leaves the page changed. A second marked submission
+    /// without a refresh must still publish its new write without reviving
+    /// the old withheld bytes over another title write.
+    #[test]
+    fn a_title_write_does_not_suppress_the_next_marked_submission() {
+        let p = crate::watch::tests::pool(1);
+        register(p, p as u64, PAGE as u64);
+        let (Some(copy), Some(b)) = (find(p as u64, PAGE as u64), bitmap()) else {
+            unregister(p, p as u64);
+            return; // no host GPU here
+        };
+        let base = copy.marks.expect("tracked memory gets mark bits") as usize;
+        let bits = b.data as *mut u32;
+        let mark = || {
+            // SAFETY: a dword of the mapped bitmap.
+            unsafe { *bits.add(base / 32) |= 1 << (base % 32) };
+        };
+        // SAFETY: four-byte ranges of our pool.
+        let title = |at: usize| unsafe { ((p + at) as *const [u8; 4]).read_volatile() };
+        let write_title = |at: usize, bytes: [u8; 4]| {
+            // SAFETY: a four-byte range of our pool.
+            unsafe { ((p + at) as *mut [u8; 4]).write_volatile(bytes) };
+        };
+        copy.update(p, PAGE);
+        copy.writing(p, PAGE, true);
+        write_title(256, [0x3c; 4]);
+        copy.write_host((p + 64) as u64, &[0x5a; 4]);
+        copy.write_host((p + 256) as u64, &[0xa5; 4]);
+        mark();
+        copy_back_marks(&[(copy.clone(), p + 256, 4)]);
+        assert_eq!(title(64), [0x5a; 4]);
+        assert_eq!(title(256), [0x3c; 4]);
+
+        // No intervening refresh: the title writes the still-changed page
+        // again, then a later marked submission writes a disjoint range.
+        write_title(256, [0x6e; 4]);
+        copy.writing(p, PAGE, true);
+        copy.write_host((p + 512) as u64, &[0x77; 4]);
+        mark();
+        copy_back_marks(&[]);
+        assert_eq!(title(512), [0x77; 4], "the next submission is not skipped");
+        assert_eq!(title(256), [0x6e; 4], "the later title write survives");
+        assert_eq!(copy.read_host((p + 256) as u64, 1), [0x6e6e6e6e]);
+        copy.copy_back(p, PAGE);
+        unregister(p, p as u64);
+    }
+
+    #[test]
+    fn withheld_ranges_are_cut_out_without_losing_the_gaps() {
+        let page = 0x2_0000;
+        assert_eq!(outside_withheld(page, page + PAGE, &[]), [(page, page + PAGE)]);
+        assert_eq!(
+            outside_withheld(page, page + PAGE, &[(page + 256, page + 260)]),
+            [(page, page + 256), (page + 260, page + PAGE)]
+        );
+        assert_eq!(
+            outside_withheld(
+                page,
+                page + 100,
+                &[(page + 80, page + 120), (page + 10, page + 40), (page + 20, page + 50)]
+            ),
+            [(page, page + 10), (page + 50, page + 80)]
+        );
+        assert!(outside_withheld(page, page + PAGE, &[(page, page + PAGE)]).is_empty());
     }
 
     /// Mark bits are handed out in runs and come back joined.
