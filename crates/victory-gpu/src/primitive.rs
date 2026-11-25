@@ -333,6 +333,30 @@ mod tests {
     }
 
     #[test]
+    fn reconstructed_fp16_corners_preserve_nan_and_infinity() {
+        let src = [
+            [0x7e01u16, 0x7c00, 0xfc00, 0x7c00],
+            [0x3c00, 0x3c00, 0x3c00, 0x7c00],
+            [0x3c00, 0x3c00, 0x3c00, 0x0000],
+        ]
+        .into_iter()
+        .flatten()
+        .flat_map(u16::to_le_bytes)
+        .collect::<Vec<_>>();
+        let mut dst = [0; 6 * 8];
+        let format = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT;
+        expand_rects(&src, &mut dst, 8, &[(0, format.0 as u32)]);
+
+        let (components, _) = dst[5 * 8..].as_chunks::<2>();
+        let [red, green, blue, alpha] =
+            std::array::from_fn(|i| half_to_f32(u16::from_le_bytes(components[i])));
+        assert!(red.is_nan(), "NaN input became {red}");
+        assert_eq!(green, f32::INFINITY);
+        assert_eq!(blue, f32::NEG_INFINITY);
+        assert!(alpha.is_nan(), "infinity minus infinity became {alpha}");
+    }
+
+    #[test]
     fn multiple_rectangles_and_f32_f16_vector_formats_expand_in_sequence() {
         // Two rectangles of R32G32B32_FLOAT (format 6, 12 bytes) + R16G16_FLOAT (format 34, 4 bytes) = 16 bytes
         let v = |p: [f32; 3], uv: [f32; 2]| {
