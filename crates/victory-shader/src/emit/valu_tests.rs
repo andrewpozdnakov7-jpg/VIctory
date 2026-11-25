@@ -226,6 +226,64 @@ fn run_cases(
 }
 
 #[test]
+fn scalar_zero_counts_and_bit_scans_match_rdna2() {
+    let patterns = [
+        0_u64,
+        u64::MAX,
+        0xffff_ffff_ffff_fffe,
+        0xffff_fffe_ffff_ffff,
+        0x0000_0000_8000_0000,
+        0x8000_0000_0000_0000,
+        0xaaaa_aaaa_5555_5555,
+        0x0001_0000_0000_0000,
+    ];
+    let or_missing = |position, width| {
+        if position == width {
+            u32::MAX
+        } else {
+            position
+        }
+    };
+    for opcode in [0x0d, 0x0e, 0x11, 0x12, 0x16, 0x18] {
+        let count = matches!(opcode, 0x0d | 0x0e);
+        let mut body = vec![0xbe8c_0000 | opcode << 8]; // SOP1 s12, s0 or s[0:1]
+        if count {
+            // Record the zero-count instruction's SCC in bit 8.
+            body.extend([
+                sop2(0x0a, 13, 129, 128), // s_cselect_b32 s13, 1, 0
+                sop2(0x1e, 13, 13, 136),  // s_lshl_b32 s13, s13, 8
+                sop2(0x10, 12, 12, 13),   // s_or_b32 s12, s12, s13
+            ]);
+        }
+        body.push(vop1(1, 0, sgpr(12))); // v_mov_b32 v0, s12
+        let shader = build_valu_cs(&body);
+        let cases = patterns.map(|bits| {
+            let lo = bits as u32;
+            let hi = (bits >> 32) as u32;
+            let result = match opcode {
+                0x0d => lo.count_zeros(),
+                0x0e => bits.count_zeros(),
+                0x11 => or_missing(lo.trailing_ones(), 32),
+                0x12 => or_missing(bits.trailing_ones(), 64),
+                0x16 => or_missing(bits.leading_zeros(), 64),
+                0x18 => or_missing(
+                    (if bits as i64 >= 0 { bits } else { !bits }).leading_zeros(),
+                    64,
+                ),
+                _ => unreachable!(),
+            };
+            [lo, hi, 0, result | (u32::from(count && result != 0) << 8)]
+        });
+        run_cases(&shader, &cases, |backend, _, input, actual| {
+            assert_eq!(
+                actual, input[3],
+                "{backend}: SOP1 {opcode:#04x}, {input:08x?}"
+            );
+        });
+    }
+}
+
+#[test]
 fn scalar_quad_masks_pack_nibbles_and_set_scc() {
     let pack_words = |opcode: u32| {
         [
