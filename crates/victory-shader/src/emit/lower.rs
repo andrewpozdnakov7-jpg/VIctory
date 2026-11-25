@@ -7680,7 +7680,13 @@ impl<'a> Lower<'a> {
         self.s.m.bin(c, Bin::Or, sign, half)
     }
 
-    fn image_d16(&mut self, h: V, channels: &[V], texel: bool) -> Result<Vec<V>, Why> {
+    fn image_d16(
+        &mut self,
+        h: V,
+        channels: &[V],
+        texel: bool,
+        point_choice: Option<V>,
+    ) -> Result<Vec<V>, Why> {
         let c = self.cur;
         let index = *self
             .s
@@ -7701,11 +7707,16 @@ impl<'a> Lower<'a> {
             .iter()
             .map(|&x| self.f32_to_f16(x, false))
             .collect();
-        let nearest = if texel {
+        let nearest = if texel || point_choice.is_some() {
             // Loads and gathers return texels. A filtered sample can be
             // between two codes and must keep that interpolation.
             let wide = self.s.m.i32(VIEW_UNORM16);
             let wide = self.s.m.cmp(self.cur, pred::IUGE, entry, wide);
+            let wide = if let Some(point) = point_choice {
+                self.s.m.bin(self.cur, Bin::And, wide, point)
+            } else {
+                wide
+            };
             let signed = self.s.m.i32(VIEW_SNORM16);
             let signed = self.s.m.cmp(self.cur, pred::EQ, entry, signed);
             let at = self.begin_guarded(Some(wide));
@@ -8043,6 +8054,7 @@ impl<'a> Lower<'a> {
         let fu = self.s.m.undef(self.s.t.f32);
         let iu = self.s.m.undef(self.s.t.i32);
         let mut texel = op == 66 || op == 73;
+        let mut point_choice = None;
         let r = if sample {
             let ss = self
                 .descriptors
@@ -8068,17 +8080,33 @@ impl<'a> Lower<'a> {
             if cmp && (*a16 || dmask.count_ones() != 1) {
                 return Err("a comparison sample of 16-bit coordinates or several channels");
             }
-            // A static point sampler selects one texel. Its UNORM16 and
-            // SNORM16 values need the same exact rounding as an image load.
-            if *d16
-                && !texel
-                && !cmp
-                && let Source::Constant(words) = ss
-                && let Some(words) = words.get(..4).and_then(|w| w.try_into().ok())
-            {
-                texel = super::sampler::StaticSampler::from_words(words).filter == 0;
-            }
             let sh = self.handle(site, ss, true, (14 | if cmp { 0x8000 } else { 0 }, 0))?;
+            // Immediate point samplers return one texel. When uniform
+            // control flow chooses an immediate sampler, use the same
+            // choice for sampling and for the normalized D16 conversion.
+            if *d16 && !texel && !cmp {
+                let is_point = |words: &[u32]| {
+                    words
+                        .get(..4)
+                        .and_then(|w| w.try_into().ok())
+                        .is_some_and(|w| super::sampler::StaticSampler::from_words(w).filter == 0)
+                };
+                if let Source::Constant(words) = ss {
+                    texel = is_point(words);
+                } else if let Source::Phi { args, .. } = ss
+                    && let [Source::Constant(a), Source::Constant(b)] = args.as_slice()
+                    && let Some(&(_, _, choose_first)) = self.s.sampler_choices
+                        .iter()
+                        .find(|&&(first, _, _)| first == sh)
+                {
+                    let (a, b) = (is_point(a), is_point(b));
+                    texel = a && b;
+                    if a != b {
+                        let (a, b) = (self.s.m.bool(a), self.s.m.bool(b));
+                        point_choice = Some(self.s.m.select(self.cur, choose_first, a, b));
+                    }
+                }
+            }
             // Texel offsets (`_o`) come first: x in bits 0-5, y in 8-13,
             // signed (programmable offsets: gathers only).
             let offset_word = name.ends_with("_o");
@@ -8388,7 +8416,7 @@ impl<'a> Lower<'a> {
             .collect();
         // shortcut: integer image formats would keep 16 integer bits.
         let mut xs = if *d16 {
-            self.image_d16(h, &channels, texel)?
+            self.image_d16(h, &channels, texel, point_choice)?
         } else {
             channels.into_iter().map(|x| self.as_int(x)).collect()
         };

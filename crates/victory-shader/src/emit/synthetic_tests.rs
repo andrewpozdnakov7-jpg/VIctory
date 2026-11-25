@@ -658,6 +658,121 @@ fn d16_point_and_linear_samples_round_correctly() {
 }
 
 #[test]
+fn d16_samples_follow_immediate_sampler_choice() {
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_UNORM;
+
+    const POINT: u32 = 0x0400_0000;
+    const LINEAR: u32 = 0x1850_0000;
+    let shader = |d16: bool, [zero, nonzero]: [u32; 2]| {
+        build_with_threads(
+            &[
+                0xBE84_0300, // s_mov_b32 s4, s0
+                0xBE85_0380, // s_mov_b32 s5, 0
+                0xF40C_0302,
+                0xFA00_0000, // s_load_dwordx8 s[12:19], s[4:5], 0x0
+                0xF408_0A02,
+                0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+                0xB008_01B6, // s_movk_i32 s8, 0x1b6 (transparent black border)
+                0xBE89_03FF,
+                0x00C0_0000, // s_mov_b32 s9, 0xc00000
+                0xBE8B_0380, // s_mov_b32 s11, 0
+                0xBF06_8001, // s_cmp_eq_u32 s1, 0 (group id)
+                0xBF85_0003, // s_cbranch_scc1 to the group-zero sampler
+                0xBE8A_03FF,
+                nonzero,     // s_mov_b32 s10, other group's sampler
+                0xBF82_0002, // s_branch to the sample
+                0xBE8A_03FF,
+                zero,        // s_mov_b32 s10, group-zero sampler
+                0x7E00_02F0, // v_mov_b32 v0, 0.5
+                0x7E02_02F0, // v_mov_b32 v1, 0.5
+                0x7E08_0201, // v_mov_b32 v4, s1
+                0x3408_0882, // v_lshlrev_b32 v4, 2, v4
+                0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+                0xF09C_0108,
+                0x0043_0200 | u32::from(d16) << 31, // image_sample_lz v2, v[0:1], s[12:19], s[8:11]
+                0xBF8C_3F70, // s_waitcnt vmcnt(0)
+                0xE070_1000,
+                0x800A_0204, // buffer_store_dword v2, v4, s[40:43], 0 offen
+                0xBF81_0000, // s_endpgm
+            ],
+            1,
+        )
+        .expect("lower two immediate sampler choices")
+    };
+    let format = DXGI_FORMAT_R16G16B16A16_UNORM;
+    let texels: Vec<u8> = [32u16; 4]
+        .into_iter()
+        .chain([65455u16; 4])
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    let views = [
+        View::TextureBits {
+            size: [2, 1],
+            format,
+            data: &texels,
+            texel_bytes: 8,
+        },
+        View::Buffer {
+            data: &[0; 4],
+            stride: Stride::Structured(16),
+        },
+        View::RawUav(2),
+    ];
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let read = |d16, filters| {
+            let shader = shader(d16, filters);
+            assert_eq!(shader.static_samplers.len(), 2);
+            let (root, pso) = host.compute_pipeline(&shader).expect("sampling pipeline");
+            let mut roots = vec![(
+                0,
+                Root::Constants(vec![0; shader.user_data_dwords().max(1) as usize]),
+            )];
+            if d16 {
+                roots.push((
+                    1,
+                    Root::View {
+                        srv: true,
+                        data: vec![super::host::texture_rounding(format), 16, 4],
+                    },
+                ));
+            }
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots,
+                        views: &views,
+                        samplers: &[],
+                        groups: [2, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+            [out[0][0], out[0][1]]
+        };
+        for (filters, point) in [([POINT, LINEAR], 0), ([LINEAR, POINT], 1)] {
+            let full = read(false, filters).map(f32::from_bits);
+            let linear = 1 - point;
+            assert!(full[point] > 0.99 && full[linear] > 0.49 && full[linear] < 0.5);
+            let mut want = [0; 2];
+            want[point] = 0x3bfd;
+            want[linear] = super::semantics_tests::to_f16(f64::from(full[linear]), false);
+            assert_eq!(read(true, filters), want, "{label}: filters {filters:08x?}");
+        }
+        ran += 1;
+    }
+    assert!(ran > 0, "no SM 6.6 device ran the sampler choices");
+}
+
+#[test]
 fn ordered_pixel_sections_use_rasterizer_ordered_views() {
     // A pixel program's ordered section (POPS) as the title's compiler
     // writes it: the collision id after the primitive mask (s10, user data
