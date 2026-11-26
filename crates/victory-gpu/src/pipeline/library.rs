@@ -504,31 +504,29 @@ pub(crate) fn save(now: bool) {
         tracing::warn!(error = %e, "host pipeline library not saved");
         return;
     }
-    let (bytes, prebuilt) = {
+    let (bytes, prebuilt, dirty) = {
         let mut l = library.state.lock().unwrap_or_else(|e| e.into_inner());
-        if l.added == 0 && !l.prebuilt_changed && !USED_CHANGED.swap(false, Ordering::Relaxed) {
+        let l = &mut *l;
+        let Some(dirty) = Dirty::take(&mut l.added, &mut l.prebuilt_changed, &USED_CHANGED) else {
             return;
-        }
-        // SAFETY: a plain query.
+        };
+        // SAFETY: a plain size query on the live library.
         let size = unsafe { l.library.GetSerializedSize() };
         // SAFETY: a buffer of the size the library asks for.
-        let written = write_library(dir, size, |out| unsafe { l.library.Serialize(out) });
-        match written {
+        match write_library(dir, size, |out| unsafe { l.library.Serialize(out) }) {
             Ok(tag) => {
-                l.added = 0;
-                l.prebuilt_changed = false;
                 // Kept beside the bytes it holds for (also when a run adds
                 // pipelines).
                 let prebuilt = (!l.prebuilt.is_empty()).then(|| list(&tag, &l.prebuilt));
-                (size, prebuilt)
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::OutOfMemory => {
-                // Left for a later save: the pipelines stay counted as added.
-                tracing::warn!(bytes = size, "no memory to serialise the host pipeline library; saved later");
-                return;
+                (size, prebuilt, dirty)
             }
             Err(e) => {
-                tracing::warn!(error = %e, "host pipeline library not saved");
+                if e.kind() == std::io::ErrorKind::OutOfMemory {
+                    tracing::warn!(bytes = size, "no memory to serialise the host pipeline library; saved later");
+                } else {
+                    tracing::warn!(error = %e, "host pipeline library not saved");
+                }
+                dirty.restore(&mut l.added, &mut l.prebuilt_changed, &USED_CHANGED);
                 return;
             }
         }
@@ -556,7 +554,41 @@ pub(crate) fn save(now: bool) {
             shaders_translated,
             "host pipeline library saved"
         ),
-        Err(e) => tracing::warn!(error = %e, "host pipeline library not saved"),
+        Err(e) => {
+            tracing::warn!(error = %e, "host pipeline library not saved");
+            let mut l = library.state.lock().unwrap_or_else(|e| e.into_inner());
+            let l = &mut *l;
+            dirty.restore(&mut l.added, &mut l.prebuilt_changed, &USED_CHANGED);
+        }
+    }
+}
+
+/// What changed since the last save, taken by the save that writes it and
+/// given back if that save fails, so that the next one tries again.
+struct Dirty {
+    added: u64,
+    prebuilt_changed: bool,
+    used_changed: bool,
+}
+
+impl Dirty {
+    /// The marks, cleared; none if nothing changed.
+    fn take(added: &mut u64, prebuilt_changed: &mut bool, used_changed: &AtomicBool) -> Option<Dirty> {
+        let dirty = Dirty {
+            added: std::mem::take(added),
+            prebuilt_changed: std::mem::take(prebuilt_changed),
+            used_changed: used_changed.swap(false, Ordering::Relaxed),
+        };
+        (dirty.added != 0 || dirty.prebuilt_changed || dirty.used_changed).then_some(dirty)
+    }
+
+    /// The marks, back (with what changed meanwhile).
+    fn restore(self, added: &mut u64, prebuilt_changed: &mut bool, used_changed: &AtomicBool) {
+        *added += self.added;
+        *prebuilt_changed |= self.prebuilt_changed;
+        if self.used_changed {
+            used_changed.store(true, Ordering::Relaxed);
+        }
     }
 }
 
@@ -842,6 +874,19 @@ mod tests {
         assert!(again.before[&key(0)] < again.before[&key(1)]);
     }
 
+    /// A save that fails gives its changes back for the next to write.
+    #[test]
+    fn a_failed_save_leaves_its_changes_to_the_next() {
+        let (mut added, mut prebuilt, used) = (3u64, true, AtomicBool::new(true));
+        let dirty = Dirty::take(&mut added, &mut prebuilt, &used).expect("changes");
+        assert_eq!((added, prebuilt, used.load(Ordering::Relaxed)), (0, false, false), "taken");
+        assert!(Dirty::take(&mut added, &mut prebuilt, &used).is_none(), "nothing more to save");
+        added = 2; // pipelines stored while the save wrote
+        dirty.restore(&mut added, &mut prebuilt, &used);
+        assert_eq!((added, prebuilt, used.load(Ordering::Relaxed)), (5, true, true));
+        assert!(Dirty::take(&mut added, &mut prebuilt, &used).is_some(), "the next save writes them");
+    }
+
     /// The pre-build's list holds only for the library bytes it was
     /// saved with.
     #[test]
@@ -1116,6 +1161,73 @@ mod tests {
             drop(saving);
             assert_eq!(loaded, Ok(true), "the load waited for the save");
         });
+    }
+
+    #[test]
+    fn cache_files_are_retried_after_a_failed_save() {
+        // Each run needs its own process because the cache directory and
+        // pipeline library are initialized once for the process.
+        const BLOCKED: &str = "VICTORY_TEST_BLOCKED_PIPELINE_CACHE_FILE";
+        if let Ok(file) = std::env::var(BLOCKED) {
+            let dir = tempfile::tempdir().unwrap();
+            use_pipeline_cache(dir.path().to_owned());
+            if library().is_none() {
+                eprintln!("no D3D12 pipeline library; skipped");
+                return;
+            }
+
+            let blocked = dir.path().join(&file);
+            std::fs::create_dir(&blocked).unwrap();
+            match file.as_str() {
+                PREBUILT_FILE => {
+                    keep_early_list();
+                    note_prebuilt("recorded-pipeline".to_owned());
+                }
+                EARLY_FILE => note_used("used-pipeline"),
+                _ => panic!("unknown cache file {file}"),
+            }
+
+            save(true);
+            let blob = dir.path().join(LIBRARY_FILE);
+            assert!(blob.is_file(), "the save reached the file writes");
+            assert!(blocked.is_dir(), "the cache file was blocked");
+            std::fs::remove_dir(&blocked).unwrap();
+
+            save(true);
+            let contents = std::fs::read(&blocked)
+                .unwrap_or_else(|error| panic!("{file} was not retried: {error}"));
+            if file == PREBUILT_FILE {
+                let bytes = std::fs::read(blob).unwrap();
+                assert_eq!(
+                    listed(&contents, &tag(&bytes)),
+                    HashSet::from(["recorded-pipeline".to_owned()])
+                );
+            } else {
+                assert_eq!(contents, b"used-pipeline");
+            }
+            eprintln!("recovered {file}");
+            return;
+        }
+
+        let mut passed = true;
+        for file in [PREBUILT_FILE, EARLY_FILE] {
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "pipeline::library::tests::cache_files_are_retried_after_a_failed_save",
+                    "--nocapture",
+                ])
+                .env(BLOCKED, file)
+                .output()
+                .expect("run isolated cache test");
+            eprintln!(
+                "{file}:\n{}{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            passed &= result.status.success();
+        }
+        assert!(passed, "cache publication did not recover");
     }
 
     #[test]
