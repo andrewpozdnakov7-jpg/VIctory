@@ -119,10 +119,21 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
     }
 }
 
-/// Returns `true` when every LDS access in `p` executes uniformly across the
-/// workgroup (no per-lane `EXEC` guard), so DXIL group barriers can order
-/// single-wave Wave64 LDS sharing on Wave32 hosts without forcing `WaveSize(64)`.
+/// Whether these LDS operations can use a group-wide barrier. A lane must
+/// reach the same barriers as every other lane, including through branches.
 fn can_sync_wave64_lds(p: &Program, x: &Parts) -> bool {
+    if x.st.exits.iter().any(|exit| match *exit {
+        LaneExit::Branch { when, .. } => x
+            .st
+            .bools
+            .support(when)
+            .iter()
+            .any(|atom| !matches!(atom, Atom::Uniform(_))),
+        LaneExit::Indirect => true,
+        LaneExit::Jump(_) | LaneExit::End => false,
+    }) {
+        return false;
+    }
     for (b, block) in p.blocks.iter().enumerate() {
         for (i, inst) in block.insts.iter().enumerate() {
             if !matches!(inst.fields, Fields::Ds { gds: false, .. }) {
@@ -598,6 +609,7 @@ impl<'a> Lower<'a> {
         let root_memory = x.res.scalar.iter().any(|s| matches!(s.1.param, MEMORY | USER_DATA))
             || insts().any(|i| i.name().starts_with("image_bvh"));
         let mut console_lanes = false;
+        let mut lds_wave32_sync = false;
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
             s.lds_dwords = cs.lds_bytes() / 4;
@@ -638,26 +650,13 @@ impl<'a> Lower<'a> {
             };
             let wave = if x.native.wave64 { 64 } else { 32 };
             let threads = cs.threads.iter().product::<u32>();
-            let one_wave = threads <= wave;
-            if console_lanes {
+            let one_wave_lds = threads <= wave && s.lds_dwords > 0;
+            let relax = wave == 64 && one_wave_lds && !console_lanes && can_sync_wave64_lds(p, x);
+            lds_wave32_sync = relax && threads > 1;
+            if console_lanes || one_wave_lds && !relax {
                 s.wave_size = Some(wave);
-            } else if one_wave && s.lds_dwords > 0 {
-                if wave == 64 && threads <= 32 {
-                    // <= 32 threads fits inside one Wave32 warp too: no WaveSize(64) needed.
-                } else if wave == 64 && can_sync_wave64_lds(p, x) {
-                    // Uniform single-wave Wave64 LDS accesses: sync with DXIL group
-                    // barriers instead of locking to WaveSize(64) so Wave32 hosts run it.
-                } else {
-                    s.wave_size = Some(wave);
-                }
             }
         }
-        let lds_wave32_sync = matches!(&x.native.io, StageIo::Cs(cs) if x.native.wave64
-            && !console_lanes
-            && cs.threads.iter().product::<u32>() > 32
-            && cs.threads.iter().product::<u32>() <= 64
-            && s.lds_dwords > 0
-            && can_sync_wave64_lds(p, x));
         let mut no_barrier = HashSet::new();
         if let StageIo::Ms(ms) = &x.native.io {
             s.prims = x.prims.clone();
@@ -3339,6 +3338,10 @@ impl<'a> Lower<'a> {
         if self.s.lds_dwords == 0 {
             return Err("LDS the program does not allocate");
         }
+        // A later write must wait for the earlier reads as well as writes.
+        if self.lds_wave32_sync {
+            self.emit_lds_barrier();
+        }
         let a = self.vgprs(inst, addr.as_ref().ok_or("an LDS address")?, 1)?[0];
         // shortcut: LDS addresses are taken as aligned to what they access.
         // The address is `addr + offset` in 32 bits (it wraps: LLVM folds a
@@ -3383,9 +3386,6 @@ impl<'a> Lower<'a> {
             ]
         };
         if let Some(rest) = name.strip_prefix("ds_read") {
-            if self.lds_wave32_sync {
-                self.emit_lds_barrier();
-            }
             let elements = if rest.starts_with('2') {
                 pair(name)
             } else if matches!(rest, "_b32" | "_b64" | "_b96" | "_b128") {
@@ -3486,9 +3486,6 @@ impl<'a> Lower<'a> {
                 self.s.m.atomic(self.cur, Rmw::And, p, keep);
                 self.s.m.atomic(self.cur, Rmw::Or, p, set);
                 self.end_guarded(at, &[]);
-                if self.lds_wave32_sync {
-                    self.emit_lds_barrier();
-                }
                 return Ok(());
             };
             let mut stores = Vec::new();
@@ -3504,9 +3501,6 @@ impl<'a> Lower<'a> {
                 let at = self.begin_guarded(Some(g));
                 self.s.m.store(self.cur, p, x);
                 self.end_guarded(at, &[]);
-            }
-            if self.lds_wave32_sync {
-                self.emit_lds_barrier();
             }
             return Ok(());
         }
@@ -3561,9 +3555,6 @@ impl<'a> Lower<'a> {
         let r = self.end_guarded(at, &[(r, outside)])[0];
         if let Some(reg) = dst_reg {
             self.write(inst, Reg::V(reg), r, None);
-        }
-        if self.lds_wave32_sync {
-            self.emit_lds_barrier();
         }
         Ok(())
     }
