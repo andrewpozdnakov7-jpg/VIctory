@@ -2382,6 +2382,88 @@ mod tests {
         heap
     }
 
+    /// An identity copy records no GPU write. If both placed resources
+    /// share a host texture, later CPU changes must still reach it.
+    #[cfg(windows)]
+    #[test]
+    fn a_texture_identity_copy_keeps_later_cpu_uploads() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let null = std::ptr::null();
+        let desc = texture(4, 4, 28, 1);
+        let bytes = footprint(&desc).unwrap().size as usize;
+        let allocator_iid = guid(0x6102dee4, 0xaf59, 0x4b09, [0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24]);
+        let list_iid = guid(0x5b160d0f, 0xac1b, 0x4185, [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55]);
+        let (mut allocator, mut samples) = (null, Vec::new());
+        assert_eq!(crate::list::create_allocator(null, 0, &allocator_iid, &mut allocator), S_OK);
+        let release = |o: This| slot::<Release>(o, 0x10)(o);
+        let submit = |record: &dyn Fn(This)| {
+            let mut list = null;
+            assert_eq!(crate::list::create_list(null, 0, 0, allocator, null, &list_iid, &mut list), S_OK);
+            record(list);
+            assert_eq!(slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list), S_OK);
+            host.execute(&[crate::list::host_list(list).unwrap()]);
+            assert_eq!(release(list), 0);
+        };
+
+        #[repr(C)]
+        struct Location {
+            resource: This,
+            kind: u32,
+            footprint: PlacedFootprint,
+        }
+        type Region = extern "system" fn(This, *const Location, u32, u32, u32, *const Location, *const u8);
+        let footprint = PlacedFootprint { offset: 0, format: 28, width: 4, height: 4, depth: 1, row_pitch: 256 };
+        let location = |resource, kind| Location { resource, kind, footprint };
+
+        for whole in [true, false] {
+            let h = heap(1 << 20);
+            let place = || {
+                let mut image = null;
+                assert_eq!(create_placed(null, h, 0, &desc, 0, null.cast(), &RESOURCE_IIDS[0], &mut image), S_OK);
+                image
+            };
+            let (src, alias) = (place(), place());
+            assert_ne!(src, alias);
+            let copy = host_copy(src).unwrap();
+            assert!(std::sync::Arc::ptr_eq(&copy, &host_copy(alias).unwrap()));
+            let readback = test_buffer(1024);
+            let (out, _) = buffer_bytes(readback).unwrap();
+            let data = resource(src).data();
+            let fill = |value| {
+                // SAFETY: the placement has `bytes` of writable title memory.
+                unsafe { std::ptr::write_bytes(data, value, bytes) }
+            };
+            let pixel = || {
+                submit(&|list| slot::<Region>(list, 0x80)(
+                    list, &location(readback, 1), 0, 0, 0, &location(src, 0), null.cast()
+                ));
+                // SAFETY: the four bytes are inside the completed readback.
+                unsafe { out.cast::<[u8; 4]>().read() }
+            };
+
+            fill(0x17);
+            let first = pixel();
+            submit(&|list| {
+                if whole {
+                    slot::<extern "system" fn(This, This, This)>(list, 0x88)(list, alias, src);
+                } else {
+                    slot::<Region>(list, 0x80)(
+                        list, &location(alias, 0), 0, 0, 0, &location(src, 0), null.cast()
+                    );
+                }
+            });
+            fill(0x2A);
+            samples.push((first, pixel()));
+            for o in [readback, alias, src, h] {
+                assert_eq!(release(o), 0);
+            }
+        }
+        assert_eq!(release(allocator), 0);
+        assert_eq!(samples, [([0x17; 4], [0x2A; 4]); 2]);
+    }
+
     /// A title texture's host texture is made when first asked for, and a
     /// texture of the same memory made later with more uses (unordered
     /// access) shares it: the first one made takes every use the memory's

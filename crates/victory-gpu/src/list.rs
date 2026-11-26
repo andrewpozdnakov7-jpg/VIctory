@@ -655,7 +655,6 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             if crate::texture::title_written(&from) {
                 crate::texture::upload(list, src, &from);
             }
-            crate::texture::host_writes(list, dst);
             // Two title textures over one memory share one host texture: the
             // copy would be of that texture onto itself, which the host does
             // not allow (the debug layer: CopyResource with its destination
@@ -667,6 +666,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             }
             ensure_state(list, dst, COPY_DEST);
             ensure_state(list, src, COPY_SOURCE);
+            crate::texture::host_writes(list, dst);
             #[cfg(feature = "diagnostics")]
             list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
             // SAFETY: an open list and live textures.
@@ -809,11 +809,8 @@ extern "system" fn copy_texture_region(
                 Some(b) => [b[0], b[1], b[2]] == [x, y, z],
                 None => [x, y, z] == [0; 3],
             };
-            if in_place {
-                // As a copy would have: what is noted stays as it was.
-                crate::texture::host_writes(list, dst.resource);
-            } else {
-                // Not done, so the destination is not the host's either.
+            // No GPU write was recorded, so the source keeps its upload policy.
+            if !in_place {
                 static ONCE: std::sync::Once = std::sync::Once::new();
                 ONCE.call_once(|| {
                     tracing::warn!("a copy to another place in its own subresource is not done");
