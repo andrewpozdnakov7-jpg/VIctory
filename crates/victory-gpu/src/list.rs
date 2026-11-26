@@ -1863,6 +1863,22 @@ pub(crate) fn has_newer_table(list: This) -> bool {
     table == NEWER_LIST_FUNCTIONS.0.as_ptr()
 }
 
+#[cfg(all(test, windows))]
+pub(crate) fn run_copy_resource_probe(dst: This, src: This) {
+    let mut allocator = std::ptr::null();
+    let mut command_list = std::ptr::null();
+    assert_eq!(create_allocator(std::ptr::null(), 0, &ALLOCATOR_IIDS[0], &mut allocator), S_OK);
+    assert_eq!(
+        create_list(std::ptr::null(), 0, 0, allocator, std::ptr::null(), &LIST_IIDS[0], &mut command_list),
+        S_OK
+    );
+    copy_resource(command_list, dst, src);
+    assert_eq!(close(command_list), S_OK);
+    crate::host::host().expect("WARP device").execute(&[host_list(command_list).expect("host command list")]);
+    list_release(command_list);
+    allocator_release(allocator);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

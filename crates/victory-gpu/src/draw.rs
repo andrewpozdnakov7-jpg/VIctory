@@ -2799,6 +2799,107 @@ uint ps() : SV_Target { return 1; }
         }
     }
 
+    /// A title write to mip 1 should upload that mip without undoing the
+    /// preceding GPU copy to mip 0. Check tracked and untracked memory.
+    #[test]
+    #[ignore = "candidate #758 regression for partial mip updates"]
+    fn issue758_cpu_mip_write_keeps_the_other_gpu_mip() {
+        const RED: [u8; 4] = [255, 0, 0, 255];
+        const GREEN: [u8; 4] = [0, 255, 0, 255];
+        const BLUE: [u8; 4] = [0, 0, 255, 255];
+
+        let host = crate::host::host().expect("a D3D12 device");
+        let reader = compile_cs(
+            r#"
+#define RS "DescriptorTable(SRV(t0)), UAV(u1)"
+Texture2D<float4> t : register(t0);
+RWByteAddressBuffer pixels : register(u1);
+[RootSignature(RS)]
+[numthreads(4, 4, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    pixels.Store4((id.y * 4 + id.x) * 16, asuint(t.Load(int3(id.xy, 0))));
+    if (id.x < 2 && id.y < 2)
+        pixels.Store4((16 + id.y * 2 + id.x) * 16, asuint(t.Load(int3(id.xy, 1))));
+}
+"#,
+        );
+        let (output, mapped) = host.shared_buffer(20 * 16).unwrap();
+        let mut words = texture_words(4, 4, 28, 0x100, 0);
+        words[7] = 1 | 2 << 16; // One slice, two mips.
+
+        let write_mip = |object, mip: u32, color: [u8; 4]| {
+            let (memory, desc) = crate::resource::texture_memory(object).unwrap();
+            let texture = crate::resource::texture_layout(&desc).unwrap();
+            let layout = &texture.planes[0].layout;
+            assert!(layout.size <= crate::watch::PAGE as u64);
+            let edge = 4 >> mip;
+            for y in 0..edge {
+                for x in 0..edge {
+                    let offset = layout.offset(mip, x, y, 0).unwrap() as usize;
+                    // SAFETY: this four-byte texel is inside our title allocation.
+                    unsafe { (memory.cast_mut().add(offset) as *mut [u8; 4]).write(color) };
+                }
+            }
+        };
+
+        let mut results = Vec::new();
+        for watched in [true, false] {
+            let address = if watched {
+                crate::watch::tests::pool(1) as u64
+            } else {
+                title_memory(crate::watch::PAGE)
+            };
+            assert_eq!(
+                crate::watch::track(address as usize, crate::watch::PAGE, true).is_some(),
+                watched
+            );
+            let target = texture_at_address(address, &words);
+            let source = texture_at_address(crate::watch::tests::pool(1) as u64, &words);
+            let slots = Slots::new(2);
+            let mut desc = [0; 10];
+            desc[..6].copy_from_slice(&[28, 4, 0x1688, 0, 0, 2]);
+            let target_view = View::Shader(target as usize, Some(desc));
+            let source_view = View::Shader(source as usize, Some(desc));
+            slots.make(0, &target_view);
+            slots.make(1, &source_view);
+
+            let read = |view, slot| {
+                let list = host.new_list().unwrap();
+                readable(&list, &used(ResourceType::Srv), view, false);
+                run(&list, &slots, &reader, slot, Some(&output), (1, 1));
+                list.close();
+                host.execute(&[&list]);
+                // SAFETY: the completed dispatch wrote all 20 RGBA32F entries.
+                let pixels: [[f32; 4]; 20] =
+                    unsafe { mapped.cast::<[[f32; 4]; 20]>().read() };
+                pixels.map(|color| color.map(|value| (value * 255.0).round() as u8))
+            };
+
+            for mip in 0..2 {
+                write_mip(target, mip, RED);
+                write_mip(source, mip, GREEN);
+            }
+            assert_eq!(read(&target_view, 0), [RED; 20], "initial CPU upload");
+            assert_eq!(read(&source_view, 1), [GREEN; 20], "GPU copy source");
+            crate::list::run_copy_resource_probe(target, source);
+            assert_eq!(read(&target_view, 0), [GREEN; 20], "after GPU CopyResource");
+
+            write_mip(target, 1, BLUE);
+            let pixels = read(&target_view, 0);
+            println!(
+                "watched={watched} mip0 green={}/16 red={}/16 mip1 blue={}/4 green={}/4",
+                pixels[..16].iter().filter(|texel| **texel == GREEN).count(),
+                pixels[..16].iter().filter(|texel| **texel == RED).count(),
+                pixels[16..].iter().filter(|texel| **texel == BLUE).count(),
+                pixels[16..].iter().filter(|texel| **texel == GREEN).count(),
+            );
+            results.push(pixels);
+        }
+        let mut expected = [GREEN; 20];
+        expected[16..].fill(BLUE);
+        assert_eq!(results, [expected, expected], "mip 0 must keep the GPU copy");
+    }
+
     const READ: &str = r#"
 #define RS "DescriptorTable(SRV(t0)), UAV(u1)"
 Texture2D<float4> t : register(t0);
