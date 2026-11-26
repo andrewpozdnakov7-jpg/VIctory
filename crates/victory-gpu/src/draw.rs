@@ -2124,6 +2124,101 @@ void main(uint3 id : SV_DispatchThreadID) {
         }
     }
 
+    /// Reads the title texture before and after a deferred CPU copy in
+    /// the same ExecuteCommandLists call.
+    #[test]
+    #[ignore = "opt-in texture submission ordering probe"]
+    fn texture_reads_straddle_a_cpu_copy_in_one_submission() {
+        const RED: [u8; 4] = [255, 0, 0, 255];
+        const GREEN: [u8; 4] = [0, 255, 0, 255];
+
+        let host = crate::host::host().expect("native D3D12 host");
+        let reader = compile_cs(
+            r#"
+#define RS "DescriptorTable(SRV(t0)), UAV(u1)"
+Texture2D<float4> texture_in : register(t0);
+RWByteAddressBuffer pixels : register(u1);
+[RootSignature(RS)]
+[numthreads(4, 4, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    pixels.Store4((id.y * 4 + id.x) * 16, asuint(texture_in.Load(int3(id.xy, 0))));
+}
+"#,
+        );
+        let mut results = Vec::new();
+        for watched in [true, false] {
+            let address = if watched {
+                crate::watch::tests::pool(1) as u64
+            } else {
+                title_memory(crate::watch::PAGE)
+            };
+            assert_eq!(
+                crate::watch::track(address as usize, crate::watch::PAGE, true).is_some(),
+                watched
+            );
+            let texture = texture_at_address(address, &texture_words(4, 4, 28, 0x100, 0));
+            let (memory, desc) = crate::resource::texture_memory(texture).unwrap();
+            let layout = &crate::resource::texture_layout(&desc).unwrap().planes[0].layout;
+            let bytes = layout.size as usize;
+            assert!(bytes <= crate::watch::PAGE);
+            let color_bytes = |color: [u8; 4]| {
+                let mut data = vec![0u8; bytes];
+                for y in 0..4 {
+                    for x in 0..4 {
+                        let offset = layout.offset(0, x, y, 0).unwrap() as usize;
+                        data[offset..offset + 4].copy_from_slice(&color);
+                    }
+                }
+                data
+            };
+            let red = color_bytes(RED);
+            let green = color_bytes(GREEN);
+            // SAFETY: our texture allocation has at least this many bytes.
+            unsafe { std::ptr::copy_nonoverlapping(red.as_ptr(), memory.cast_mut(), bytes) };
+
+            let slots = Slots::new(1);
+            let mut desc = [0; 10];
+            desc[..6].copy_from_slice(&[28, 4, 0x1688, 0, 0, 1]);
+            let view = View::Shader(texture as usize, Some(desc));
+            slots.make(0, &view);
+            let make_read = |out| {
+                let list = host.new_list().unwrap();
+                readable(&list, &used(ResourceType::Srv), &view, false);
+                run(&list, &slots, &reader, 0, Some(out), (1, 1));
+                list.close();
+                list
+            };
+
+            let (first, first_data) = host.shared_buffer(16 * 16).unwrap();
+            let (last, last_data) = host.shared_buffer(16 * 16).unwrap();
+            let a = make_read(&first);
+            let w = host.new_list().unwrap();
+            w.defer_copy(memory.cast_mut(), green.as_ptr(), bytes);
+            w.close();
+            let b = make_read(&last);
+            host.execute(&[&a, &w, &b]);
+
+            let pixels = |mapping: *mut u8| {
+                // SAFETY: the completed dispatch wrote all 16 RGBA32F entries.
+                let data = unsafe { mapping.cast::<[[f32; 4]; 16]>().read() };
+                data.map(|rgba| rgba.map(|value| (value * 255.0).round() as u8))
+            };
+            let before = pixels(first_data);
+            let after = pixels(last_data);
+            let (next, next_data) = host.shared_buffer(16 * 16).unwrap();
+            host.execute(&[&make_read(&next)]);
+            let next = pixels(next_data);
+            let count = |read: &[[u8; 4]; 16], color| read.iter().filter(|&&p| p == color).count();
+            println!(
+                "watched={watched}: A red={}/16 green={}/16; B red={}/16 green={}/16; next green={}/16",
+                count(&before, RED), count(&before, GREEN), count(&after, RED),
+                count(&after, GREEN), count(&next, GREEN)
+            );
+            results.push((before, after, next));
+        }
+        assert_eq!(results, [([RED; 16], [GREEN; 16], [GREEN; 16]); 2]);
+    }
+
     const READ: &str = r#"
 #define RS "DescriptorTable(SRV(t0)), UAV(u1)"
 Texture2D<float4> t : register(t0);
