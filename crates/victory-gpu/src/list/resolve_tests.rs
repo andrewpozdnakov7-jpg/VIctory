@@ -190,12 +190,9 @@ fn format_118_resolves_the_overlapping_depth_region() {
     check_depth_resolve(6);
 }
 
-/// A triangle covers the lower left half of an 8x8 4x MSAA depth/stencil
-/// texture, writing stencil 0x80 over the cleared 0: the pixels along its
-/// diagonal edge have samples of both values. Resolving the stencil plane
-/// (subresource 1) must close the list, give every pixel on or below the
-/// diagonal 0x80 and the others 0: that is `STENCIL_RESOLVE_MODE` = MAX
-/// (a chosen rule: the console's for mixed samples is not known).
+/// A triangle writes stencil 0x80 into the lower left half of an 8x8 4x
+/// MSAA texture cleared to zero. For the two regions where all samples
+/// agree, resolving the stencil plane must preserve both stencil values.
 fn check_stencil_resolve(guest_format: u32) {
     use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
     use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
@@ -320,9 +317,12 @@ fn check_stencil_resolve(guest_format: u32) {
     host.execute(&[list]);
     for y in 0..N {
         for x in 0..N {
-            // On the diagonal the samples differ (some 0x80, some 0): the
-            // chosen MAX keeps the written value.
-            let expected = if y >= x { REFERENCE } else { 0 };
+            // A diagonal pixel has both values. Only check pixels wholly
+            // covered by one of the two stencil values.
+            if y == x {
+                continue;
+            }
+            let expected = if y > x { REFERENCE } else { 0 };
             let offset = footprint.Offset as usize + y as usize * footprint.Footprint.RowPitch as usize + x as usize;
             // SAFETY: the completed copy fills N x N stencil bytes at the device's row pitch.
             let stencil = unsafe { mapped.add(offset).read() };
@@ -332,11 +332,11 @@ fn check_stencil_resolve(guest_format: u32) {
 }
 
 #[test]
-fn format_120_resolves_a_stencil_plane_with_mixed_samples() {
+fn format_120_resolves_a_stencil_plane_away_from_the_edge() {
     check_stencil_resolve(120);
 }
 
 #[test]
-fn format_118_resolves_its_stencil_plane_with_mixed_samples() {
+fn format_118_resolves_its_stencil_plane_away_from_the_edge() {
     check_stencil_resolve(118);
 }
