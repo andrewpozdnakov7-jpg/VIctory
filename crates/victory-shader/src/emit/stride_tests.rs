@@ -9,12 +9,12 @@ use windows::Win32::Graphics::Direct3D12::D3D12_SAMPLER_DESC;
 
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT, DXGI_FORMAT_R16_FLOAT, DXGI_FORMAT_R16_UINT, DXGI_FORMAT_R16G16_FLOAT,
-    DXGI_FORMAT_R16G16_UINT, DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R16G16B16A16_UINT,
+    DXGI_FORMAT_R16G16_SINT, DXGI_FORMAT_R16G16_UINT, DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R16G16B16A16_UINT,
     DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32_UINT, DXGI_FORMAT_R32G32_FLOAT,
 };
 
 use super::host::{Dispatch, Host, Root, Stride, View};
-use super::{HostShader, StaticSampler, VIEW_INTEGER, VIEW_STRIDES, lower, validator};
+use super::{HostShader, StaticSampler, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDES, lower, validator};
 use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
 };
@@ -887,10 +887,14 @@ fn partial_dmask_image_stores_write_typed_texture_uavs() {
     let u16_pairs: Vec<u32> = (0..32u32)
         .map(|l| (0x3C00 + l) | ((0xF000 | l) << 16))
         .collect();
+    let i16_pairs: Vec<u32> = (0..32u32)
+        .map(|lane| (0x7FFF - lane) | ((0x8000 + lane) << 16))
+        .collect();
     let d16_xy = make_1dw_store(0x3, true);
     for (format, stride, data) in [
         (DXGI_FORMAT_R16G16_FLOAT, 0, &f16_pairs),
         (DXGI_FORMAT_R16G16_UINT, VIEW_INTEGER, &u16_pairs),
+        (DXGI_FORMAT_R16G16_SINT, VIEW_INTEGER | VIEW_SIGNED, &i16_pairs),
     ] {
         let views = [
             View::TypedTextureUav(format, 32, 1, 1),
@@ -901,6 +905,42 @@ fn partial_dmask_image_stores_write_typed_texture_uavs() {
         ];
         for (label, words) in run(&d16_xy, &views, vec![stride, 4]) {
             assert_eq!(words[0], *data, "{label} {format:?} dmask=0x3 d16");
+        }
+    }
+
+    // Seed every channel before a sparse store. The unselected channels
+    // must become zero, and Alpha is discarded by a two-channel view.
+    let rw_code = [
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF40C_0202, 0xFA00_0000, // s_load_dwordx8 s[8:15], s[4:5], 0
+        0x7E02_02F0, // v_mov_b32 v1, 0.5
+        0x7E04_02F2, // v_mov_b32 v2, 1.0
+        0x7E06_02F4, // v_mov_b32 v3, 2.0
+        0x7E08_02F6, // v_mov_b32 v4, 4.0
+        0x7E0A_0300, // v_mov_b32 v5, v0 (x)
+        0x7E0C_0280, // v_mov_b32 v6, 0 (y)
+        0xBF8C_0000,
+        0xF020_1F08, 0x0002_0105, // image_store v[1:4], v[5:6], dmask:0xF
+        0xBF8C_0000,
+        0x7E02_02FF, 0x4180_0000, // v_mov_b32 v1, 16.0
+        0x7E04_02FF, 0x4200_0000, // v_mov_b32 v2, 32.0
+        0xF020_1908, 0x0002_0105, // image_store v[1:2], v[5:6], dmask:0x9
+        0xBF81_0000,
+    ];
+    let shader = build(
+        &rw_code,
+        vec![param(RootType::Table, 0)],
+        vec![entry(ResourceType::Uav, 8, 0)],
+        32,
+    );
+    for (view, texel) in [
+        (View::TextureUav(32, 1), &[16.0f32, 0.0, 0.0, 32.0][..]),
+        (View::TypedTextureUav(DXGI_FORMAT_R32G32_FLOAT, 32, 1, 2), &[16.0, 0.0][..]),
+    ] {
+        let want: Vec<_> = texel.iter().map(|x| x.to_bits()).collect();
+        for (label, words) in run(&shader, &[view], vec![0]) {
+            assert_eq!(words[0], want.repeat(32), "{label} dmask=0x9 whole texel");
         }
     }
 

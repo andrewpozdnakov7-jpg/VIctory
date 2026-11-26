@@ -493,7 +493,7 @@ impl HostHeap {
 
     /// Enters the byte stride of `view` (0 for none or not a buffer view)
     /// for slot `index` in the view-stride table, with the integer-format
-    /// bits of a typed buffer view ([`view_kind`]).
+    /// bits of a typed buffer view or texture UAV ([`view_kind`]).
     fn set_stride(&self, index: u32, view: Option<&View>) {
         self.write_stride(index, view.map_or(0, |v| view_stride(v) | view_kind(v)));
     }
@@ -1008,35 +1008,36 @@ fn view_stride(view: &View) -> u32 {
     element.max(1) as u32
 }
 
-/// The view-stride table's format-kind bits of a buffer view: a typed view
-/// (no structure stride, not raw) of an integer format gets
-/// `VIEW_INTEGER`, a signed one also `VIEW_SIGNED`; anything else none.
-/// Translated shaders pass 16-bit typed data of such views as bits, not as
-/// halves (`victory_shader::emit`, "d16").
+/// Record the format kind for typed buffers and texture UAVs. Shader
+/// stores use it to extend integer d16 values before writing.
 fn view_kind(view: &View) -> u32 {
     use victory_shader::emit::{VIEW_INTEGER, VIEW_SIGNED};
     let (unordered, words): (bool, &[u32; 10]) = match view {
         View::Shader(_, Some(desc)) => (false, desc),
         View::Unordered(_, _, Some(desc)) => (true, desc),
-        View::Placed(unordered, resource, desc) if resource[0] == 1 => match desc[..10].try_into() {
-            Ok(words) => (*unordered, words),
-            Err(_) => return 0,
-        },
+        View::Placed(unordered, resource, desc) if resource[0] == 1 || *unordered => {
+            let Ok(words) = desc[..10].try_into() else { return 0 };
+            (*unordered, words)
+        }
         _ => return 0,
     };
-    // Buffer views only (dimension 1); a structured or raw one is no typed view.
-    let (format, typed) = if unordered {
-        let desc = uav_desc(words);
-        // SAFETY: a buffer view's union member.
-        let b = unsafe { desc.Anonymous.Buffer };
-        (desc.Format.0 as u32, b.StructureByteStride == 0 && b.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 == 0)
-    } else {
-        let desc = srv_desc(words);
-        // SAFETY: a buffer view's union member.
-        let b = unsafe { desc.Anonymous.Buffer };
-        (desc.Format.0 as u32, b.StructureByteStride == 0 && b.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 == 0)
+    let typed = match (unordered, words[1]) {
+        (true, 1) => {
+            let desc = uav_desc(words);
+            // SAFETY: a buffer view's union member.
+            let b = unsafe { desc.Anonymous.Buffer };
+            b.StructureByteStride == 0 && b.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 == 0
+        }
+        (false, 1) => {
+            let desc = srv_desc(words);
+            // SAFETY: a buffer view's union member.
+            let b = unsafe { desc.Anonymous.Buffer };
+            b.StructureByteStride == 0 && b.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 == 0
+        }
+        (true, 2..=5 | 8) => true,
+        _ => false,
     };
-    match (words[1] == 1 && typed).then(|| integer_format(format)).flatten() {
+    match typed.then(|| integer_format(crate::resource::pc_format(words[0]))).flatten() {
         Some(true) => VIEW_INTEGER | VIEW_SIGNED,
         Some(false) => VIEW_INTEGER,
         None => 0,
@@ -1844,6 +1845,22 @@ mod tests {
         let srv = View::Shader(0, Some([62, 1, 5768, 0, 0, 0, 64, 0, 0, 0]));
         assert_eq!(view_kind(&srv), VIEW_INTEGER, "R8_UINT");
         assert_eq!(view_stride(&uav(12, 0, 0)) | view_kind(&uav(12, 0, 0)), 8 | VIEW_INTEGER);
+    }
+
+    #[test]
+    fn explicit_integer_texture_uavs_have_kind_bits_without_a_buffer_stride() {
+        use victory_shader::emit::{VIEW_INTEGER, VIEW_SIGNED};
+        for (format, bits) in [(36, VIEW_INTEGER), (38, VIEW_INTEGER | VIEW_SIGNED), (34, 0)] {
+            let words = [format, 4, 0, 0, 0, 0, 0, 0, 0, 0];
+            let view = View::Unordered(0, 0, Some(words));
+            assert_eq!((view_stride(&view), view_kind(&view)), (0, bits));
+            let mut resource = [0; 14];
+            resource[0] = 3;
+            let mut desc = [0; 16];
+            desc[..10].copy_from_slice(&words);
+            let placed = View::Placed(true, resource, desc);
+            assert_eq!((view_stride(&placed), view_kind(&placed)), (0, bits));
+        }
     }
 
     /// A placed texture's view the title writes into a heap is left null
