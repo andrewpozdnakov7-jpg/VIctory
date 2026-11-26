@@ -21,6 +21,7 @@ use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 mod bvh;
+mod mixed_fma;
 
 type Why = &'static str;
 
@@ -2201,6 +2202,7 @@ impl<'a> Lower<'a> {
         self.s.m.select(c, zeros, signed, r)
     }
 
+    /// DXIL FMad allows either fused or separate multiply-add arithmetic.
     fn fmad(&mut self, a: V, b: V, c: V) -> V {
         self.s.op(
             self.cur,
@@ -6422,41 +6424,64 @@ impl<'a> Lower<'a> {
             "v_fma_mix_f32" | "v_fma_mixlo_f16" | "v_fma_mixhi_f16" => {
                 // Each source is f32, or with op_sel_hi the low (op_sel: high)
                 // f16 half; neg_hi is the absolute value here.
-                let mut xs = Vec::new();
-                for i in 0..3 {
+                let f32_result = name == "v_fma_mix_f32";
+                let float_path = f32_result || self.mode16 == Some(3);
+                let mut xs = [self.s.m.i32(0); 3];
+                for (i, out) in xs.iter_mut().enumerate() {
                     let op = v.src.get(i).ok_or("a missing operand")?;
                     let low = v.opsel_hi >> i & 1 != 0 && v.opsel >> i & 1 == 0;
                     let x = match self.low16_src(inst, i).filter(|_| low) {
                         Some(x) => x,
                         None => self.operand(inst, op)?,
                     };
-                    let mut x = if v.opsel_hi >> i & 1 != 0 {
+                    let widened = if v.opsel_hi >> i & 1 != 0 {
                         let h = if v.opsel >> i & 1 != 0 {
                             let k16 = self.s.m.i32(16);
                             self.s.m.bin(c, Bin::LShr, x, k16)
                         } else {
                             x
                         };
-                        self.s
-                            .op(c, "legacyF16ToF32", Attr::ReadNone, self.s.t.f32, 131, &[h])
+                        Some(self.s.op(
+                            c,
+                            "legacyF16ToF32",
+                            Attr::ReadNone,
+                            self.s.t.f32,
+                            131,
+                            &[h],
+                        ))
                     } else {
-                        self.as_float(x)
+                        None
                     };
-                    if v.neg_hi >> i & 1 != 0 {
-                        x = self.unary(6, x);
-                    }
-                    if v.neg >> i & 1 != 0 {
-                        let z = self.s.m.f32(0x8000_0000);
-                        x = self.s.m.bin(c, Bin::Sub, z, x);
-                    }
-                    xs.push(x);
+                    let abs = v.neg_hi >> i & 1 != 0;
+                    let neg = v.neg >> i & 1 != 0;
+                    *out = if float_path {
+                        let mut f = widened.unwrap_or_else(|| self.as_float(x));
+                        if abs {
+                            f = self.unary(6, f);
+                        }
+                        if neg {
+                            let z = self.s.m.f32(0x8000_0000);
+                            f = self.s.m.bin(c, Bin::Sub, z, f);
+                        }
+                        f
+                    } else {
+                        // Apply sign modifiers on the bits for the f16 result.
+                        let mut bits = widened.map_or(x, |f| self.as_int(f));
+                        if abs {
+                            let mag = self.s.m.i32(0x7FFF_FFFF);
+                            bits = self.s.m.bin(c, Bin::And, bits, mag);
+                        }
+                        if neg {
+                            let sign = self.s.m.i32(0x8000_0000);
+                            bits = self.s.m.bin(c, Bin::Xor, bits, sign);
+                        }
+                        bits
+                    };
                 }
-                let mut r = self.fmad(xs[0], xs[1], xs[2]);
-                if name == "v_fma_mix_f32" {
+                if f32_result {
+                    let [a, b, addend] = xs;
+                    let r = self.fmad(a, b, addend);
                     return float(self, r);
-                }
-                if v.clamp {
-                    r = self.unary(7, r);
                 }
                 // The f16 result goes to one half; the other half stays.
                 let Some(Operand::Vector { reg, .. }) = v.dst else {
@@ -6476,7 +6501,14 @@ impl<'a> Lower<'a> {
                     },
                     None => self.s.m.i32(0),
                 };
-                let h = self.narrow16(r);
+                let h = if float_path {
+                    let [a, b, addend] = xs;
+                    let r = self.fmad(a, b, addend);
+                    let r = if v.clamp { self.unary(7, r) } else { r };
+                    self.narrow16(r)
+                } else {
+                    self.fma_mix_f16(xs, v.clamp)
+                };
                 let (keep, h) = if name == "v_fma_mixhi_f16" {
                     let k16 = self.s.m.i32(16);
                     (0xFFFF, self.s.m.bin(c, Bin::Shl, h, k16))
