@@ -52,17 +52,19 @@ uint clamped(uint at, uint record) {
             dest.Store2(at + 8, args.Load2(at + 8));
         }
     } else if (kind == 2) {
-        uint3 g = args.Load3(at);
+        uint3 requested = args.Load3(at);
+        uint3 g = min(requested, uint3(65535, 65535, 65535));
         uint row = 0;
-        uint asked = g.x;
-        if (spread != 0) {
-            if (g.x > 65535 && g.y <= 1 && g.z <= 1) {
-                uint z = (g.x + 65534) / 65535;
-                row = (g.x + z - 1) / z;
-                g = uint3(row, g.y, z);
+        uint asked = requested.x;
+        if (spread != 0 && asked > 65535 && requested.y != 0 && requested.z == 1) {
+            // Drop records over the per-dispatch budget before rounding up.
+            if (asked > GROUPS) {
+                g = uint3(0, 0, 0);
+            } else {
+                uint rows = (asked + 65534) / 65535;
+                row = (asked + rows - 1) / rows;
+                g = uint3(row, g.y, rows);
             }
-        } else {
-            g = min(g, uint3(65535, 65535, 65535));
         }
         // x * y fits 32 bits; the whole count may not.
         if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
@@ -448,42 +450,46 @@ mod tests {
     #[test]
     fn spread_records_split_large_x_and_keep_small_unspread() {
         let Some(host) = super::host() else {
-            return; // no host GPU here
+            eprintln!("no host GPU; skipped");
+            return;
         };
-        let records = 3u32;
-        let (title, in_ptr) = host.shared_buffer(u64::from(records) * 12).unwrap();
+        let cases: [([u32; 3], [u32; 5]); 11] = [
+            ([115_200, 1, 1], [57_600, 115_200, 57_600, 1, 2]),
+            ([65_535, 1, 1], [0, 65_535, 65_535, 1, 1]),
+            ([65_536, 1, 1], [32_768, 65_536, 32_768, 1, 2]),
+            ([65_537, 1, 1], [32_769, 65_537, 32_769, 1, 2]),
+            ([65_536, 2, 1], [32_768, 65_536, 32_768, 2, 2]),
+            ([100, 2, 1], [0, 100, 100, 2, 1]),
+            ([65_537, 0, 1], [0, 65_537, 65_535, 0, 1]),
+            ([65_537, 1, 0], [0, 65_537, 65_535, 1, 0]),
+            ([65_537, 1, 2], [0, 65_537, 65_535, 1, 2]),
+            ([1, 65_537, 1], [0, 1, 1, 65_535, 1]),
+            ([u32::MAX, 1, 1], [0, u32::MAX, 0, 0, 0]),
+        ];
+        let records = cases.len() as u32;
+        let (title, data) = host.shared_buffer(u64::from(records) * 12).unwrap();
         let list = host.new_list().unwrap();
-        // Record 0: 115,200 x 1 x 1 -> [57600, 115200, 57600, 1, 2]
-        // Record 1: 65,537 x 1 x 1  -> [32769, 65537, 32769, 1, 2]
-        // Record 2: 100 x 2 x 1     -> [0, 100, 100, 2, 1]
-        let input = [115_200u32, 1, 1, 65_537, 1, 1, 100, 2, 1];
-        // SAFETY: mapped buffers kept alive until execute finishes.
+        // SAFETY: the mapping covers one triple for each synthetic record.
         unsafe {
-            let in_u32 = in_ptr.cast::<u32>();
-            for (i, &w) in input.iter().enumerate() {
-                in_u32.add(i).write_volatile(w);
+            for (i, (input, _)) in cases.iter().enumerate() {
+                data.cast::<[u32; 3]>().add(i).write(*input);
             }
-            let out = super::bound(
-                &list,
-                title.GetGPUVirtualAddress(),
-                (2, 12, records),
-                true,
-            ).unwrap();
-            super::done(&list, &out);
-            list.close();
-            host.execute(&[&list]);
-            let mut p = std::ptr::null_mut();
-            out.Map(0, None, Some(&mut p)).unwrap();
-            let out_u32 = p.cast::<u32>();
-            let got: Vec<u32> = (0..15).map(|i| out_u32.add(i).read_volatile()).collect();
-            assert_eq!(
-                got,
-                [
-                    57_600, 115_200, 57_600, 1, 2, // record 0
-                    32_769, 65_537, 32_769, 1, 2,  // record 1
-                    0, 100, 100, 2, 1,             // record 2
-                ]
-            );
+        }
+        // SAFETY: title is a live D3D12 buffer.
+        let address = unsafe { title.GetGPUVirtualAddress() };
+        let out = super::bound(&list, address, (2, 12, records), true).unwrap();
+        super::done(&list, &out);
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: the output mapping covers five words per completed record.
+        unsafe {
+            let mut mapped = std::ptr::null_mut();
+            out.Map(0, None, Some(&mut mapped)).unwrap();
+            for (i, (input, expected)) in cases.iter().enumerate() {
+                let got = mapped.cast::<[u32; 5]>().add(i).read();
+                assert_eq!(got, *expected, "spread record for {input:?}");
+            }
+            out.Unmap(0, None);
         }
     }
 }

@@ -1125,13 +1125,11 @@ impl State {
                 .host
                 .user_data
                 .iter()
-                .any(|u| u.slot == victory_shader::emit::DISPATCH_SLOT)
+                .any(|u| u.slot == victory_shader::emit::DISPATCH_SLOT && u.dword == 0)
         });
         let (row, asked, gx, gy, gz) = spread_groups(x, y, z, can_spread);
-        if gx > 65_535 || gy > 65_535 || gz > 65_535 {
-            once!(
-                "dispatch groups ({gx}, {gy}, {gz}) exceed D3D12 limit 65,535 (spread: {can_spread})"
-            );
+        if gy != y || (row == 0 && (gx != x || gz != z)) {
+            once!(x, y, z, "dispatch dimensions clamped to the D3D12 group limit (65,535)");
         }
         self.dispatch_spread = [row, asked];
         let bound = self.bind(list, p, true);
@@ -1865,7 +1863,10 @@ impl State {
             if always || crate::capture::dump_on() {
                 let count = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
                 let name = crate::pipeline::shaders_of(pipeline);
-                crate::capture::read_indirect(list, (&clamped, 0), count, (kind, stride, max), name, always);
+                let (record_stride, prefix) = if is_spread { (20, 8) } else { (stride, 0) };
+                crate::capture::read_indirect(
+                    list, (&clamped, 0), count, (kind, record_stride, max, prefix), name, always,
+                );
             }
         }
         crate::indirect::done(list, &clamped);
