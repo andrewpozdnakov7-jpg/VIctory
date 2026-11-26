@@ -471,21 +471,8 @@ pub fn emit_with(
     for e in &mut prims {
         e.interp = 1;
     }
-    // A mesh group's id arrives multiplied by max(threads, vertices,
-    // primitives) (the code divides by that); the thread count is in PSV0
-    // from runtime info version 2 on.
-    // shortcut: older containers fall back to the group's lane count, right
-    // when the HLSL group fills its waves (Grand Theft Auto VI's do).
     let mesh_stride = match &native.io {
-        crate::native::StageIo::Ms(ms) => {
-            let psv = c.part(FourCC::PSV0).map(|p| p.data);
-            let threads = psv
-                .filter(|d| crate::dxbc::u32_at(d, 0).is_ok_and(|n| n >= 48))
-                .and_then(|d| crate::dxbc::u32_at(d, 4 + 36).ok());
-            threads.map_or(ms.threads, |t| {
-                t.max(ms.max_vertices).max(ms.max_primitives)
-            })
-        }
+        crate::native::StageIo::Ms(ms) => mesh_stride(c, ms),
         _ => 0,
     };
     let parts = |st, res| lower::Parts {
@@ -538,6 +525,27 @@ pub fn emit_with(
         heap_writes: l.heap_writes,
         view_marks: l.view_marks,
     })
+}
+
+/// Stride multiplying `SV_GroupID.x` in a console mesh shader's `v5` input:
+/// `max(threads, vertices, primitives)` (the code divides by that). The HLSL
+/// thread count is `NumThreadsX * NumThreadsY * NumThreadsZ` in `PSV0` from
+/// runtime info version 2 on.
+// shortcut: older containers fall back to the group's lane count, right when
+// the HLSL group fills its waves (Grand Theft Auto VI's do).
+fn mesh_stride(c: &Container, ms: &crate::native::MeshIo) -> u32 {
+    let threads = c
+        .part(FourCC::PSV0)
+        .map(|p| p.data)
+        .filter(|d| crate::dxbc::u32_at(d, 0).is_ok_and(|n| n >= 48))
+        .and_then(|d| {
+            let x = crate::dxbc::u32_at(d, 4 + 36).ok()?;
+            let y = crate::dxbc::u32_at(d, 4 + 40).ok()?;
+            let z = crate::dxbc::u32_at(d, 4 + 44).ok()?;
+            x.checked_mul(y)?.checked_mul(z).filter(|&n| n > 0)
+        })
+        .unwrap_or(ms.threads);
+    threads.max(ms.max_vertices).max(ms.max_primitives)
 }
 
 /// The rows of an `ISG1`/`OSG1` part.
@@ -1305,6 +1313,281 @@ mod tests {
         }
     }
 
+    /// `mesh_stride` multiplies all three `PSVRuntimeInfo2` thread dimensions
+    /// (`NumThreadsX * NumThreadsY * NumThreadsZ`) and still takes the maximum
+    /// with `max_vertices` and `max_primitives` when `PSV0` is absent, older
+    /// than runtime info version 2, or leaves the dimensions zeroed.
+    #[test]
+    fn mesh_stride_multiplies_psv_thread_dimensions_and_applies_output_maxima() {
+        let psv = |info_size: u32, threads: Option<[u32; 3]>| {
+            let mut out = vec![0u8; 4 + info_size as usize];
+            out[0..4].copy_from_slice(&info_size.to_le_bytes());
+            if let Some(dims) = threads {
+                for (k, n) in dims.into_iter().enumerate() {
+                    out[4 + 36 + 4 * k..4 + 40 + 4 * k].copy_from_slice(&n.to_le_bytes());
+                }
+            }
+            out
+        };
+        let stride = |psv0: Option<&[u8]>, threads, max_vertices, max_primitives| {
+            let parts: Vec<(FourCC, &[u8])> = psv0.map(|d| (FourCC::PSV0, d)).into_iter().collect();
+            let bytes = crate::dxbc::build(&parts);
+            let c = Container::parse(&bytes).unwrap();
+            let ms = crate::native::MeshIo {
+                outputs: vec![],
+                clip_cntl: 0,
+                threads,
+                max_vertices,
+                max_primitives,
+                topology: 2,
+                lds_bytes: 0,
+            };
+            super::mesh_stride(&c, &ms)
+        };
+
+        // 1D partial wave uses exact PSV0 thread count rather than wave-rounded ms.threads.
+        assert_eq!(stride(Some(&psv(48, Some([24, 1, 1]))), 32, 16, 16), 24);
+        // 2D, 3D (PSV0 v3 = 52 bytes), and Z-only thread groups multiply X * Y * Z.
+        assert_eq!(stride(Some(&psv(48, Some([8, 8, 1]))), 64, 32, 32), 64);
+        assert_eq!(stride(Some(&psv(52, Some([4, 4, 4]))), 64, 16, 16), 64);
+        assert_eq!(stride(Some(&psv(48, Some([1, 1, 128]))), 128, 3, 1), 128);
+        // Output maxima still dominate when larger than X * Y * Z.
+        assert_eq!(stride(Some(&psv(48, Some([8, 4, 1]))), 32, 64, 128), 128);
+        // Missing or pre-v2 PSV0 falls back to ms.threads and still applies output maxima.
+        assert_eq!(stride(None, 64, 128, 256), 256);
+        assert_eq!(stride(Some(&psv(36, None)), 64, 128, 32), 128);
+        // Zeroed or overflowing PSV0 dimensions fall back cleanly without panicking.
+        assert_eq!(stride(Some(&psv(48, Some([0, 0, 0]))), 64, 16, 16), 64);
+        assert_eq!(stride(Some(&psv(48, Some([0, 0, 0]))), 64, 128, 32), 128);
+        assert_eq!(
+            stride(Some(&psv(48, Some([u32::MAX, 2, 1]))), 64, 128, 32),
+            128
+        );
+    }
+
+    /// A console mesh shader whose group 1 draws a full-screen triangle only
+    /// when `v5` (`SV_GroupID.x * mesh_stride`) arrives multiplied by 64.
+    #[cfg(windows)]
+    fn group_one_stride64_mesh(
+        ms: crate::native::MeshIo,
+        psv0: Option<&[u8]>,
+    ) -> Result<HostShader, ShaderError> {
+        let body = [
+            0x7E04_0505u32, // v_readfirstlane_b32 s2, v5
+            0x9002_8602,    // s_lshr_b32 s2, s2, 6  (SV_GroupID.x = v5 / 64)
+            0xBF06_8102,    // s_cmp_eq_u32 s2, 1
+            0x8500_FF80,    // s_cselect_b32 s0, 0, CULL
+            CULL,
+            0x8800_FF00, // s_or_b32 s0, s0, TRIANGLE
+            TRIANGLE,
+            0xD765_0001, // v_mbcnt_lo_u32_b32 v1, -1, 0
+            0x0001_00C1,
+            0x3604_0281, // v_and_b32 v2, 1, v1
+            0x3606_0282, // v_and_b32 v3, 2, v1
+            0x7E04_0D02, // v_cvt_f32_u32 v2, v2
+            0x7E06_0D03, // v_cvt_f32_u32 v3, v3
+            0x1008_04F6, // v_mul_f32 v4, 4.0, v2
+            0x0608_08F3, // v_add_f32 v4, -1.0, v4
+            0x100A_06F4, // v_mul_f32 v5, 2.0, v3
+            0x060A_0AF3, // v_add_f32 v5, -1.0, v5
+            0x7E0C_02F0, // v_mov_b32 v6, 0.5
+            0x7E0E_02F2, // v_mov_b32 v7, 1.0
+            0x7E12_0200, // v_mov_b32 v9, s0
+            0xF800_0941, // exp prim v9, off, off, off done
+            0x0000_0009,
+            0xF800_08CF, // exp pos0 v4, v5, v6, v7 done
+            0x0706_0504,
+        ];
+        let mut words = Vec::new();
+        if ms.threads > 32 {
+            // Only wave 0 (lanes 0..31) exports when max_vertices/max_primitives < threads.
+            words.extend([
+                0x9001_9803,                     // s_lshr_b32 s1, s3, 24 (wave index)
+                0xBF06_8001,                     // s_cmp_eq_u32 s1, 0
+                0xBF84_0000 | body.len() as u32, // s_cbranch_scc0 -> s_endpgm
+            ]);
+        }
+        words.extend(body);
+        words.push(0xBF81_0000); // s_endpgm
+        let native = NativeProgram {
+            stage: HwStage::Ms,
+            wave64: false,
+            vgprs: 10,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ms(ms),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let position = SigElement {
+            name: "SV_Position".into(),
+            index: 0,
+            kind: 3,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 0xF,
+            half: false,
+        };
+        let osg1 = container::signature(&[position], false);
+        let mut parts: Vec<(FourCC, &[u8])> = vec![(FourCC::OSG1, &osg1)];
+        if let Some(psv) = psv0 {
+            parts.push((FourCC::PSV0, psv));
+        }
+        let bytes = crate::dxbc::build(&parts);
+        let c = Container::parse(&bytes)?;
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs)?;
+        let st = structure::structure(&p)?;
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
+        let io = io::raise(&p, &native)?;
+        emit(&c, &native, &p, &st, &io, &res)
+    }
+
+    /// A 2D/3D mesh thread group (`[numthreads(8, 8, 1)]` or `[numthreads(4, 4, 4)]`)
+    /// has `NumThreadsX * NumThreadsY * NumThreadsZ = 64` threads in `PSV0`,
+    /// and a container without `PSV0` v2+ still takes `max(threads, max_vertices,
+    /// max_primitives)`. Reading only `NumThreadsX` or omitting the output maxima
+    /// on fallback gave `mesh_stride = 32`, making group 1 compute `32 / 64 = 0`
+    /// and cull its triangle.
+    #[test]
+    #[cfg(windows)]
+    fn mesh_group_stride_handles_multidim_psv_and_output_maxima_fallback() {
+        use super::host::{Draw, Host, Root};
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_FEATURE_D3D12_OPTIONS7, D3D12_FEATURE_DATA_D3D12_OPTIONS7,
+            D3D12_MESH_SHADER_TIER_NOT_SUPPORTED, D3D12_SHADER_VISIBILITY_MESH,
+        };
+        let psv_v2 = |threads: [u32; 3]| {
+            let mut out = vec![0u8; 4 + 48];
+            out[0..4].copy_from_slice(&48u32.to_le_bytes());
+            for (k, n) in threads.into_iter().enumerate() {
+                out[4 + 36 + 4 * k..4 + 40 + 4 * k].copy_from_slice(&n.to_le_bytes());
+            }
+            out
+        };
+        let psv_2d = psv_v2([8, 8, 1]);
+        let psv_3d = psv_v2([4, 4, 4]);
+        let cases: [(&str, crate::native::MeshIo, Option<&[u8]>); 3] = [
+            (
+                "2D [numthreads(8,8,1)]",
+                crate::native::MeshIo {
+                    outputs: vec![],
+                    clip_cntl: 0,
+                    threads: 64,
+                    max_vertices: 32,
+                    max_primitives: 32,
+                    topology: 2,
+                    lds_bytes: 0,
+                },
+                Some(&psv_2d),
+            ),
+            (
+                "3D [numthreads(4,4,4)]",
+                crate::native::MeshIo {
+                    outputs: vec![],
+                    clip_cntl: 0,
+                    threads: 64,
+                    max_vertices: 32,
+                    max_primitives: 32,
+                    topology: 2,
+                    lds_bytes: 0,
+                },
+                Some(&psv_3d),
+            ),
+            (
+                "no PSV0 with max_vertices=64 > threads=32",
+                crate::native::MeshIo {
+                    outputs: vec![],
+                    clip_cntl: 0,
+                    threads: 32,
+                    max_vertices: 64,
+                    max_primitives: 32,
+                    topology: 2,
+                    lds_bytes: 0,
+                },
+                None,
+            ),
+        ];
+
+        let _one = super::valu_tests::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut validator = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        )
+        .ok();
+        let shaders: Vec<(&str, HostShader)> = cases
+            .into_iter()
+            .map(|(name, ms, psv)| {
+                let shader =
+                    group_one_stride64_mesh(ms, psv).unwrap_or_else(|e| panic!("{name}: {e}"));
+                if let Some(v) = validator.as_mut() {
+                    v.validate(&mut shader.dxil.clone())
+                        .unwrap_or_else(|e| panic!("{name}: validate: {e}"));
+                }
+                (name, shader)
+            })
+            .collect();
+
+        let ps = constant_color();
+        for (label, warp) in [("hardware", false), ("warp", true)] {
+            let Ok(host) = Host::new(warp) else {
+                continue;
+            };
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS7::default();
+            // SAFETY: the query writes the structure of the given size.
+            let queried = unsafe {
+                host.device.CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS7,
+                    (&raw mut options).cast(),
+                    size_of_val(&options) as u32,
+                )
+            };
+            if queried.is_err() || options.MeshShaderTier == D3D12_MESH_SHADER_TIER_NOT_SUPPORTED {
+                continue;
+            }
+            for (name, ms) in &shaders {
+                let root = host
+                    .root_signature_for(&[(ms, D3D12_SHADER_VISIBILITY_MESH)])
+                    .unwrap();
+                let pso = host
+                    .mesh_pipeline_with(&root, &ms.dxil, &ps)
+                    .unwrap_or_else(|e| panic!("{label} ({name}): mesh pipeline: {e}"));
+                let texels = host
+                    .draw(
+                        &root,
+                        &pso,
+                        &Draw {
+                            roots: vec![(0, Root::Constants(vec![0]))],
+                            textures: &[],
+                            samplers: &[],
+                            vertices: &[],
+                            stride: 0,
+                            size: (16, 16),
+                            mesh_groups: 2,
+                        },
+                    )
+                    .unwrap_or_else(|e| panic!("{label} ({name}): draw: {e}"));
+                let lit = texels.iter().filter(|t| t[3] != 0.0).count();
+                assert!(
+                    texels.iter().all(|t| *t == [1.0, 0.5, 0.25, 1.0]),
+                    "{label} ({name}): expected group 1 to light all 256 texels, got {lit}"
+                );
+            }
+            eprintln!("{label}: mesh group stride cases drew");
+        }
+        for (name, shader) in &shaders {
+            if let Some(ir) = dump_dxil(&shader.dxil) {
+                assert!(
+                    ir.lines()
+                        .any(|l| l.contains("mul i32") && l.trim_end().ends_with(", 64")),
+                    "{name}: expected `mul i32 ..., 64` in DXIL:\n{ir}"
+                );
+            }
+        }
+    }
+
     /// A pixel shader interpolating at sample positions (PERSP_SAMPLE
     /// barycentrics, `SPI_PS_INPUT_ADDR` bit 0) runs at sample frequency:
     /// DXC's PSV0 says so in PSInfo.SampleFrequency (runtime info byte 1)
@@ -1630,7 +1913,11 @@ mod tests {
         if !dxc.exists() {
             return None;
         }
-        let file = std::env::temp_dir().join(format!("victory-interp-{}.dxil", std::process::id()));
+        let file = std::env::temp_dir().join(format!(
+            "victory-dxil-{}-{:?}.dxil",
+            std::process::id(),
+            std::thread::current().id()
+        ));
         std::fs::write(&file, container).ok()?;
         let out = std::process::Command::new(dxc)
             .arg("-dumpbin")
