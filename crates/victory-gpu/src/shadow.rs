@@ -1557,6 +1557,146 @@ pub(crate) mod tests {
         unregister(p, p as u64);
     }
 
+
+    /// Compare the production whole-range fallback with a mark-only replay
+    /// of a fully marked range. The child process isolates the global bitmap.
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn withheld_view_page_refresh_on_warp() {
+        const CHILD: &str = "VICTORY_TEST_WITHHELD_PAGES_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .env(CHILD, "1")
+                .env("VICTORY_D3D12_WARP", "1")
+                .args([
+                    "--exact",
+                    "shadow::tests::withheld_view_page_refresh_on_warp",
+                    "--nocapture",
+                ])
+                .output()
+                .unwrap();
+            print!("{}", String::from_utf8_lossy(&output.stdout));
+            eprint!("{}", String::from_utf8_lossy(&output.stderr));
+            assert!(output.status.success(), "WARP fixture failed");
+            return;
+        }
+
+        let Some(host) = host() else {
+            eprintln!("WARP unavailable; skipped");
+            return;
+        };
+        let limit = victory_shader::emit::VIEW_WRITE_BITS;
+        // Use the same fixture with #2269 applied.
+        let tail_mark_survives = std::env::var_os("VICTORY_TEST_WITHHELD_EXPECT_TAIL_MARK").is_some();
+        for (label, writes, tail) in [
+            ("marked", &[(1, true)][..], false),
+            ("unmarked", &[(2, false)][..], false),
+            ("mixed", &[(1, true), (2, false)][..], false),
+            ("last dword", &[(1, true)][..], true),
+        ] {
+            for allow_selective in [false, true] {
+                let marks_only = allow_selective && writes.iter().all(|&(_, marked)| marked);
+                let p = crate::watch::tests::pool(4);
+                let len = 4 * PAGE;
+                let initial = [0x10u32, 0x20, 0x30, 0x40];
+                // SAFETY: the first dword of each of the four test pages.
+                unsafe {
+                    for (page, value) in initial.into_iter().enumerate() {
+                        ((p + page * PAGE) as *mut u32).write(value);
+                    }
+                }
+                {
+                    let mut allocator = marks();
+                    assert!(allocator.owners.is_empty(), "isolated test mark allocator");
+                    *allocator = Marks {
+                        end: if tail { limit - 32 } else { 0 },
+                        ..Marks::default()
+                    };
+                }
+                register(p, p as u64, len as u64);
+                let copy = find(p as u64, len as u64).unwrap();
+                let first = copy.marks.expect("the four pages have mark bits");
+                assert_eq!(first / 32, if tail { limit / 32 - 1 } else { 0 });
+                let word = (first / 32) as u64 * 4;
+                let mut bits = 0;
+                for &(page, marked) in writes {
+                    if marked {
+                        bits |= 1 << ((first + page as u32) % 32);
+                    }
+                }
+                let gpu_mark = bitmap(true).unwrap();
+                let (input, data) = host.shared_buffer(12).unwrap();
+                // SAFETY: the input mapping holds three dwords.
+                unsafe { data.cast::<[u32; 3]>().write([0x99, 0x88, bits]) };
+                let writer = host.new_list().unwrap();
+                writer.defer_missed(|| true);
+                if marks_only {
+                    // Replay the per-page policy without changing production
+                    // code. The real bitmap drain still runs in execute.
+                    assert_eq!(copy.update(p, len), len);
+                    copy.writing(p, len, true);
+                } else {
+                    let _memory = writer.writer_uses_memory(true);
+                    copy.refresh(&writer, p as u64, len as u64);
+                    for &(_, marked) in writes {
+                        copy.gpu_writes(&writer, p as u64, len as u64, marked);
+                    }
+                }
+                // SAFETY: live buffers, fitting ranges, and an open copy list.
+                unsafe {
+                    for &(page, _) in writes {
+                        writer.list.CopyBufferRegion(
+                            &copy.buffer, (page * PAGE) as u64, &input, (page - 1) as u64 * 4, 4,
+                        );
+                    }
+                    // The GPU writes the real mark dword before retirement.
+                    writer.list.CopyBufferRegion(&gpu_mark._buffer, word, &input, 8, 4);
+                }
+                writer.close();
+                host.execute(&[&writer]);
+                if marks_only {
+                    copy.keep_writes(p, len);
+                }
+
+                let title: [u32; 4] = std::array::from_fn(|page| {
+                    // SAFETY: the writer has finished and the title backing is live.
+                    unsafe { ((p + page * PAGE) as *const u32).read() }
+                });
+                assert_eq!(title, initial, "withheld data reached title memory");
+
+                let refreshed = copy.update(p, len);
+                assert_eq!(refreshed % PAGE, 0);
+                let pages = refreshed / PAGE;
+                let (out, data) = host.shared_buffer(16).unwrap();
+                let reader = host.new_list().unwrap();
+                // SAFETY: the entire copy and the four readback words are live.
+                unsafe {
+                    for page in 0..4u64 {
+                        reader.list.CopyBufferRegion(
+                            &out, page * 4, &copy.buffer, page * PAGE as u64, 4,
+                        );
+                    }
+                }
+                reader.close();
+                host.execute(&[&reader]);
+                // SAFETY: the finished readback is four dwords.
+                let got = unsafe { data.cast::<[u32; 4]>().read() };
+
+                let lost = marks_only && tail && !tail_mark_survives;
+                let expected_pages = if !marks_only { 4 } else { usize::from(!lost) };
+                let expected = if lost { [0x10, 0x99, 0x30, 0x40] } else { initial };
+                println!("{label}, selective={allow_selective}: {pages} refreshed, GPU={got:02x?}");
+                assert_eq!(pages, expected_pages, "{label}, selective={allow_selective}");
+                assert_eq!(got, expected, "{label}, selective={allow_selective}");
+
+                drop((reader, writer));
+                unregister(p, p as u64);
+                drop(copy);
+                crate::watch::tests::free(p);
+            }
+        }
+    }
+
     /// What a frame withheld leaves every host copy of its memory at the
     /// frame's end (run textures9's shape): in frame N a program using title
     /// memory writes a record into the copies and the frame misses, so it
