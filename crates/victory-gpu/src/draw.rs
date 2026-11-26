@@ -526,11 +526,12 @@ impl State {
     /// Brings the host list up to date for a draw; false if the draw cannot
     /// run on the host.
     fn prepare(&mut self, list: &HostList, indexed: bool) -> bool {
-        self.prepare_for(list, indexed, false)
+        self.prepare_for(list, indexed, None)
     }
 
-    /// As [`State::prepare`], for draws (`mesh` false) or mesh dispatches.
-    fn prepare_for(&mut self, list: &HostList, indexed: bool, mesh: bool) -> bool {
+    /// As [`State::prepare`], with a grid supplied for mesh dispatches.
+    fn prepare_for(&mut self, list: &HostList, indexed: bool, mesh_grid: Option<u32>) -> bool {
+        let mesh = mesh_grid.is_some();
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             return false;
@@ -543,7 +544,7 @@ impl State {
             not_run("another kind of pipeline");
             return false;
         }
-        if !self.bind(list, p, false) {
+        if !self.bind(list, p, false, mesh_grid.unwrap_or(0)) {
             return false;
         }
         let l = &list.list;
@@ -613,7 +614,7 @@ impl State {
     /// descriptors its tables hold.
     /// False if the draw or dispatch must not run: a table it reads could
     /// not be made.
-    fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+    fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool, mesh_grid: u32) -> bool {
         // What its shaders write is withheld only if the program uses title
         // memory and a list using it misses (`crate::memory::withholding`).
         let _writer = list.writer_uses_memory(p.stages.iter().any(|s| s.memory.is_some()));
@@ -750,6 +751,10 @@ impl State {
             if let Some((param, dwords)) = stage.user_data {
                 let mut values = vec![0u32; dwords as usize];
                 for u in &t.host.user_data {
+                    if u.slot == victory_shader::emit::DIRECT_MESH_GRID_SLOT {
+                        values[u.index as usize] = mesh_grid;
+                        continue;
+                    }
                     if u.root == RootType::Descriptor
                         && u.dword == 0
                         && let Some(Root::View(address)) =
@@ -1114,7 +1119,7 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
-        if !self.bind(list, p, true) {
+        if !self.bind(list, p, true, 0) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             dropped(list, self.pipeline, "dispatch");
@@ -1200,7 +1205,9 @@ impl State {
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
-        let ran = self.prepare_for(list, false, true)
+        // D3D12 limits each axis to 65,535 groups.
+        let grid = (x & 0xffff) | (y << 16);
+        let ran = self.prepare_for(list, false, Some(grid))
             && match list.list.cast::<ID3D12GraphicsCommandList6>() {
                 Ok(l6) => {
                     #[cfg(feature = "diagnostics")]
@@ -1776,9 +1783,9 @@ impl State {
                     false
                 }) && self.prepare(list, kind == INDEXED)
             }
-            MESH => self.prepare_for(list, false, true),
+            MESH => self.prepare_for(list, false, Some(0)),
             DISPATCH => match crate::pipeline::host_pipeline(self.pipeline as This) {
-                Some(p) if p.compute => self.bind(list, p, true),
+                Some(p) if p.compute => self.bind(list, p, true, 0),
                 _ => false,
             },
             _ => false,
@@ -3473,7 +3480,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         let mut state = State::default();
         state.set_heaps(&[heap]);
         state.set_table(true, 0, title_heap.start);
-        assert!(state.bind(&list, &hp, true));
+        assert!(state.bind(&list, &hp, true, 0));
         assert!(
             crate::twin::COPIES.load(Ordering::Relaxed) > copies_before,
             "depth twin conversion ran during State::bind"
