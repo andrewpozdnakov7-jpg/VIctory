@@ -237,7 +237,7 @@ use crate::{ShaderError, io, ir, resource, structure};
 pub use sampler::StaticSampler;
 pub use shader::{
     HEAP_SAMPLERS, HEAP_VIEWS, MEMORY_SPACE, NULL_BUFFER_VIEW, ROOT_CBV_SPACE, SAMPLER_SPACE,
-    USER_DATA_SPACE, VIEW_INTEGER, VIEW_MARK_NONE, VIEW_MARKS, VIEW_READS, VIEW_SIGNED, VIEW_STRIDE_BITS,
+    USER_DATA_SPACE, VIEW_FLOAT_TEXTURE, VIEW_INTEGER, VIEW_MARK_NONE, VIEW_MARKS, VIEW_READS, VIEW_SIGNED, VIEW_STRIDE_BITS,
     VIEW_STRIDES, VIEW_WRITE_BITS, VIEW_WRITES,
 };
 
@@ -262,6 +262,15 @@ pub fn loop_limit() -> u32 {
             lower::LOOP_LIMIT
         }
     })
+}
+
+/// With `VICTORY_NAN_SCRUB=1` (off by default), pixel colour exports and stores
+/// to explicitly typed float texture UAVs replace NaN and +/-infinity with
+/// `0.0` so bad values do not
+/// spread into black or blown-out patches across bloom, blur, or temporal passes.
+pub fn nan_scrub() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_NAN_SCRUB").is_some_and(|v| v == "1"))
 }
 
 /// `VICTORY_SHADER_LOOP_LIMIT`'s value; the default when it is unset,

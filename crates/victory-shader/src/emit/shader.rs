@@ -19,11 +19,13 @@ pub const ROOT_CBV_SPACE: u32 = 1;
 pub const VIEW_STRIDES: u8 = 255;
 /// The bits of a view-stride table dword holding the stride.
 pub const VIEW_STRIDE_BITS: u32 = (1 << 30) - 1;
-/// In a view-stride table dword: a typed buffer view of an integer format
+/// In a view-stride table dword: a typed buffer or texture UAV of an integer format
 /// (`UINT` or `SINT`), whose 16-bit typed accesses (`_d16`) pass bits.
 pub const VIEW_INTEGER: u32 = 1 << 31;
 /// With [`VIEW_INTEGER`]: a signed (`SINT`) format.
 pub const VIEW_SIGNED: u32 = 1 << 30;
+/// With `VIEW_INTEGER` clear: a texture UAV with a known float or normalized format.
+pub const VIEW_FLOAT_TEXTURE: u32 = VIEW_SIGNED;
 /// Where the title-memory page table is bound: `t0` (a raw root SRV) in
 /// this space (see `emit` "Title memory").
 pub const MEMORY_SPACE: u32 = 2;

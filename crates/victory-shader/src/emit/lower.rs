@@ -21,6 +21,7 @@ use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 mod bvh;
+mod nan_scrub;
 #[cfg(test)]
 mod image_store_tests;
 
@@ -8653,6 +8654,7 @@ impl<'a> Lower<'a> {
                 };
                 slot += 1;
             }
+            self.scrub_texture_store(h, &mut vals_f);
             let void = self.s.t.void;
             if let Some((int, _)) = integer {
                 let h_int = self.handle(site, src, false, (kind | 0x1000, 0x405))?;
@@ -10140,13 +10142,18 @@ impl<'a> Lower<'a> {
             let el = &mut elements(self, primitive)[id];
             el.usage |= 1 << col;
             let (suffix, x) = match el.comp {
-                9 if half.is_some() => (".f32", self.as_float(x)),
+                9 if half.is_some() => {
+                    let f = self.as_float(x);
+                    let colour = self.s.pixel && matches!(e.target, Target::Color(_));
+                    (".f32", if colour { self.scrub_nan(f) } else { f })
+                }
                 9 => {
                     let f = match self.floats.get(&value) {
                         Some(&f) => f,
                         None => self.as_float(x),
                     };
-                    (".f32", f)
+                    let colour = self.s.pixel && matches!(e.target, Target::Color(_));
+                    (".f32", if colour { self.scrub_nan(f) } else { f })
                 }
                 _ => (".i32", x),
             };

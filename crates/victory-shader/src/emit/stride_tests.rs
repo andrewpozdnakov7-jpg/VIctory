@@ -1003,3 +1003,127 @@ fn partial_dmask_image_stores_write_typed_texture_uavs() {
         assert_eq!(words[0], f32s, "{label} R32_FLOAT dmask=0x0 no-op");
     }
 }
+
+#[test]
+fn nan_scrub_image_stores_keep_integer_payloads() {
+    let code = [
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF40C_0202,
+        0xFA00_0000, // texture UAV -> s[8:15]
+        0xBE86_0301, // s_mov_b32 s6, s1
+        0xBE87_0380, // s_mov_b32 s7, 0
+        0xF408_0403,
+        0xFA00_0000, // raw input SRV -> s[16:19]
+        0x340A_0084, // v5 = lane * 16
+        0x7E0C_0300, // v6 = x
+        0x7E0E_0280, // v7 = y = 0
+        0xBF8C_0000,
+        0xE038_1000,
+        0x8004_0105, // buffer_load_dwordx4 v[1:4], [v5]
+        0xBF8C_0000,
+        0xF020_1F08,
+        0x0002_0106, // image_store v[1:4], v[6:7], dmask 0xF
+        0xBF81_0000,
+    ];
+    let shader = build(
+        &code,
+        vec![param(RootType::Table, 0), param(RootType::Table, 1)],
+        vec![
+            entry(ResourceType::Uav, 8, 0),
+            entry(ResourceType::Srv, 4, 1),
+        ],
+        8,
+    );
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let host = Host::new(false)
+        .or_else(|_| Host::new(true))
+        .expect("SM 6.6 test device");
+    let (root, pipeline) = host
+        .compute_pipeline(&shader)
+        .expect("image store pipeline");
+    let inputs = [
+        0x7FC0_1234,
+        0x7F80_0021,
+        0x7F80_0000,
+        0xFF80_0000,
+        0x8000_0000,
+        0x3F80_0000,
+        0xC000_0000,
+        0x7F7F_FFFF,
+    ];
+    let tail = [0x3F00_0000, 0xC000_0000, 0x3F80_0000];
+    let data: Vec<_> = inputs
+        .iter()
+        .flat_map(|&x| [x, tail[0], tail[1], tail[2]])
+        .collect();
+    let enabled = super::nan_scrub();
+    let mut all_match = true;
+    for (format, output, channels, flags) in [
+        (
+            "float",
+            View::TextureUav(8, 1),
+            4,
+            super::VIEW_FLOAT_TEXTURE,
+        ),
+        ("unknown", View::TextureUav(8, 1), 4, 0),
+        ("integer", View::UintTextureUav(8, 1), 1, VIEW_INTEGER),
+    ] {
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            ud[u.index as usize] = 32 * u32::from(u.slot);
+        }
+        let mut roots = vec![(0, Root::Constants(ud))];
+        if !shader.root_srvs.is_empty() {
+            assert_eq!(shader.root_srvs, [VIEW_STRIDES]);
+            roots.push((
+                1,
+                Root::View {
+                    srv: true,
+                    data: vec![flags, 4],
+                },
+            ));
+        }
+        let views = [
+            output,
+            View::Buffer {
+                data: &data,
+                stride: Stride::Raw,
+            },
+        ];
+        let out = host
+            .dispatch(
+                &root,
+                &pipeline,
+                &Dispatch {
+                    roots,
+                    views: &views,
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .expect("image store readback");
+        let first = out[0]
+            .chunks_exact(channels)
+            .map(|p| p[0])
+            .collect::<Vec<_>>();
+        let mut wanted = inputs;
+        if enabled && format == "float" {
+            wanted[..4].fill(0);
+        }
+        let matches = first.iter().zip(wanted).filter(|(a, b)| **a == *b).count();
+        println!(
+            "scrub image enabled={enabled} format={format} matches={matches}/8 outputs={first:08x?}"
+        );
+        if channels == 4 {
+            assert!(out[0].chunks_exact(channels).all(|p| p[1..] == tail));
+        }
+        all_match &= first == wanted;
+    }
+    assert!(
+        all_match,
+        "the image scrub must use the known float view kind"
+    );
+}

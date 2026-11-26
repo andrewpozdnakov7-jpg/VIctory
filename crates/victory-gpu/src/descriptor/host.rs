@@ -1011,7 +1011,7 @@ fn view_stride(view: &View) -> u32 {
 /// Record the format kind for typed buffers and texture UAVs. Shader
 /// stores use it to extend integer d16 values before writing.
 fn view_kind(view: &View) -> u32 {
-    use victory_shader::emit::{VIEW_INTEGER, VIEW_SIGNED};
+    use victory_shader::emit::{VIEW_FLOAT_TEXTURE, VIEW_INTEGER, VIEW_SIGNED};
     let (unordered, words): (bool, &[u32; 10]) = match view {
         View::Shader(_, Some(desc)) => (false, desc),
         View::Unordered(_, _, Some(desc)) => (true, desc),
@@ -1037,11 +1037,26 @@ fn view_kind(view: &View) -> u32 {
         (true, 2..=5 | 8) => true,
         _ => false,
     };
-    match typed.then(|| integer_format(crate::resource::pc_format(words[0]))).flatten() {
+    if !typed {
+        return 0;
+    }
+    let format = crate::resource::pc_format(words[0]);
+    match integer_format(format) {
         Some(true) => VIEW_INTEGER | VIEW_SIGNED,
         Some(false) => VIEW_INTEGER,
+        None if unordered && words[1] != 1 && float_texture_format(format) => VIEW_FLOAT_TEXTURE,
         None => 0,
     }
+}
+
+/// Explicit floating-point or normalized texture formats. Unknown formats
+/// carry no float tag so the diagnostic shader leaves their values intact.
+fn float_texture_format(format: u32) -> bool {
+    matches!(
+        format,
+        2 | 6 | 10 | 11 | 13 | 16 | 24 | 26 | 28 | 31 | 34 | 35 | 37 | 41 | 49 | 51
+            | 54 | 56 | 58 | 61 | 63 | 65 | 67 | 87 | 88
+    )
 }
 
 /// Whether a DXGI format is an integer one, and if so whether signed:
@@ -1849,8 +1864,14 @@ mod tests {
 
     #[test]
     fn explicit_integer_texture_uavs_have_kind_bits_without_a_buffer_stride() {
-        use victory_shader::emit::{VIEW_INTEGER, VIEW_SIGNED};
-        for (format, bits) in [(36, VIEW_INTEGER), (38, VIEW_INTEGER | VIEW_SIGNED), (34, 0)] {
+        use victory_shader::emit::{VIEW_FLOAT_TEXTURE, VIEW_INTEGER, VIEW_SIGNED};
+        for (format, bits) in [
+            (36, VIEW_INTEGER),
+            (38, VIEW_INTEGER | VIEW_SIGNED),
+            (34, VIEW_FLOAT_TEXTURE),
+            (35, VIEW_FLOAT_TEXTURE),
+            (0, 0),
+        ] {
             let words = [format, 4, 0, 0, 0, 0, 0, 0, 0, 0];
             let view = View::Unordered(0, 0, Some(words));
             assert_eq!((view_stride(&view), view_kind(&view)), (0, bits));

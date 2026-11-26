@@ -64,18 +64,24 @@ fn build() -> &'static [u8; 32] {
                 "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"
             );
         }
-        key(victory_shader::SOURCE_HASH, ENCODING, limit)
+        key(
+            victory_shader::SOURCE_HASH,
+            ENCODING,
+            limit,
+            victory_shader::emit::nan_scrub(),
+        )
     })
 }
 
 /// This file, whose `encode` and `decode` define the entries.
 const ENCODING: &[u8] = include_bytes!("shader_cache.rs");
 
-fn key(translator: &str, encoding: &[u8], limit: u32) -> [u8; 32] {
+fn key(translator: &str, encoding: &[u8], limit: u32, nan_scrub: bool) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
     h.update(translator.as_bytes());
     h.update(blake3::hash(encoding).as_bytes());
     h.update(&limit.to_le_bytes());
+    h.update(&[u8::from(nan_scrub)]);
     *h.finalize().as_bytes()
 }
 
@@ -480,17 +486,19 @@ mod tests {
     /// written before it is read.
     #[test]
     fn the_key_covers_translator_encoding_and_settings() {
-        let k = key("0123456789abcdef", b"encoding", 1 << 20);
-        assert_eq!(k, key("0123456789abcdef", b"encoding", 1 << 20));
-        assert_ne!(k, key("0123456789abcdee", b"encoding", 1 << 20));
-        assert_ne!(k, key("0123456789abcdef", b"encoding.", 1 << 20));
-        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 19));
+        let k = key("0123456789abcdef", b"encoding", 1 << 20, false);
+        assert_eq!(k, key("0123456789abcdef", b"encoding", 1 << 20, false));
+        assert_ne!(k, key("0123456789abcdee", b"encoding", 1 << 20, false));
+        assert_ne!(k, key("0123456789abcdef", b"encoding.", 1 << 20, false));
+        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 19, false));
+        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 20, true));
         assert_eq!(
             *build(),
             key(
                 victory_shader::SOURCE_HASH,
                 ENCODING,
-                victory_shader::emit::loop_limit()
+                victory_shader::emit::loop_limit(),
+                victory_shader::emit::nan_scrub(),
             )
         );
         // The encoding part is this file as built.
