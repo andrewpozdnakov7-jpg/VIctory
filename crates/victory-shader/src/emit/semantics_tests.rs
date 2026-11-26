@@ -3181,3 +3181,63 @@ fn lds_out_of_bounds_reads_zero_and_drops_writes() {
         probe(masked, inputs, INT, |i| vec![if i[0] > i[1] { 0 } else { OLD }]),
     ]));
 }
+
+
+#[test]
+#[ignore = "exhaustive WARP diagnostic for #2160"]
+fn log_f32_dense_warp_sweep() {
+    const LO: u32 = 0x3F60_0000; // 0.875
+    const HI: u32 = 0x3F90_0000; // 1.125
+    const UNITY: u32 = 0x3F80_0000;
+    const BATCH: u32 = 1 << 18;
+
+    let _one = ONE_AT_A_TIME.lock().unwrap();
+    let body = [vop1(0x27, 5, v(1)), vop1(0x01, 6, v(1))];
+    let shader = lower_program(&program(&body, false)).unwrap();
+    let validator_path = super::validator::Validator::default_path().unwrap();
+    let mut validator = super::validator::Validator::load(Some(&validator_path)).unwrap();
+    validator.validate(&mut shader.dxil.clone()).unwrap();
+    let host = Host::new(true).expect("WARP SM 6.6");
+
+    let mut failures = 0;
+    let mut seen = 0;
+    let mut worst = (0.0, 0, 0);
+    for start in (LO..=HI).step_by(BATCH as usize) {
+        let end = (start + BATCH - 1).min(HI);
+        let inputs: Vec<[u32; 4]> = (start..=end).map(|bits| [bits, 0, 0, 0]).collect();
+        let readback = run(&host, &shader, &inputs, false).unwrap();
+        assert_eq!(readback.len(), inputs.len());
+        for ([bits, ..], [got, echoed, ..]) in inputs.into_iter().zip(readback) {
+            assert_eq!(echoed, bits, "work-item input readback");
+            seen += 1;
+            if bits == UNITY {
+                assert_eq!(got, 0, "the logarithm at unity returns +0");
+                continue;
+            }
+            let delta = f64::from(f32::from_bits(bits)) - 1.0;
+            let expected = delta.ln_1p() * std::f64::consts::LOG2_E;
+            // The spacing of f32 values in the reference's binade.
+            let magnitude_exponent = expected.to_bits() & 0x7FF0_0000_0000_0000;
+            let unit = f64::from_bits(magnitude_exponent - (23_u64 << 52));
+            let error = (f64::from(f32::from_bits(got)) - expected).abs() / unit;
+            assert!(error.is_finite(), "result for {bits:#010x}: {got:#010x}");
+            failures += u32::from(error > 1.0);
+            if error > worst.0 {
+                worst = (error, bits, got);
+            }
+        }
+    }
+    assert_eq!(seen, HI - LO + 1);
+    eprintln!(
+        "swept {seen} encodings, {failures} above 1 ULP; max {:.9} ULP at {:#010x}, got {:#010x}",
+        worst.0, worst.1, worst.2
+    );
+    let fallback = [LO - 1, HI + 1, 0, 0x8000_0000, 0x7F80_0000, 0x4000_0000];
+    let inputs = fallback.map(|bits| [bits, 0, 0, 0]);
+    let results = run(&host, &shader, &inputs, false).unwrap();
+    for (bits, [got, echoed, ..]) in fallback.into_iter().zip(results) {
+        assert_eq!(echoed, bits);
+        eprintln!("fallback {bits:#010x}: {got:#010x}");
+    }
+    assert_eq!(failures, 0);
+}
