@@ -72,21 +72,25 @@ The title's code needs AVX2 ([the README's requirements](../README.md#getting-st
 executable path in Wine's `Z:` form, and start from a working directory outside the
 repository too: vkd3d-proton writes `vkd3d-proton.cache` there. Check the paths with
 `wine "$VICTORY_EXE" config` (it exits nonzero when one violates the asset policy), then
-run. For example, one headless run:
+run. In this example, the launch stops if the directory setup or path check fails:
 
 ```sh
-mkdir -p ~/victory-run && cd ~/victory-run   # vkd3d-proton's cache lands here
-VICTORY_EXE='Z:\path\to\repo\target\x86_64-pc-windows-msvc\diag\victory.exe'
-GAME_DIR='Z:\path\to\game'
-TITLE_EXE="$GAME_DIR\\<the title's exe>"
-export VICTORY_GAME_DIR="$GAME_DIR"
-export VICTORY_CACHE_DIR='Z:\path\to\cache' VICTORY_DATA_DIR='Z:\path\to\data'
-export VK_DRIVER_FILES=/usr/share/vulkan/icd.d/nvidia_icd.json
-export DXVK_FILTER_DEVICE_NAME="RTX 5090" WINEDEBUG=-all
-wine "$VICTORY_EXE" config
-gamescope --backend headless -W 1920 -H 1080 -w 1920 -h 1080 \
-  --prefer-vk-device 10de:2b85 -- \
-  sh -c 'wine "$0" run "$1" --execute' "$VICTORY_EXE" "$TITLE_EXE"
+(
+  set -e
+  mkdir -p ~/victory-run
+  cd ~/victory-run   # vkd3d-proton's cache lands here
+  VICTORY_EXE='Z:\path\to\repo\target\x86_64-pc-windows-msvc\diag\victory.exe'
+  GAME_DIR='Z:\path\to\game'
+  TITLE_EXE="$GAME_DIR\\<the title's exe>"
+  export VICTORY_GAME_DIR="$GAME_DIR"
+  export VICTORY_CACHE_DIR='Z:\path\to\cache' VICTORY_DATA_DIR='Z:\path\to\data'
+  export VK_DRIVER_FILES=/usr/share/vulkan/icd.d/nvidia_icd.json
+  export DXVK_FILTER_DEVICE_NAME="RTX 5090" WINEDEBUG=-all
+  wine "$VICTORY_EXE" config
+  gamescope --backend headless -W 1920 -H 1080 -w 1920 -h 1080 \
+    --prefer-vk-device 10de:2b85 -- \
+    sh -c 'wine "$0" run "$1" --execute' "$VICTORY_EXE" "$TITLE_EXE"
+)
 ```
 
 `--prefer-vk-device` takes your GPU's PCI id; omit it if the ICD selects the right
