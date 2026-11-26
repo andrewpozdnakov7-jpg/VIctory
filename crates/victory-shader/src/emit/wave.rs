@@ -1320,12 +1320,16 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn end_to_end_permlanex16_and_wave64_high_mask_do_not_miscompile() {
+        use super::super::{HostShader, host, validator};
         use crate::dxbc::Container;
         use crate::native::{
             ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo,
             UsedResource,
         };
         use crate::{io, resource, structure};
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_FEATURE_D3D12_OPTIONS1, D3D12_FEATURE_DATA_D3D12_OPTIONS1,
+        };
 
         let compile = |wave64: bool, body: &[u32], out_vreg: u8| {
             let mut w = vec![
@@ -1392,35 +1396,71 @@ mod tests {
             );
         }
 
-        // FI=1 (opsel=1) legitimately fetches inactive lane 15 -> compiles and
-        // produces exact inclusive prefix sum [1, 3, 6, ..., 528] on D3D12.
-        let fi1_body = wave32_permlanex16_prefix_words(0xFFFF_0000, 0, 1);
-        let fi1_shader = compile(false, &fi1_body, 1).expect("FI=1 prefix sum translates");
         let _one = super::super::valu_tests::ONE_AT_A_TIME
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if let Ok(host) =
-            super::super::host::Host::new(false).or_else(|_| super::super::host::Host::new(true))
-            && let Ok((root, pso)) = host.compute_pipeline(&fi1_shader)
-        {
-            let mut ud = vec![0u32; fi1_shader.user_data_dwords().max(1) as usize];
-            for u in &fi1_shader.user_data {
-                ud[u.index as usize] = 0;
+        let host = host::Host::new(false).or_else(|_| host::Host::new(true)).ok();
+        let mut validator =
+            validator::Validator::load(validator::Validator::default_path().as_deref()).ok();
+        let mut readback = |label: &str, shader: &HostShader, expected: &[u32]| {
+            if let Some(validator) = &mut validator {
+                validator
+                    .validate(&mut shader.dxil.clone())
+                    .unwrap_or_else(|e| panic!("{label}: {e}"));
             }
+            let Some(host) = &host else {
+                eprintln!("{label}: no SM 6.6 device; skipped readback");
+                return;
+            };
+            let lanes = expected.len() as u32;
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+            // SAFETY: the query writes one OPTIONS1 structure.
+            unsafe {
+                host.device
+                    .CheckFeatureSupport(
+                        D3D12_FEATURE_D3D12_OPTIONS1,
+                        (&raw mut options).cast(),
+                        size_of_val(&options) as u32,
+                    )
+                    .expect("query wave capabilities");
+            }
+            if !options.WaveOps.as_bool()
+                || options.WaveLaneCountMin > lanes
+                || options.WaveLaneCountMax < lanes
+            {
+                eprintln!("{label}: adapter cannot execute Wave{lanes}; skipped readback");
+                return;
+            }
+            let (root, pso) = host
+                .compute_pipeline(shader)
+                .unwrap_or_else(|e| panic!("{label}: create pipeline: {e}"));
+            let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
             let out = host
                 .dispatch(
                     &root,
                     &pso,
-                    &super::super::host::Dispatch {
-                        roots: vec![(0, super::super::host::Root::Constants(ud))],
-                        views: &[super::super::host::View::RawUav(32)],
+                    &host::Dispatch {
+                        roots: vec![(0, host::Root::Constants(ud))],
+                        views: &[host::View::RawUav(lanes)],
                         samplers: &[],
                         groups: [1, 1, 1],
                     },
                 )
-                .expect("dispatch FI=1 prefix sum");
-            let expected: Vec<u32> = (1..=32u32).map(|k| k * (k + 1) / 2).collect();
-            assert_eq!(&out[0][..32], &expected[..]);
+                .unwrap_or_else(|e| panic!("{label}: dispatch: {e}"));
+            assert_eq!(&out[0][..expected.len()], expected, "{label}");
+            println!("{label}: read back all {lanes} lanes");
+        };
+
+        // FI=1 fetches the inactive lane for either BOUND_CTRL setting.
+        let prefixes: Vec<u32> = (1..=32u32).map(|k| k * (k + 1) / 2).collect();
+        for opsel in [1, 3] {
+            let body = wave32_permlanex16_prefix_words(0xFFFF_0000, 0, opsel);
+            let shader = compile(false, &body, 1).expect("FI=1 prefix sum translates");
+            readback(
+                &format!("Wave32 FI=1 BOUND_CTRL={}", opsel >> 1),
+                &shader,
+                &prefixes,
+            );
         }
 
         // 2. Wave64 whole-wave reduction where high half s3 of mask s[2:3] is
@@ -1432,10 +1472,8 @@ mod tests {
             &[sop1(EXEC, 0x04, 0)],
         );
         valid_w64.push(vop1(6, 0x01, 4)); // v_mov_b32 v6, s4
-        assert!(
-            compile(true, &valid_w64, 6).is_ok(),
-            "intact Wave64 reduction must still translate"
-        );
+        let shader = compile(true, &valid_w64, 6).expect("intact Wave64 reduction translates");
+        readback("Wave64 intact reduction", &shader, &[2080; 64]);
 
         let mut clobbered_w64 = wave64_sum_section_words(
             &[
