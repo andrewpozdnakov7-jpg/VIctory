@@ -1265,6 +1265,35 @@ fn arithmetic_probes() -> Vec<Probe> {
 }
 
 #[test]
+#[ignore = "prints bit patterns for adapter comparison"]
+fn mad_product_rounding_bit_patterns() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let warp = std::env::var("VICTORY_WARP").as_deref() == Ok("1");
+    let host = Host::new(warp).expect("D3D12 SM 6.6 device");
+    let mut validator = validator::Validator::load(validator::Validator::default_path().as_deref())
+        .expect("DXIL validator");
+    let inputs = [
+        [0x0080_0000, 0x8080_0000, 0, 0],
+        [0x0080_0000, 0x8080_0000, 0x8000_0000, 0],
+        [0x8080_0000, 0x3f00_0000, 0x8000_0000, 0],
+        [0x8080_0000, 0x3f00_0000, 0x0080_0000, 0],
+        [0xbf80_0000, 0, 0x8000_0000, 0],
+        [0xbf80_0000, 0x3f00_0000, 0x3f80_0000, 0],
+    ];
+    for (name, body) in [
+        ("v_mac_f32", vec![vop1(0x01, 5, v(3)), vop2(0x1f, 5, v(1), 2)]),
+        ("v_mad_f32", vop3(0x141, 5, [v(1), v(2), v(3)], NONE).to_vec()),
+    ] {
+        let shader = lower_program(&program(&body, false)).unwrap();
+        validator.validate(&mut shader.dxil.clone()).unwrap();
+        let output = run(&host, &shader, &inputs, false).unwrap();
+        let bits: Vec<_> = output.iter().map(|row| row[0]).collect();
+        println!("{name}: {bits:08x?}");
+        assert_eq!(bits[5], 0x3f00_0000, "normal multiply-add control");
+    }
+}
+
+#[test]
 fn arithmetic_matches_the_hardware() {
     assert_clean(check(&passing(arithmetic_probes())));
 }
