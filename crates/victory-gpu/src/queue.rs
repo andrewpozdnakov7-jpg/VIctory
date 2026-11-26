@@ -354,6 +354,23 @@ pub(crate) struct Plane {
     _rest: [u64; 6],
 }
 const _: () = assert!(std::mem::size_of::<Plane>() == 0x48);
+
+/// The title resource in the present's second plane, when there is one
+/// (`crate::compose`).
+#[cfg(windows)]
+fn second_plane(planes: u32, plane_parameters: *const Plane) -> Option<This> {
+    if planes < 2 || plane_parameters.is_null() {
+        return None;
+    }
+    // SAFETY: the title passes `planes` plane descriptions.
+    let plane = unsafe { plane_parameters.add(1).as_ref() }?;
+    if plane.count == 0 || plane.resources.is_null() {
+        return None;
+    }
+    // SAFETY: the plane lists `count` resources.
+    Some(unsafe { *plane.resources })
+}
+
 /// Submission tagged with the frame it belongs to `(count, lists, frame
 /// token, flags)`; frames are paced elsewhere, so it runs as a plain one.
 extern "system" fn execute_x(this: This, count: u32, lists: *const This, _token: u64, _flags: u32) {
@@ -567,7 +584,13 @@ extern "system" fn present(
                 .iter()
                 .map(|(_, tex, state, _)| (tex, *state))
                 .collect();
-            let shown = host.present(&sources, frame);
+            let second = second_plane(planes, plane_parameters).and_then(|resource| {
+                resources
+                    .iter()
+                    .find(|(title, _, _, _)| *title == resource)
+                    .map(|(_, tex, state, _)| (tex, *state))
+            });
+            let shown = host.present(&sources, second, frame);
             for &(resource, _, state, first) in &resources {
                 if first {
                     crate::resource::host_transition(resource, state);

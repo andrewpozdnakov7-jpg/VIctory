@@ -3181,11 +3181,18 @@ impl Host {
     /// Shows one or more `planes` (each a live host texture and its current
     /// host state, kept in that state), compositing planes 1.. on top of
     /// plane 0 when multiple planes are presented, as frame `frame` (saved if
-    /// captures are on). `None` if nothing was shown; else, in diagnostics
-    /// builds, whether the frame was black.
-    pub(crate) fn present(&self, planes: &[(&ID3D12Resource, u32)], frame: u64) -> Option<bool> {
+    /// captures are on). `second`, when present, is laid over the first by
+    /// the opt-in compute pass instead. `None` if nothing was shown; else, in
+    /// diagnostics builds, whether the frame was black.
+    pub(crate) fn present(
+        &self,
+        planes: &[(&ID3D12Resource, u32)],
+        second: Option<(&ID3D12Resource, u32)>,
+        frame: u64,
+    ) -> Option<bool> {
         self.present_with_compositor(
             planes,
+            second,
             frame,
             Compositor::new,
             #[cfg(all(test, feature = "diagnostics"))]
@@ -3196,6 +3203,7 @@ impl Host {
     fn present_with_compositor(
         &self,
         planes: &[(&ID3D12Resource, u32)],
+        second: Option<(&ID3D12Resource, u32)>,
         frame: u64,
         create_compositor: impl FnOnce(&ID3D12Device, DXGI_FORMAT) -> windows::core::Result<Compositor>,
         #[cfg(all(test, feature = "diagnostics"))] inspect: impl FnOnce(
@@ -3210,6 +3218,8 @@ impl Host {
             tracing::warn!(format = primary_desc.Format.0, "cannot present this format");
             return None;
         };
+        let compose = second.is_some() && crate::compose::enabled();
+        let shown = if compose { &planes[..1] } else { planes };
         let mut presentation = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
         let Presentation { presenter, retry } = &mut *presentation;
         if presenter.is_none() && !retry.ready(Instant::now()) {
@@ -3220,22 +3230,22 @@ impl Host {
             .and_then(|p| p.compositor.as_ref())
             .map(|c| c.format);
         let mut new_compositor = None;
-        let planes = if planes.len() > 1 && cached_format != Some(format) {
+        let shown = if shown.len() > 1 && cached_format != Some(format) {
             match create_compositor(&self.device, format) {
                 Ok(c) => {
                     new_compositor = Some(c);
-                    planes
+                    shown
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "presenting the primary plane after compositor initialization failed");
-                    &planes[..1]
+                    &shown[..1]
                 }
             }
         } else {
-            planes
+            shown
         };
         let (mut width, mut height) = (primary_desc.Width as u32, primary_desc.Height);
-        for &(tex, _) in &planes[1..] {
+        for &(tex, _) in &shown[1..] {
             // SAFETY: live resource.
             let d = unsafe { tex.GetDesc() };
             width = width.max(d.Width as u32);
@@ -3285,8 +3295,23 @@ impl Host {
             };
             p.copy.reset();
             let list = &p.copy.list;
-            let (capture, probe) = if planes.len() == 1 {
-                let (texture, state) = planes[0];
+            let laid = if compose {
+                let (game, _) = shown[0];
+                second.and_then(|(ui, ui_state)| {
+                    let out = crate::compose::record(&self.device, list, game, ui, ui_state);
+                    if let Some(out) = &out {
+                        p.copy.keep(out);
+                    }
+                    out
+                })
+            } else {
+                None
+            };
+            let (capture, probe) = if shown.len() == 1 {
+                let (texture, mut state) = shown[0];
+                if laid.is_some() {
+                    state = D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32;
+                }
                 let state = D3D12_RESOURCE_STATES(state as i32);
                 let mut before = Vec::with_capacity(2);
                 if state != D3D12_RESOURCE_STATE_COPY_SOURCE {
@@ -3298,7 +3323,7 @@ impl Host {
                     D3D12_RESOURCE_STATE_COPY_DEST,
                 ));
                 list.ResourceBarrier(&before);
-                list.CopyResource(&back, texture);
+                list.CopyResource(&back, laid.as_ref().unwrap_or(texture));
                 #[cfg(all(test, feature = "diagnostics"))]
                 let capture = {
                     // Inspect what reached the swap chain, before Present.
@@ -3356,10 +3381,10 @@ impl Host {
                 );
                 let srv_cpu_base = comp.srv_heap.GetCPUDescriptorHandleForHeapStart();
                 let srv_gpu_base = comp.srv_heap.GetGPUDescriptorHandleForHeapStart();
-                let count = planes.len().min(MAX_PLANES as usize);
+                let count = shown.len().min(MAX_PLANES as usize);
                 let mut before = Vec::with_capacity(count + 1);
                 let mut after = Vec::with_capacity(count);
-                for (i, &(tex, state)) in planes[..count].iter().enumerate() {
+                for (i, &(tex, state)) in shown[..count].iter().enumerate() {
                     let d = tex.GetDesc();
                     let srv_fmt = swap_format(d.Format).unwrap_or(d.Format);
                     let handle = D3D12_CPU_DESCRIPTOR_HANDLE {
@@ -3384,7 +3409,7 @@ impl Host {
                     );
                     let state = D3D12_RESOURCE_STATES(state as i32);
                     if state != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
-                        && planes[..i]
+                        && shown[..i]
                             .iter()
                             .all(|(earlier, _)| earlier.as_raw() != tex.as_raw())
                     {
@@ -4071,7 +4096,7 @@ mod present_plane_tests {
         host.execute(&[&list]);
         let state = D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32;
         assert!(
-            host.present(&[(&scene, state)], 1).is_some(),
+            host.present(&[(&scene, state)], None, 1).is_some(),
             "single-plane control"
         );
         let first_pixel =
@@ -4096,6 +4121,7 @@ mod present_plane_tests {
         let mut fallback = None;
         let shown = host.present_with_compositor(
             &[(&scene, state), (&overlay, state)],
+            None,
             2,
             |_, _| {
                 attempted = true;
@@ -4120,6 +4146,7 @@ mod present_plane_tests {
         assert!(
             host.present_with_compositor(
                 &[(&scene, state), (&overlay, state)],
+                None,
                 3,
                 Compositor::new,
                 |buffer, footprint| composite = Some(first_pixel(buffer, footprint)),

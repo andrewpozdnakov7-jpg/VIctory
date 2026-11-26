@@ -83,6 +83,9 @@ fn store_shader() -> Arc<Shader> {
             host,
             used: native.used,
         })),
+        resolves_light: false,
+        ends_reflections: false,
+        draws_sky: false,
     })
 }
 
