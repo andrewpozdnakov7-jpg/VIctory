@@ -1243,8 +1243,11 @@ fn shared_texture(
     {
         SHARED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if let Some(host) = crate::host::host() {
-            // SAFETY: a plain query on a host description (same layout).
-            let info = unsafe { host.device.GetResourceAllocationInfo(0, &[std::ptr::from_ref(&d).cast::<windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC>().read_unaligned()]) };
+            // The live texture's own description: `d` may ask for uses its
+            // format does not take on this host (unordered access on
+            // B5G5R5A1 on NVIDIA), which the query rejects by removing the
+            // device. SAFETY: plain queries on a live resource.
+            let info = unsafe { host.device.GetResourceAllocationInfo(0, &[t.texture.GetDesc()]) };
             SAVED.fetch_add(info.SizeInBytes, std::sync::atomic::Ordering::Relaxed);
         }
         return live;
@@ -1808,6 +1811,10 @@ static TEXTURES_AT: std::sync::Mutex<std::collections::BTreeMap<u64, Vec<usize>>
 #[cfg(windows)]
 pub(crate) fn alias_source(placed: This) -> Option<This> {
     const WRITTEN: u32 = 0x7; // render target, depth, unordered access
+    // A shader view of no resource (a null view) has no memory.
+    if placed.is_null() {
+        return None;
+    }
     let b = resource(placed);
     let map = TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner());
     let bytes = |d: &ResourceDesc| {
@@ -2305,6 +2312,12 @@ pub(crate) fn test_buffer(width: u64) -> This {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn a_null_view_has_no_alias_source() {
+        assert_eq!(alias_source(std::ptr::null()), None);
+    }
 
     #[test]
     fn a_regions_rows_in_a_footprint() {
@@ -3193,9 +3206,10 @@ mod tests {
     /// and an sRGB one with a typeless family keep it.
     #[test]
     fn a_format_without_unordered_access_loses_the_flag() {
-        if crate::host::host().is_none() {
-            return; // no host GPU here
-        }
+        let Some(device) = crate::host::host() else {
+            eprintln!("no D3D12 host for the format 86 test; skipped");
+            return;
+        };
         let texture = |format| ResourceDesc {
             dimension: 3,
             alignment: 0,
@@ -3221,6 +3235,32 @@ mod tests {
         let host = host_desc(&texture(86)).unwrap();
         assert_eq!(host.flags & UNORDERED, 0, "86 has no typed UAV");
         assert_eq!(host.format, 86, "and no family to stand in");
+
+        let null = std::ptr::null();
+        let mut created = null;
+        assert_eq!(
+            create_committed(
+                null, &PROPERTIES, 0, &texture(86), 0, null.cast(), &RESOURCE_IIDS[0], &mut created,
+            ),
+            S_OK
+        );
+        let backing = host_copy(created).expect("a host texture for format 86");
+        // SAFETY: queries on the live host resource and device.
+        let actual = unsafe { backing.texture.GetDesc() };
+        assert_eq!(actual.Format.0, 86);
+        assert_eq!(actual.Flags.0 as u32 & UNORDERED, 0);
+
+        let heap = crate::descriptor::host::HostHeap::new(false, 2).expect("host view heap");
+        use crate::descriptor::View;
+        heap.make_at(0, &View::Shader(created as usize, None));
+        heap.make_at(1, &View::Unordered(created as usize, 0, None));
+        assert!(heap.kept(0), "the shader resource view is usable");
+        assert!(!heap.kept(1), "the unordered view stays null");
+        // SAFETY: this is a live device after attempting both views.
+        assert!(unsafe { device.device.GetDeviceRemovedReason() }.is_ok());
+        slot::<extern "system" fn(This) -> u32>(created, 0x10)(created);
+        eprintln!("format 86: host texture, live SRV, null UAV");
+
         // A format whose type can be stored to keeps the flag.
         if crate::descriptor::host::typed_store(28) {
             let host = host_desc(&texture(28)).unwrap();
@@ -3228,4 +3268,3 @@ mod tests {
         }
     }
 }
-
