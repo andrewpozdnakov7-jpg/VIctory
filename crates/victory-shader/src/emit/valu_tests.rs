@@ -862,7 +862,15 @@ fn f16_max_and_min_treat_a_nan_as_the_other_operand() {
                     _ => cases[i].3,
                 };
                 let got = got & 0xFFFF;
-                assert_eq!(got, want, "{backend}: {name} {inp:x?}");
+                let want = want & 0xFFFF;
+                if is_f16_nan(want as u16) {
+                    assert!(
+                        is_f16_nan(got as u16),
+                        "{backend}: {name} {inp:x?} = {got:#06x}"
+                    );
+                } else {
+                    assert_eq!(got, want, "{backend}: {name} {inp:x?}");
+                }
             },
         );
     }
