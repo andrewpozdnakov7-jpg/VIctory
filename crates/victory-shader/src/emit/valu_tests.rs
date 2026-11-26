@@ -2281,3 +2281,51 @@ fn v_mul_legacy_f32_treats_denormals_as_zero() {
         );
     });
 }
+
+/// Run the two BVH distance sums from #3196 in all three add groupings. The three
+/// edge values are supplied at dispatch time, and the three shear depths
+/// come from the same synthetic cases as the BVH CPU reference.
+#[test]
+#[ignore = "adapter diagnostic for #3196"]
+fn bvh_distance_add_order_probe() {
+    let cases = [
+        (
+            1,
+            [0x402B_7C30, 0x4080_4B48, 0x4055_48D0],
+            [0x40F2_8000, 0x4109_8000, 0x4119_C000],
+            [0x42AD_90F6, 0x42AD_90F5, 0x42AD_90F5],
+        ),
+        (
+            3,
+            [0x413A_8350, 0x4125_25C0, 0x40E2_3460],
+            [0x41A7_4000, 0x4152_8000, 0x4194_4000],
+            [0x43FF_3F7A, 0x43FF_3F7A, 0x43FF_3F79],
+        ),
+    ];
+    let vop2 = |op: u32, dst: u8, a: u8, b: u8| {
+        op << 25 | u32::from(dst) << 17 | u32::from(b) << 9 | u32::from(vgpr(a))
+    };
+    let mut differences = 0;
+    for (ty, [u, v, w], depths, expected) in cases {
+        let mut products = Vec::new();
+        for (i, depth) in (0u8..3).zip(depths) {
+            products.extend([vop1(1, 8 + i, 255), depth]);
+            products.push(vop2(0x008, 5 + i, 1 + i, 8 + i));
+        }
+        for (label, pair, final_add, want) in [
+            ("left", (5, 6), (8, 7), expected[0]),
+            ("right", (6, 7), (5, 8), expected[1]),
+            ("u+w first", (5, 7), (8, 6), expected[2]),
+        ] {
+            let mut words = products.clone();
+            words.push(vop2(0x003, 8, pair.0, pair.1));
+            words.push(vop2(0x003, 0, final_add.0, final_add.1));
+            let shader = build_valu_cs(&words);
+            run_cases(&shader, &[[u, v, w, 0]], |backend, _, _, got| {
+                eprintln!("{backend} type {ty} {label}: got {got:#010x}, want {want:#010x}");
+                differences += usize::from(got != want);
+            });
+        }
+    }
+    assert_eq!(differences, 0);
+}
