@@ -222,11 +222,6 @@ pub(crate) fn uploads(
     let mut work: Vec<(Arc<crate::texture::Staging>, Arc<crate::resource::HostTexture>)> = Vec::new();
     let mut staged = std::collections::HashSet::new();
     for (staging, copy) in textures {
-        // A host copy wrote it in a submission made before this one, and
-        // title memory has not changed since.
-        if crate::texture::still_host_written(copy) {
-            continue;
-        }
         if staged.insert(Arc::as_ptr(staging)) {
             work.push((staging.clone(), copy.clone()));
         }
@@ -253,9 +248,7 @@ pub(crate) fn uploads(
             if !texture.used_recently() {
                 continue;
             }
-            // Its contents are the host's since a host copy wrote it, until
-            // the title writes its memory again.
-            if crate::texture::still_host_written(&texture) {
+            if !crate::texture::title_written(&texture.texture) {
                 continue;
             }
             if let Some(staging) = crate::texture::staging(r as This, &texture.texture)

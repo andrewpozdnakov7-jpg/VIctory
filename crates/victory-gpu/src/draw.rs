@@ -2802,13 +2802,14 @@ uint ps() : SV_Target { return 1; }
     /// A title write to mip 1 should upload that mip without undoing the
     /// preceding GPU copy to mip 0. Check tracked and untracked memory.
     #[test]
-    #[ignore = "candidate #758 regression for partial mip updates"]
     fn issue758_cpu_mip_write_keeps_the_other_gpu_mip() {
         const RED: [u8; 4] = [255, 0, 0, 255];
         const GREEN: [u8; 4] = [0, 255, 0, 255];
         const BLUE: [u8; 4] = [0, 0, 255, 255];
 
-        let host = crate::host::host().expect("a D3D12 device");
+        let Some(host) = crate::host::host() else {
+            return;
+        };
         let reader = compile_cs(
             r#"
 #define RS "DescriptorTable(SRV(t0)), UAV(u1)"
@@ -2842,8 +2843,8 @@ void main(uint3 id : SV_DispatchThreadID) {
             }
         };
 
-        let mut results = Vec::new();
-        for watched in [true, false] {
+        for (swizzle, watched) in [(0, true), (0, false), (5, true), (5, false)] {
+            words[11] = 0x100 | swizzle;
             let address = if watched {
                 crate::watch::tests::pool(1) as u64
             } else {
@@ -2855,6 +2856,11 @@ void main(uint3 id : SV_DispatchThreadID) {
             );
             let target = texture_at_address(address, &words);
             let source = texture_at_address(crate::watch::tests::pool(1) as u64, &words);
+            let (_, desc) = crate::resource::texture_memory(target).unwrap();
+            let layout = &crate::resource::texture_layout(&desc).unwrap().planes[0].layout;
+            if swizzle != 0 {
+                assert_eq!(layout.first_tail_mip, 0, "both mips share the tail block");
+            }
             let slots = Slots::new(2);
             let mut desc = [0; 10];
             desc[..6].copy_from_slice(&[28, 4, 0x1688, 0, 0, 2]);
@@ -2884,20 +2890,31 @@ void main(uint3 id : SV_DispatchThreadID) {
             crate::list::run_copy_resource_probe(target, source);
             assert_eq!(read(&target_view, 0), [GREEN; 20], "after GPU CopyResource");
 
+            // A neighboring allocation in the same watched page changed.
+            assert!((layout.size as usize) < crate::watch::PAGE);
+            // SAFETY: this write is outside this texture, in the allocated page.
+            unsafe { (address as *mut u8).add(crate::watch::PAGE - 1).write(0x77) };
+            assert_eq!(read(&target_view, 0), [GREEN; 20], "same-page write");
+
+            let mut expected = [GREEN; 20];
+            expected[16..].fill(BLUE);
+            let copied = crate::texture::copied(target);
             write_mip(target, 1, BLUE);
-            let pixels = read(&target_view, 0);
-            println!(
-                "watched={watched} mip0 green={}/16 red={}/16 mip1 blue={}/4 green={}/4",
-                pixels[..16].iter().filter(|texel| **texel == GREEN).count(),
-                pixels[..16].iter().filter(|texel| **texel == RED).count(),
-                pixels[16..].iter().filter(|texel| **texel == BLUE).count(),
-                pixels[16..].iter().filter(|texel| **texel == GREEN).count(),
-            );
-            results.push(pixels);
+            assert_eq!(read(&target_view, 0), expected, "mip 1 changed");
+            assert_eq!(crate::texture::copied(target), copied + 1);
+            assert!(!crate::resource::give_up_now(target), "mip 0 is still GPU-owned");
+
+            write_mip(target, 1, RED);
+            expected[16..].fill(RED);
+            assert_eq!(read(&target_view, 0), expected, "mip 1 changed again");
+            write_mip(target, 0, BLUE);
+            expected[..16].fill(BLUE);
+            assert_eq!(read(&target_view, 0), expected, "mip 0 now comes from the CPU");
+            assert!(crate::resource::give_up_now(target), "both mips can be remade");
+            slots.make(0, &target_view);
+            assert_eq!(read(&target_view, 0), expected, "remade from CPU memory");
+            println!("swizzle={swizzle} watched={watched}: all mip transitions passed");
         }
-        let mut expected = [GREEN; 20];
-        expected[16..].fill(BLUE);
-        assert_eq!(results, [expected, expected], "mip 0 must keep the GPU copy");
     }
 
     const READ: &str = r#"
