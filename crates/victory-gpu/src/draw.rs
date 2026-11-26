@@ -2129,6 +2129,16 @@ void main(uint3 id : SV_DispatchThreadID) {
     #[test]
     #[ignore = "opt-in texture submission ordering probe"]
     fn texture_reads_straddle_a_cpu_copy_in_one_submission() {
+        check_texture_generations(false);
+    }
+
+    #[test]
+    #[ignore = "opt-in texture submission ordering probe"]
+    fn bindless_upload_keeps_each_generation_in_one_batch() {
+        check_texture_generations(true);
+    }
+
+    fn check_texture_generations(bindless_upload: bool) {
         const RED: [u8; 4] = [255, 0, 0, 255];
         const GREEN: [u8; 4] = [0, 255, 0, 255];
 
@@ -2181,9 +2191,19 @@ void main(uint3 id : SV_DispatchThreadID) {
             desc[..6].copy_from_slice(&[28, 4, 0x1688, 0, 0, 1]);
             let view = View::Shader(texture as usize, Some(desc));
             slots.make(0, &view);
+            let viewed = bindless_upload.then(|| {
+                let viewed = std::sync::Arc::new(crate::bindless::Viewed::default());
+                viewed.set(0, Some(&view), true);
+                viewed
+            });
             let make_read = |out| {
                 let list = host.new_list().unwrap();
-                readable(&list, &used(ResourceType::Srv), &view, false);
+                if let Some(viewed) = &viewed {
+                    list.defer_heap(viewed);
+                } else {
+                    readable(&list, &used(ResourceType::Srv), &view, false);
+                }
+                // Use the same texture view in the readback shader for both upload paths.
                 run(&list, &slots, &reader, 0, Some(out), (1, 1));
                 list.close();
                 list
@@ -2210,7 +2230,7 @@ void main(uint3 id : SV_DispatchThreadID) {
             let next = pixels(next_data);
             let count = |read: &[[u8; 4]; 16], color| read.iter().filter(|&&p| p == color).count();
             println!(
-                "watched={watched}: A red={}/16 green={}/16; B red={}/16 green={}/16; next green={}/16",
+                "bindless={bindless_upload} watched={watched}: A red={}/16 green={}/16; B red={}/16 green={}/16; next green={}/16",
                 count(&before, RED), count(&before, GREEN), count(&after, RED),
                 count(&after, GREEN), count(&next, GREEN)
             );
