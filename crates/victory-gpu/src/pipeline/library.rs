@@ -34,7 +34,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
 
 use windows::Win32::Graphics::Direct3D12::*;
@@ -143,8 +143,9 @@ fn shard_of(name: &str) -> usize {
 }
 
 /// One save at a time: serialising and publishing must not interleave, or an
-/// older complete snapshot could be published over a newer one.
-static SAVING: Mutex<()> = Mutex::new(());
+/// older complete snapshot could be published over a newer one. Holds the
+/// generation of the last published early list.
+static SAVING: Mutex<u64> = Mutex::new(0);
 
 /// A shard of the library: the interface loads use, and the state stores and
 /// saves lock.
@@ -361,18 +362,16 @@ pub(crate) fn save(now: bool) {
     }
     // Serialising and publishing are both inside this lock, so two saves
     // cannot interleave and publish an older snapshot over a newer one.
-    let _saving = SAVING.lock().unwrap_or_else(|e| e.into_inner());
+    let mut saved_early_generation = SAVING.lock().unwrap_or_else(|e| e.into_inner());
     if let Err(e) = std::fs::create_dir_all(dir) {
         tracing::warn!(error = %e, "host pipeline library folder not made");
         return;
     }
-    let used_changed = USED_CHANGED.load(Ordering::Relaxed);
-    let used_generation = USED_GENERATION.load(Ordering::Relaxed);
-    let used = USED
+    let (used, early_generation) = USED
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .as_ref()
-        .map(Used::list)
+        .map(|used| (used.list(), used.generation))
         .unwrap_or_default();
     let mut saved = 0u32;
     let mut total = 0usize;
@@ -382,14 +381,11 @@ pub(crate) fn save(now: bool) {
             total += bytes;
         }
     }
-    if used_changed || saved > 0 {
+    if early_generation != *saved_early_generation || saved > 0 {
         match write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()) {
-            // Only if no key arrived while the list was being written: those
-            // are not in it, and the next save has to write them.
             Ok(()) => {
-                if USED_GENERATION.load(Ordering::Relaxed) == used_generation {
-                    USED_CHANGED.store(false, Ordering::Relaxed);
-                }
+                // Keys recorded after this snapshot keep a newer generation.
+                *saved_early_generation = early_generation;
             }
             Err(e) => tracing::warn!(error = %e, "early pipeline list not saved"),
         }
@@ -518,6 +514,7 @@ struct Used {
     /// kept most recent run first, so a lower place is a more recent run.
     before: HashMap<String, usize>,
     now: HashSet<String>,
+    generation: u64,
 }
 
 impl Used {
@@ -528,7 +525,7 @@ impl Used {
         for (place, key) in listed.lines().filter(|l| !l.is_empty()).enumerate() {
             before.entry(key.to_owned()).or_insert(place);
         }
-        Used { before, now: HashSet::new() }
+        Used { before, ..Used::default() }
     }
 
     /// The list to keep: this run's keys, then earlier runs' others, most
@@ -543,10 +540,6 @@ impl Used {
 }
 
 static USED: Mutex<Option<Used>> = Mutex::new(None);
-static USED_CHANGED: AtomicBool = AtomicBool::new(false);
-/// Bumped whenever a title pipeline key is added, so a save knows whether the
-/// early list it wrote is still the whole list.
-static USED_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 fn used() -> std::sync::MutexGuard<'static, Option<Used>> {
     let mut used = USED.lock().unwrap_or_else(|e| e.into_inner());
@@ -575,9 +568,10 @@ pub(crate) fn wanted_early(key: &str) -> bool {
 
 /// The title pipeline with `key` was drawn or dispatched with.
 pub(crate) fn note_used(key: &str) {
-    if used().get_or_insert_with(Used::default).now.insert(key.to_owned()) {
-        USED_CHANGED.store(true, Ordering::Relaxed);
-        USED_GENERATION.fetch_add(1, Ordering::Relaxed);
+    let mut used = used();
+    let used = used.get_or_insert_with(Used::default);
+    if used.now.insert(key.to_owned()) {
+        used.generation = used.generation.wrapping_add(1);
     }
 }
 
@@ -604,7 +598,11 @@ mod tests {
         let keys = |r: std::ops::Range<usize>| r.map(|i| format!("{i:032x}")).collect::<Vec<_>>();
         // Earlier runs' keys, place 0 the most recent.
         let before = keys(0..EARLY_MAX).into_iter().enumerate().map(|(place, k)| (k, place)).collect();
-        let used = Used { before, now: keys(EARLY_MAX - 10..EARLY_MAX + 10).into_iter().collect() };
+        let used = Used {
+            before,
+            now: keys(EARLY_MAX - 10..EARLY_MAX + 10).into_iter().collect(),
+            ..Used::default()
+        };
         let list = used.list();
         assert_eq!(list.len(), EARLY_MAX);
         assert!(used.now.iter().all(|k| list.contains(k)));
