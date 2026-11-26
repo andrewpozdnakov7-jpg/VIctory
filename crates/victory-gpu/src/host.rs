@@ -305,52 +305,29 @@ fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
     }
 }
 
-/// Diagnostics, `VICTORY_GPU_TIMING`: GPU time per kind of command and
-/// pipeline (ms, commands) and lists' wall time against the sum of their
-/// commands' (ms), since the last frame-rate line.
 #[cfg(feature = "diagnostics")]
-type GpuTimes = (std::collections::HashMap<String, (f64, u64)>, f64, f64);
-#[cfg(feature = "diagnostics")]
-static GPU_TIMES: Mutex<Option<GpuTimes>> = Mutex::new(None);
+#[path = "host/gpu_timing.rs"]
+mod gpu_timing;
 
-/// Adds a timed list's commands (from [`HostList::slowest`]) to [`GPU_TIMES`],
-/// by the command's kind and pipeline: its note before the first ` | `,
-/// without counts and addresses.
+/// Accounts for a guest present in the same window as the completed lists.
 #[cfg(feature = "diagnostics")]
-fn gpu_times(wall: Duration, commands: &[(f64, String)]) {
-    let mut times = GPU_TIMES.lock().unwrap_or_else(|e| e.into_inner());
-    let (by, wall_ms, sum) = times.get_or_insert_with(Default::default);
-    *wall_ms += wall.as_secs_f64() * 1e3;
-    for (ms, note) in commands {
-        // "draw 3x1 [mesh 1f.., pixel 2e..] | ...": the kind and the pipeline.
-        let head = note.split(" | ").next().unwrap_or_default();
-        let kind = head.split(' ').next().unwrap_or_default();
-        let key = match head.find('[') {
-            Some(at) => format!("{kind} {}", &head[at..]),
-            None => kind.to_owned(),
-        };
-        let e = by.entry(key).or_default();
-        (e.0, e.1) = (e.0 + ms, e.1 + 1);
-        *sum += ms;
+pub(crate) fn gpu_timing_presented() {
+    if timing() && let Some(report) = gpu_timing::present(Instant::now()) {
+        report.log();
     }
 }
 
-/// Logs [`GPU_TIMES`] per frame over `frames` frames: the 25 costliest.
-#[cfg(feature = "diagnostics")]
-fn log_gpu_times(frames: f64) {
-    let Some((by, wall, sum)) = GPU_TIMES.lock().unwrap_or_else(|e| e.into_inner()).take() else {
-        return;
+#[cfg(all(test, feature = "diagnostics"))]
+#[path = "host/timing_warp.rs"]
+mod timing_warp;
+
+#[cfg(all(test, feature = "diagnostics"))]
+fn finish_timing_test_window(now: Instant) -> u64 {
+    let Some(report) = gpu_timing::present(now) else {
+        return 0;
     };
-    tracing::info!(
-        "GPU timing: lists {:.1} ms/frame of wall time, their commands {:.1} ms/frame",
-        wall / frames,
-        sum / frames
-    );
-    let mut by: Vec<_> = by.into_iter().collect();
-    by.sort_by(|a, b| b.1.0.total_cmp(&a.1.0));
-    for (key, (ms, n)) in by.iter().take(25) {
-        tracing::info!("  GPU {:.2} ms/frame in {:.1} commands/frame: {key}", ms / frames, *n as f64 / frames);
-    }
+    report.log();
+    report.command_count()
 }
 
 /// Diagnostics: the host device's video memory use and budget, in MB, local
@@ -833,10 +810,13 @@ pub(crate) struct HostList {
     /// or writes, and the pipeline that first wrote each (diagnostics).
     #[cfg(feature = "diagnostics")]
     targets: Mutex<Vec<(usize, String)>>,
-    /// With `VICTORY_GPU_TIMING`: a GPU timestamp before each noted command
-    /// and at the end, and where they are read back.
+    /// With `VICTORY_GPU_TIMING`: GPU timestamps and their readback.
     #[cfg(feature = "diagnostics")]
     stamps: OnceLock<Option<(ID3D12QueryHeap, ID3D12Resource)>>,
+    /// Command timestamps written in the current recording, excluding the
+    /// final timestamp used to measure the last interval.
+    #[cfg(feature = "diagnostics")]
+    stamp_count: AtomicU32,
 }
 
 // SAFETY: D3D12 objects are free-threaded; a host list is recorded by the
@@ -873,11 +853,17 @@ pub(crate) fn dred_on() -> bool {
 
 /// Whether each list of a submission runs and is timed on its own, slow
 /// ones logged with their commands (`VICTORY_GPU_TIMING`, diagnostics
-/// builds; the commands are noted with `VICTORY_D3D12_DRED` on).
+/// builds).
 #[cfg(feature = "diagnostics")]
 fn timing() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| crate::switch::on("VICTORY_GPU_TIMING"))
+}
+
+/// A dropped command can have a DRED note but has no GPU interval.
+#[cfg(feature = "diagnostics")]
+fn timed_note(note: &str) -> bool {
+    !note.starts_with("DROPPED ")
 }
 
 /// Names a host object for the device-removed report, which names the
@@ -1148,6 +1134,8 @@ impl Host {
                 targets: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
                 stamps: OnceLock::new(),
+                #[cfg(feature = "diagnostics")]
+                stamp_count: AtomicU32::new(0),
             })
         }
     }
@@ -1254,7 +1242,9 @@ impl Host {
         crate::copystat::add(crate::copystat::C::FaultsPrep, crate::copystat::page_faults().saturating_sub(faults));
         // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
         #[cfg(feature = "diagnostics")]
-        let groups: Vec<&[Option<ID3D12CommandList>]> = if timing() {
+        let timed = timing();
+        #[cfg(feature = "diagnostics")]
+        let groups: Vec<&[Option<ID3D12CommandList>]> = if timed {
             firsts
                 .iter()
                 .zip(firsts.iter().skip(1).chain([&lists.len()]))
@@ -1265,6 +1255,13 @@ impl Host {
         };
         #[cfg(not(feature = "diagnostics"))]
         let groups = [&lists[..]];
+        #[cfg(feature = "diagnostics")]
+        let frequency = if timed {
+            // SAFETY: a plain query on the host queue.
+            unsafe { self.queue.GetTimestampFrequency() }.ok().filter(|&hz| hz != 0)
+        } else {
+            None
+        };
         let mut removed_in = None;
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
@@ -1286,21 +1283,23 @@ impl Host {
                 }
             }
             #[cfg(feature = "diagnostics")]
+            let wall = started.elapsed();
+            #[cfg(feature = "diagnostics")]
             crate::resource::life::note(0, crate::resource::life::RAN, *submitted, 0);
             #[cfg(feature = "diagnostics")]
-            if groups.len() > 1 {
-                // SAFETY: a plain query.
-                let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
-                gpu_times(started.elapsed(), &runs[i].slowest(frequency, usize::MAX));
-            }
-            #[cfg(feature = "diagnostics")]
-            if groups.len() > 1 && started.elapsed() > std::time::Duration::from_millis(50) {
-                // SAFETY: a plain query.
-                let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
-                let commands = runs[i].notes.lock().unwrap_or_else(|e| e.into_inner()).len();
-                tracing::warn!(ms = started.elapsed().as_millis(), commands, "slow host list");
-                for (ms, op) in runs[i].slowest(frequency, 6) {
-                    tracing::warn!("slow list command, {ms:.1} ms: {op}");
+            if timed {
+                // SAFETY: a plain query. Do not read timestamps if the wait
+                // failed and the submission has not completed.
+                let completed = unsafe { self.fence.GetCompletedValue() };
+                if completed != u64::MAX && completed >= *submitted {
+                    let commands = frequency.map_or_else(Vec::new, |hz| runs[i].timed_commands(hz));
+                    gpu_timing::record(wall, &commands);
+                    if wall > Duration::from_millis(50) {
+                        tracing::warn!(ms = wall.as_millis(), commands = commands.len(), "slow host list");
+                        for (ms, op) in commands.iter().take(6) {
+                            tracing::warn!("slow list command, {ms:.1} ms: {op}");
+                        }
+                    }
                 }
             }
             // SAFETY: a plain query.
@@ -1708,12 +1707,16 @@ impl HostList {
             .as_ref()
     }
 
-    /// The noted commands that took longest on the GPU, longest first, as
-    /// (milliseconds, text) (diagnostics, timing on, after the list ran).
+    /// Resolved command intervals on the GPU, longest first, as
+    /// (milliseconds, text).
     #[cfg(feature = "diagnostics")]
-    fn slowest(&self, frequency: u64, n: usize) -> Vec<(f64, String)> {
+    fn timed_commands(&self, frequency: u64) -> Vec<(f64, String)> {
         let notes = self.notes.lock().unwrap_or_else(|e| e.into_inner());
-        let (Some((_, back)), count) = (self.stamps(), notes.len().min(STAMPS as usize - 1)) else {
+        let count = self.stamp_count.load(Ordering::Relaxed) as usize;
+        if count == 0 {
+            return Vec::new();
+        }
+        let Some((_, back)) = self.stamps() else {
             return Vec::new();
         };
         let mut data = std::ptr::null_mut();
@@ -1727,14 +1730,17 @@ impl HostList {
             back.Unmap(0, None);
             s
         };
-        let mut times: Vec<(f64, String)> = (0..count)
-            .map(|i| {
+        let mut times: Vec<(f64, String)> = notes
+            .iter()
+            .filter(|(note, _)| timed_note(note))
+            .take(count)
+            .enumerate()
+            .map(|(i, (note, _))| {
                 let ticks = stamps[i + 1].saturating_sub(stamps[i]);
-                (ticks as f64 * 1e3 / frequency.max(1) as f64, notes[i].0.chars().take(300).collect())
+                (ticks as f64 * 1e3 / frequency as f64, note.chars().take(300).collect())
             })
             .collect();
         times.sort_by(|a, b| b.0.total_cmp(&a.0));
-        times.truncate(n);
         times
     }
 
@@ -1762,12 +1768,14 @@ impl HostList {
 
     pub(crate) fn close(&self) {
         #[cfg(feature = "diagnostics")]
-        if let Some((heap, back)) = self.stamps() {
-            let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
-            // SAFETY: an open list, our heap and read-back buffer.
-            unsafe {
-                self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, count);
-                self.list.ResolveQueryData(heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, count + 1, back, 0);
+        {
+            let count = self.stamp_count.load(Ordering::Relaxed);
+            if count != 0 && let Some((heap, back)) = self.stamps() {
+                // SAFETY: an open list, our heap and read-back buffer.
+                unsafe {
+                    self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, count);
+                    self.list.ResolveQueryData(heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, count + 1, back, 0);
+                }
             }
         }
         // SAFETY: our list.
@@ -1786,7 +1794,10 @@ impl HostList {
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
-        self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        {
+            self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
+            self.stamp_count.store(0, Ordering::Relaxed);
+        }
         #[cfg(feature = "diagnostics")]
         self.targets.lock().unwrap_or_else(|e| e.into_inner()).clear();
         {
@@ -1991,8 +2002,7 @@ impl HostList {
 
     /// Notes what the command about to be recorded does, as a marker
     /// command whose text the list keeps (diagnostics, with device-removed
-    /// data on): the report pairs the breadcrumbs' marker commands with the
-    /// texts in order and names the commands a fault stopped among.
+    /// data or GPU timing on). Only DRED needs a breadcrumb marker.
     #[cfg(feature = "diagnostics")]
     pub(crate) fn note_op(&self, what: impl FnOnce() -> String) {
         self.note(what, None);
@@ -2007,13 +2017,22 @@ impl HostList {
 
     #[cfg(feature = "diagnostics")]
     fn note(&self, what: impl FnOnce() -> String, range: Option<(u64, u64)>) {
-        if dred_on() {
-            let at = self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32;
-            if let Some((heap, _)) = self.stamps() && at < STAMPS - 1 {
-                // SAFETY: an open list and our query heap.
-                unsafe { self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, at) };
-            }
-            let what = what();
+        let dred = dred_on();
+        if !dred && !timing() {
+            return;
+        }
+        let what = what();
+        let measured = timed_note(&what);
+        if !dred && !measured {
+            return;
+        }
+        let at = self.stamp_count.load(Ordering::Relaxed);
+        if measured && at < STAMPS - 1 && let Some((heap, _)) = self.stamps() {
+            // SAFETY: an open list and our query heap.
+            unsafe { self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, at) };
+            self.stamp_count.store(at + 1, Ordering::Relaxed);
+        }
+        if dred {
             traced(&what);
             let text: Vec<u16> = what.encode_utf16().chain([0]).collect();
             const UNICODE: u32 = 0;
@@ -2021,11 +2040,8 @@ impl HostList {
             unsafe {
                 self.list.SetMarker(UNICODE, Some(text.as_ptr().cast()), 2 * text.len() as u32)
             };
-            self.notes
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .push((what, range));
         }
+        self.notes.lock().unwrap_or_else(|e| e.into_inner()).push((what, range));
     }
 
     /// Notes a texture the list renders to or writes, in a listed frame.
@@ -3120,7 +3136,6 @@ impl Meter {
                 // Window caption updates leave the report counters intact.
                 let drops = crate::pipeline::take_drops();
                 crate::frame::log();
-                log_gpu_times(report_frames);
                 crate::copystat::log(report_frames);
                 crate::bindless::log(report_frames);
                 crate::shadow::log_views(report_frames);

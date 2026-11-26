@@ -491,6 +491,8 @@ extern "system" fn present(
     // shows the frame as far as it ran); the frame line names such work.
     pump_held(Why::Present);
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
+    #[cfg(all(windows, feature = "diagnostics"))]
+    crate::host::gpu_timing_presented();
     #[cfg(windows)]
     account_frame(frame);
     #[cfg(feature = "diagnostics")]
