@@ -3233,27 +3233,38 @@ fn v_fmac_f16_accumulator_modifiers_match_rdna2_oracle() {
 /// gfx1031 table, which measures low-half destinations only.
 #[test]
 fn v_fmac_f16_accumulator_modifiers_use_the_selected_high_half() {
-    // a * b = 2. The high accumulators are +1 and -1; leave the low bits alone.
-    const INPUTS: [[u32; 4]; 2] = [
+    // a * b = 2 for the normal operands and 2^-14 for the subnormal cases.
+    // Adding or subtracting 2^-24 crosses the minimum-normal boundary.
+    const INPUTS: [[u32; 4]; 4] = [
         [0x3C00, 0x4000, 0x3C00_C800, OLD],
         [0x3C00, 0x4000, 0xBC00_4480, OLD],
+        [0x3C00, 0x0400, 0x0001_71A0, OLD],
+        [0x3C00, 0x0400, 0x8001_5A10, OLD],
     ];
-    let high = |abs, neg, expected: [u32; 2]| {
+    let high = |abs, neg, expected: [u32; 4]| {
         let mut body = vec![vop1(0x01, 5, v(3))];
         body.extend(vop3(
             0x136,
             5,
             [v(1), v(2), 0],
-            M { abs, neg, opsel: 8, ..NONE },
+            M {
+                abs,
+                neg,
+                opsel: 8,
+                ..NONE
+            },
         ));
         probe(body, INPUTS.to_vec(), INT, move |i| {
-            let index = usize::from(i == INPUTS[1]);
+            let index = INPUTS
+                .iter()
+                .position(|&input| input == i)
+                .expect("known input");
             vec![(expected[index] << 16) | (i[2] & 0xFFFF)]
         })
     };
     assert_clean(check(&[
-        high(0, 4, [0x3C00, 0x4200]),
-        high(4, 0, [0x4200, 0x4200]),
-        high(4, 4, [0x3C00, 0x3C00]),
+        high(0, 4, [0x3C00, 0x4200, 0x03FF, 0x0401]),
+        high(4, 0, [0x4200, 0x4200, 0x0401, 0x0401]),
+        high(4, 4, [0x3C00, 0x3C00, 0x03FF, 0x03FF]),
     ]));
 }
