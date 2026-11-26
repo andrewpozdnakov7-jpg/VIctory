@@ -442,7 +442,7 @@ fn build_wave32_cs(pattern: MaskPattern, div: Divergence, op_words: &[u32]) -> H
     shader
 }
 
-fn wave32_hardware_info(host: &Host) -> Option<String> {
+fn wave32_adapter_info(host: &Host, warp: bool) -> Option<String> {
     // SAFETY: plain D3D12/DXGI capability queries on a live device.
     unsafe {
         let mut opts1 = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
@@ -482,8 +482,9 @@ fn wave32_hardware_info(host: &Host) -> Option<String> {
             && let Ok(adapter) = factory.EnumAdapterByLuid::<IDXGIAdapter1>(luid)
             && let Ok(desc) = adapter.GetDesc1()
         {
-            if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0
-                || desc.DedicatedVideoMemory == 0
+            if !warp
+                && (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0
+                    || desc.DedicatedVideoMemory == 0)
             {
                 return None;
             }
@@ -505,15 +506,24 @@ fn wave32_hardware_info(host: &Host) -> Option<String> {
     }
 }
 
-fn dispatch_wave32(shader: &HostShader) -> Option<(String, [u32; 32])> {
+fn dispatch_wave32(shader: &HostShader, allow_warp: bool) -> Option<(String, [u32; 32])> {
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    let Ok(host) = Host::new(false) else {
+    let warp = allow_warp && std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
+    let host = Host::new(warp);
+    if warp {
+        assert!(host.is_ok(), "requested WARP device with SM 6.6");
+    }
+    let Ok(host) = host else {
         eprintln!("no SM 6.6 hardware device; skipped");
         return None;
     };
-    let Some(info) = wave32_hardware_info(&host) else {
+    let info = wave32_adapter_info(&host, warp);
+    if warp {
+        assert!(info.is_some(), "requested WARP device with 32-lane waves");
+    }
+    let Some(info) = info else {
         eprintln!("hardware device does not support 32-lane waves; skipped");
         return None;
     };
@@ -542,12 +552,12 @@ fn dispatch_wave32(shader: &HostShader) -> Option<(String, [u32; 32])> {
     Some((info, got))
 }
 
-fn check_cases(suite: &str, items: &[(&str, HostShader, [u32; 32])]) {
+fn check_cases(suite: &str, allow_warp: bool, items: &[(&str, HostShader, [u32; 32])]) {
     let mut failures = Vec::new();
     let mut passed = 0usize;
     let mut skipped = 0usize;
     for (label, shader, expected) in items {
-        let Some((info, got)) = dispatch_wave32(shader) else {
+        let Some((info, got)) = dispatch_wave32(shader, allow_warp) else {
             skipped += 1;
             continue;
         };
@@ -801,7 +811,7 @@ fn dpp16_inactive_source_and_bound_ctrl_match_rdna2_on_gpu() {
             )
         })
         .collect();
-    check_cases("DPP16", &items);
+    check_cases("DPP16", false, &items);
 }
 
 struct Dpp8Case {
@@ -876,7 +886,7 @@ fn dpp8_and_dpp8fi_inactive_source_match_rdna2_on_gpu() {
             )
         })
         .collect();
-    check_cases("DPP8/DPP8FI", &items);
+    check_cases("DPP8/DPP8FI", false, &items);
 }
 
 #[test]
@@ -930,7 +940,7 @@ fn ds_swizzle_b32_inactive_source_returns_zero_on_gpu() {
             )
         })
         .collect();
-    check_cases("ds_swizzle_b32", &items);
+    check_cases("ds_swizzle_b32", false, &items);
 }
 
 #[test]
@@ -1078,5 +1088,47 @@ fn dpp16_reverse_integer_ops_shuffle_the_second_source_on_gpu() {
             )
         })
         .collect();
-    check_cases("DPP16rev", &items);
+    check_cases("DPP16rev", true, &items);
+}
+
+/// The reverse subtract shuffles src1 and keeps each lane's own borrow-in.
+#[test]
+fn dpp16_reverse_subtract_keeps_local_borrow_on_gpu() {
+    let mut words = vec![v_and_b32_imm(4, 1, 0), v_cmp_eq_u32_imm(0, 4)];
+    words.extend(v_add_nc_u32_lit(3, lane_v1(0), 0));
+    words.extend([
+        0x2A << 25 | 2 << 17 | 3 << 9 | 0xFA, // v_subrev_co_ci_u32 v2, v1, v3, vcc
+        dpp16_word(1, 0xB1, 0xF, 0xF, false, false),
+    ]);
+
+    let value = build_wave32_cs(MaskPattern::All, Divergence::Full, &words);
+    words.extend(v_add_nc_u32_lit(5, 1, 0));
+    words.push(0x01 << 25 | 2 << 17 | 5 << 9 | 0x80); // v_cndmask_b32 v2, 0, v5, vcc
+    let borrow = build_wave32_cs(MaskPattern::All, Divergence::Full, &words);
+    check_cases(
+        "DPP16rev borrow",
+        true,
+        &[
+            (
+                "v_subrev_co_ci_u32 value",
+                value,
+                std::array::from_fn(|lane| {
+                    let lane = lane as u32;
+                    lane_v1(lane ^ 1)
+                        .wrapping_sub(lane_v1(lane) + u32::from(lane.is_multiple_of(2)))
+                }),
+            ),
+            (
+                "v_subrev_co_ci_u32 borrow out",
+                borrow,
+                std::array::from_fn(|lane| {
+                    if lane.is_multiple_of(2) {
+                        0
+                    } else {
+                        lane as u32 + 1
+                    }
+                }),
+            ),
+        ],
+    );
 }
