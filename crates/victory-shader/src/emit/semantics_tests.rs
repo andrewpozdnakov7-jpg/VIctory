@@ -2333,6 +2333,64 @@ fn sixteen_bit_probes() -> Vec<Probe> {
 }
 
 #[test]
+fn half_widening_preserves_nan_sign_and_payload() {
+    const CVT_F32_F16: u16 = 0x0B;
+    let controls = [
+        0, 1, 0x03ff, 0x0400, 0x3c00, 0x7bff, 0x7c00, 0x8000, 0x8001, 0x83ff, 0x8400, 0xbc00,
+        0xfbff, 0xfc00,
+    ];
+    let inputs: Vec<_> = controls
+        .into_iter()
+        .chain(0x7c01..=0x7fff)
+        .chain(0xfc01..=0xffff)
+        .map(|low| [low | ((low ^ 0x8000) << 16), 0, 0, 0])
+        .collect();
+    let expected = |m: M| {
+        move |i: [u32; 4]| {
+            let mut bits = (i[0] >> (16 * u32::from(m.opsel & 1))) & 0xffff;
+            if m.abs & 1 != 0 {
+                bits &= 0x7fff;
+            }
+            if m.neg & 1 != 0 {
+                bits ^= 0x8000;
+            }
+            let widened = if bits & 0x7fff > 0x7c00 {
+                ((bits & 0x8000) << 16) | 0x7f80_0000 | ((bits & 0x03ff) << 13)
+            } else {
+                (h(bits) as f32).to_bits()
+            };
+            vec![widened]
+        }
+    };
+    let mut probes = vec![probe(
+        [vop1(CVT_F32_F16, 5, v(1))],
+        inputs.clone(),
+        INT,
+        expected(NONE),
+    )];
+    for m in [
+        NONE,
+        M { abs: 1, ..NONE },
+        M { neg: 1, ..NONE },
+        M { opsel: 1, ..NONE },
+        M {
+            abs: 1,
+            neg: 1,
+            opsel: 1,
+            ..NONE
+        },
+    ] {
+        probes.push(probe(
+            vop3(0x180 + CVT_F32_F16, 5, [v(1), 0, 0], m),
+            inputs.clone(),
+            INT,
+            expected(m),
+        ));
+    }
+    assert_clean(check(&probes));
+}
+
+#[test]
 fn sixteen_bit_floats_match_the_hardware() {
     assert_clean(check(&passing(sixteen_bit_probes())));
 }
