@@ -1557,6 +1557,127 @@ mod tests {
         assert_eq!(out, [0; 16]);
     }
 
+
+    // Times uncompressed DirectStorage requests with the 2 MiB split. Run in a fresh
+    // process per setting because the section-size configuration is cached.
+    #[test]
+    #[ignore = "measures warmed DirectStorage requests"]
+    fn section_size_directstorage_probe() {
+        use crate::modules::xmem;
+        use windows_sys::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
+
+        let section_mb = std::env::var("VICTORY_SECTION_MB")
+            .unwrap()
+            .parse::<usize>()
+            .unwrap();
+        assert!([0, 2].contains(&section_mb));
+
+        let mut pages = vec![0usize; 130];
+        let mut count = pages.len();
+        assert_eq!(
+            xmem::XMemAllocatePhysicalPages(0, &mut count, pages.as_mut_ptr()),
+            1
+        );
+        assert_eq!(count, pages.len());
+        let mapped = xmem::XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            pages.len() * PAGE,
+            0x2000 | 0x2040_0000,
+            0,
+            0x04,
+        );
+        assert!(!mapped.is_null());
+        assert_eq!(
+            xmem::XMemMapPhysicalPages(mapped, pages.len(), pages.as_ptr()),
+            mapped
+        );
+        let mapped_bytes = mapped.cast::<u8>();
+
+        const MIB: usize = 1 << 20;
+        let shapes = [
+            ("64k-within", PAGE * 2, PAGE, true),
+            ("64k-across", 2 * MIB - PAGE / 2, PAGE, false),
+            ("2m-aligned", 2 * MIB, 2 * MIB, true),
+            ("4m-unaligned", PAGE + 123, 4 * MIB, false),
+            ("8m-aligned", PAGE, 8 * MIB, false),
+        ];
+        const WARMUP: usize = 4;
+        const RUNS: usize = 31;
+
+        for (label, start, len, fits_section) in shapes {
+            let bytes = pattern(len);
+            let alternate: Vec<_> = bytes.iter().map(|&value| !value).collect();
+            let sources = [&bytes, &alternate];
+            let first_page = start / PAGE;
+            let within = start % PAGE;
+            let destination = &mut pages[first_page..];
+            let window = xmem::page_window(destination, within, len).is_some();
+            assert_eq!(
+                window,
+                section_mb == 0 || fits_section,
+                "{label}: write path"
+            );
+            let mut req = request(
+                PAGE_DESTINATION | MEMORY_SOURCE,
+                destination.as_mut_ptr().cast(),
+                len,
+                bytes.as_ptr().cast(),
+                0,
+                len,
+            );
+            req.page_offset = within as u64;
+            // SAFETY: the mapped range includes both adjacent sentinel bytes.
+            unsafe {
+                mapped_bytes.add(start - 1).write(0xa7);
+                mapped_bytes.add(start + len).write(0x39);
+            }
+            let mut elapsed = Vec::with_capacity(RUNS);
+            for i in 0..WARMUP + RUNS {
+                req.source = sources[i % 2].as_ptr().cast();
+                let before = std::time::Instant::now();
+                execute(std::hint::black_box(&req)).expect("uncompressed DirectStorage request");
+                let ns = before.elapsed().as_nanos();
+                if i >= WARMUP {
+                    elapsed.push(ns);
+                }
+                if i < 2 || i == WARMUP + RUNS - 1 {
+                    // SAFETY: the call is synchronous and the destination is entirely mapped.
+                    let actual =
+                        unsafe { std::slice::from_raw_parts(mapped_bytes.add(start), len) };
+                    assert!(
+                        actual == sources[i % 2].as_slice(),
+                        "{label}: all request bytes must match"
+                    );
+                }
+            }
+            // SAFETY: the mapped range includes both adjacent sentinel bytes.
+            assert_eq!(
+                unsafe {
+                    [
+                        mapped_bytes.add(start - 1).read(),
+                        mapped_bytes.add(start + len).read(),
+                    ]
+                },
+                [0xa7, 0x39],
+                "{label} sentinels"
+            );
+            elapsed.sort_unstable();
+            println!(
+                "section_mb={section_mb},case={label},bytes={len},direct={window},p50_ns={},p95_ns={}",
+                elapsed[RUNS / 2],
+                elapsed[(RUNS * 95 / 100).min(RUNS - 1)]
+            );
+        }
+
+        assert_eq!(
+            xmem::XMemMapPhysicalPages(mapped, pages.len(), std::ptr::null()),
+            mapped
+        );
+        assert_eq!(xmem::XMemFreePhysicalPages(pages.len(), pages.as_ptr()), 1);
+        // SAFETY: this test owns the section-free placeholder.
+        assert_ne!(unsafe { VirtualFree(mapped, 0, MEM_RELEASE) }, 0);
+    }
+
     #[test]
     fn physical_page_destinations() {
         use crate::modules::xmem;
