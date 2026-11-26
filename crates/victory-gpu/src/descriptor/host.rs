@@ -56,7 +56,9 @@ pub(crate) struct HostHeap {
     /// them (shaders reading a descriptor as data, `crate::memory`;
     /// [`write_address`]): the buffer, its mapping and host address, made on
     /// first use.
-    addresses: std::sync::OnceLock<Option<(ID3D12Resource, usize, u64)>>,
+    addresses: std::sync::OnceLock<(ID3D12Resource, usize, u64)>,
+    /// Serializes allocation attempts until the table is available.
+    addresses_init: Mutex<()>,
     /// Synchronizes [`Self::note_address`] with lazy [`Self::addresses`]
     /// initialization: keeps dynamic-slot entries made before first use and
     /// forwards concurrent updates made before `OnceLock` publishes.
@@ -218,6 +220,7 @@ impl HostHeap {
             strides,
             marks,
             addresses: std::sync::OnceLock::new(),
+            addresses_init: Mutex::new(()),
             address_state: Mutex::new(AddressState::Pending(std::collections::HashMap::new())),
             viewed: Default::default(),
         };
@@ -579,22 +582,27 @@ impl HostHeap {
     /// The host address of the slots' view addresses (see the field), made
     /// on first use from the slots made so far.
     pub(crate) fn view_addresses(&self) -> Option<u64> {
-        let made = self.addresses.get_or_init(|| {
-            // The view is a root view, which has no bounds: an entry for
-            // every slot a table can lie in, the dynamic ones too (a table
-            // made afresh on a host whose heap is smaller than the title's
-            // read past the title slots' entries: whatever followed the
-            // buffer, or a GPU fault).
-            let Some((buffer, data)) =
-                host().and_then(|h| h.upload_buffer(u64::from(self.address_slots()) * 16))
-            else {
-                if let AddressState::Pending(pending) =
-                    &mut *self.address_state.lock().unwrap_or_else(|e| e.into_inner())
-                {
-                    pending.clear();
-                }
-                return None;
-            };
+        self.view_addresses_with(|size| host()?.upload_buffer(size))
+    }
+
+    fn view_addresses_with(
+        &self,
+        allocate: impl FnOnce(u64) -> Option<(ID3D12Resource, *mut u8)>,
+    ) -> Option<u64> {
+        let ready = || self.addresses.get().map(|address| address.2);
+        if let Some(gpu) = ready() {
+            return Some(gpu);
+        }
+        let _init = self.addresses_init.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(gpu) = ready() {
+            return Some(gpu);
+        }
+
+        // A title heap can outlive a temporary refusal to allocate upload
+        // memory. Leave the allocation and pending entries retryable.
+        // The root SRV has no bounds, so include the dynamic slots too.
+        let (buffer, data) = allocate(u64::from(self.address_slots()) * 16)?;
+        let (_, _, gpu) = self.addresses.get_or_init(|| {
             crate::host::name(&buffer, || "view addresses".into());
             let data = data as usize;
             // SAFETY: a live buffer.
@@ -621,9 +629,9 @@ impl HostHeap {
             drop(made);
             #[cfg(test)]
             tests::after_view_addresses_fill(self);
-            Some((buffer, data, gpu))
+            (buffer, data, gpu)
         });
-        made.as_ref().map(|m| m.2)
+        Some(*gpu)
     }
 
     /// The slots the view addresses have an entry for: the title's and the
@@ -637,10 +645,8 @@ impl HostHeap {
         if index >= self.address_slots() {
             return;
         }
-        if let Some(made) = self.addresses.get() {
-            if let Some((_, data, _)) = made {
-                write_address(*data, index as usize, view);
-            }
+        if let Some((_, data, _)) = self.addresses.get() {
+            write_address(*data, index as usize, view);
             return;
         }
         let mut state = self.address_state.lock().unwrap_or_else(|e| e.into_inner());
@@ -671,7 +677,7 @@ impl HostHeap {
     /// for a slot past the buffer (tests).
     #[cfg(test)]
     fn words_at(&self, index: u32) -> Option<[u32; 4]> {
-        let (buffer, data, _) = self.addresses.get()?.as_ref()?;
+        let (buffer, data, _) = self.addresses.get()?;
         // SAFETY: a live buffer.
         if 16 * u64::from(index) + 16 > unsafe { buffer.GetDesc() }.Width {
             return None;
@@ -2204,6 +2210,50 @@ mod tests {
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
 
+    #[test]
+    fn view_address_table_can_retry_a_failed_allocation() {
+        let Some(heap) = HostHeap::new(false, 4) else {
+            assert!(!crate::switch::on("VICTORY_D3D12_WARP"), "forced WARP unavailable");
+            return;
+        };
+        let mut first_size = 0;
+        let failed = heap.view_addresses_with(|size| {
+            first_size = size;
+            None
+        });
+        assert!(failed.is_none());
+        assert_eq!(first_size, u64::from(heap.address_slots()) * 16);
+
+        let mut retry_size = 0;
+        let retried = heap.view_addresses_with(|size| {
+            retry_size = size;
+            host()?.upload_buffer(size)
+        });
+        eprintln!(
+            "first request={first_size}, retry request={retry_size}, recovered={}",
+            retried.is_some()
+        );
+        assert_eq!(retry_size, first_size);
+        let gpu = retried.expect("the second allocation should succeed");
+        assert_ne!(gpu, 0);
+        assert_eq!(
+            heap.view_addresses_with(|_| panic!("an initialized table needs no allocation")),
+            Some(gpu)
+        );
+        let first = heap.dynamic(1).unwrap();
+        let address = 0x1_2000u64;
+        let mut resource = [0u32; 14];
+        (resource[0], resource[4]) = (1, 64);
+        let mut desc = [0u32; 16];
+        (desc[1], desc[2], desc[6], desc[7]) = (1, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, 16, 4);
+        (desc[10], desc[11]) = (address as u32, (address >> 32) as u32);
+        assert_eq!(heap.address_at(first), Some(0));
+        heap.make_at(first, &View::Placed(false, resource, desc));
+        assert_eq!(heap.address_at(first), Some(address));
+        heap.make_null(first);
+        assert_eq!(heap.address_at(first), Some(0));
+    }
+
     /// A table made afresh lies in dynamic slots, and a shader reading a
     /// view's address (e.g. the BVH builder's base) indexes the view
     /// addresses there: they have an entry for each dynamic slot, entered
@@ -2265,7 +2315,7 @@ mod tests {
         // buffer's allocation reaches past it) stays.
         assert_eq!(heap.address_at(end), None);
         let host = host().unwrap();
-        let (buffer, data, _) = heap.addresses.get().unwrap().as_ref().unwrap();
+        let (buffer, data, _) = heap.addresses.get().unwrap();
         // SAFETY: plain queries of a live buffer.
         let (desc, size) = unsafe {
             let desc = buffer.GetDesc();
@@ -2602,6 +2652,7 @@ mod tests {
         heap.make_at(first + 5, &buf_old);
         heap.raw_pair_at(first + 4, None, 0);
 
+        assert!(heap.view_addresses_with(|_| None).is_none());
         assert!(heap.view_addresses().is_some());
         assert_eq!(
             heap.address_at(first),
