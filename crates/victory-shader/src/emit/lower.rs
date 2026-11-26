@@ -6902,15 +6902,19 @@ impl<'a> Lower<'a> {
             unreachable!()
         };
         let h = self.half_src(inst, k)?;
+        Ok(self.modified_half(h, fused, v.abs >> k & 1 != 0, v.neg >> k & 1 != 0))
+    }
+
+    fn modified_half(&mut self, h: V, fused: bool, abs: bool, neg: bool) -> V {
         let mut f = self.widen_half(h, fused);
-        if v.abs >> k & 1 != 0 {
+        if abs {
             f = self.unary(6, f);
         }
-        if v.neg >> k & 1 != 0 {
+        if neg {
             let z = self.s.m.f32(0x8000_0000);
             f = self.s.m.bin(self.cur, Bin::Sub, z, f);
         }
-        Ok(f)
+        f
     }
 
     /// Writes a 16-bit result (low bits of `x`) into the destination's low
@@ -7082,7 +7086,7 @@ impl<'a> Lower<'a> {
                 };
                 let m = self.s.m.i32(0xFFFF);
                 let x = self.s.m.bin(c, Bin::And, x, m);
-                self.widen_half(x, fused)
+                self.modified_half(x, fused, v.abs & 4 != 0, v.neg & 4 != 0)
             } else {
                 self.half_fsrc_for(inst, 2, fused)?
             };

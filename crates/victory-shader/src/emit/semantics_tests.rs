@@ -3181,3 +3181,79 @@ fn lds_out_of_bounds_reads_zero_and_drops_writes() {
         probe(masked, inputs, INT, |i| vec![if i[0] > i[1] { 0 } else { OLD }]),
     ]));
 }
+
+/// RDNA2 `v_fmac_f16` in VOP3 encoding (`0x136`) honors `neg[2]` (`-acc`) and
+/// `abs[2]` (`|acc|`) on the accumulator VGPR's low half while preserving its
+/// high half. The rows are of the oracle's mode `0xc0` table (IEEE=0,
+/// DX10_CLAMP=1, f16 denormals kept), the console mode this file models (see
+/// the module header); a probe does not set a mode itself.
+/// All sixteen rows measured on gfx1031 in `boykopovar/AnyPS5`
+/// `core/libs/prx/libSceAgcDriver/tests/execution/VFmacF16Modifiers.cpp` (`d204d17e7c`).
+/// Only rows 7 and 8 propagate a NaN. The reference allows host NaN bits there.
+#[test]
+fn v_fmac_f16_accumulator_modifiers_match_rdna2_oracle() {
+    const ROWS: [([u32; 4], u32, u32); 16] = [
+        ([0x3C00, 0x4000, 0xABCD_3C00, OLD], 0xABCD_3C00, 0xABCD_4200),
+        ([0x3C00, 0x4000, 0xABCD_BC00, OLD], 0xABCD_4200, 0xABCD_4200),
+        ([0x4000, 0x4200, 0xABCD_C600, OLD], 0xABCD_4A00, 0xABCD_4A00),
+        ([0x0000, 0xBC00, 0xABCD_0000, OLD], 0xABCD_8000, 0xABCD_0000),
+        ([0x3555, 0x4200, 0xABCD_BC00, OLD], 0xABCD_4000, 0xABCD_4000),
+        ([0x3C00, 0x3C00, 0xABCD_7C00, OLD], 0xABCD_FC00, 0xABCD_7C00),
+        ([0x7C00, 0x3C00, 0xABCD_FC00, OLD], 0xABCD_7C00, 0xABCD_7C00),
+        ([0x3C00, 0x3C00, 0xABCD_7E01, OLD], 0xABCD_FE01, 0xABCD_7E01),
+        ([0x7E01, 0x3C00, 0xABCD_3C00, OLD], 0xABCD_7E01, 0xABCD_7E01),
+        ([0x3C00, 0x0001, 0xABCD_0000, OLD], 0xABCD_0001, 0xABCD_0001),
+        ([0x4000, 0x3800, 0xABCD_BC00, OLD], 0xABCD_4000, 0xABCD_4000),
+        ([0x3C01, 0x3C01, 0xABCD_BC00, OLD], 0xABCD_4001, 0xABCD_4001),
+        ([0x7BFF, 0x4000, 0xABCD_FBFF, OLD], 0xABCD_7C00, 0xABCD_7C00),
+        ([0x5C00, 0x5C00, 0xABCD_0000, OLD], 0xABCD_7C00, 0xABCD_7C00),
+        ([0x3800, 0x3800, 0xABCD_3400, OLD], 0xABCD_0000, 0xABCD_3800),
+        ([0xBC00, 0x4000, 0xABCD_4000, OLD], 0xABCD_C400, 0xABCD_0000),
+    ];
+    let inputs: Vec<[u32; 4]> = ROWS.iter().map(|&(i, _, _)| i).collect();
+    let fmac_probe = |m: M, pick: fn(&([u32; 4], u32, u32)) -> u32| {
+        let mut body = vec![vop1(0x01, 5, v(3))];
+        body.extend(vop3(0x136, 5, [v(1), v(2), 0], m));
+        probe(body, inputs.clone(), F16, move |i| {
+            vec![pick(
+                ROWS.iter()
+                    .find(|&&(r, _, _)| r == i)
+                    .expect("known input"),
+            )]
+        })
+    };
+    assert_clean(check(&[
+        fmac_probe(M { neg: 4, ..NONE }, |r| r.1),
+        fmac_probe(M { abs: 4, ..NONE }, |r| r.2),
+    ]));
+}
+
+/// Moving the accumulator to the high half should move the write with it.
+/// These finite examples exercise destination selection separately from the
+/// gfx1031 table, which measures low-half destinations only.
+#[test]
+fn v_fmac_f16_accumulator_modifiers_use_the_selected_high_half() {
+    // a * b = 2. The high accumulators are +1 and -1; leave the low bits alone.
+    const INPUTS: [[u32; 4]; 2] = [
+        [0x3C00, 0x4000, 0x3C00_C800, OLD],
+        [0x3C00, 0x4000, 0xBC00_4480, OLD],
+    ];
+    let high = |abs, neg, expected: [u32; 2]| {
+        let mut body = vec![vop1(0x01, 5, v(3))];
+        body.extend(vop3(
+            0x136,
+            5,
+            [v(1), v(2), 0],
+            M { abs, neg, opsel: 8, ..NONE },
+        ));
+        probe(body, INPUTS.to_vec(), INT, move |i| {
+            let index = usize::from(i == INPUTS[1]);
+            vec![(expected[index] << 16) | (i[2] & 0xFFFF)]
+        })
+    };
+    assert_clean(check(&[
+        high(0, 4, [0x3C00, 0x4200]),
+        high(4, 0, [0x4200, 0x4200]),
+        high(4, 4, [0x3C00, 0x3C00]),
+    ]));
+}
