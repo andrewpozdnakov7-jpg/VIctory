@@ -122,6 +122,14 @@ impl Drop for State {
     }
 }
 
+/// A view with no format of its own uses the host resource's format.
+fn effective_target_format(
+    view: Option<DXGI_FORMAT>,
+    resource: impl FnOnce() -> DXGI_FORMAT,
+) -> DXGI_FORMAT {
+    view.filter(|f| f.0 != 0).unwrap_or_else(resource)
+}
+
 fn normalize_target_formats(
     mut rt_formats: D3D12_RT_FORMAT_ARRAY,
     dsv_format: DXGI_FORMAT,
@@ -443,22 +451,30 @@ impl State {
             self.targets.push(record.resource as usize);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(list, record.resource);
+            let desc = record.desc();
             if (rt_formats.NumRenderTargets as usize) < rt_formats.RTFormats.len() {
                 let i = rt_formats.NumRenderTargets as usize;
-                rt_formats.RTFormats[i] = record.format();
+                rt_formats.RTFormats[i] = effective_target_format(desc.map(|d| d.Format), || {
+                    // SAFETY: a live host resource.
+                    unsafe { texture.GetDesc() }.Format
+                });
                 rt_formats.NumRenderTargets += 1;
             }
-            rtvs.push(host.rtv(&texture, record.desc().as_ref()));
+            rtvs.push(host.rtv(&texture, desc.as_ref()));
         }
         self.depth = 0;
         let mut dsv_format = DXGI_FORMAT(0);
         let dsv = crate::descriptor::dsv_record(depth).and_then(|record| {
             let texture = crate::resource::host_resource(record.resource)?;
             self.depth = record.resource as usize;
-            dsv_format = record.format();
+            let desc = record.depth_desc();
+            dsv_format = effective_target_format(desc.map(|d| d.Format), || {
+                // SAFETY: a live host resource.
+                unsafe { texture.GetDesc() }.Format
+            });
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(list, record.resource);
-            Some(host.dsv(&texture, record.depth_desc().as_ref()))
+            Some(host.dsv(&texture, desc.as_ref()))
         });
         (self.rt_formats, self.dsv_format) = normalize_target_formats(rt_formats, dsv_format);
         // SAFETY: an open list; the views were just made.
@@ -2077,6 +2093,28 @@ const QUAD_STRIP: u32 = 20;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn target_formats_follow_the_host_views() {
+        use windows::Win32::Graphics::Dxgi::Common::{
+            DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_UNKNOWN,
+        };
+
+        assert_eq!(
+            effective_target_format(None, || DXGI_FORMAT_R8G8B8A8_UNORM),
+            DXGI_FORMAT_R8G8B8A8_UNORM
+        );
+        assert_eq!(
+            effective_target_format(Some(DXGI_FORMAT_UNKNOWN), || DXGI_FORMAT_D32_FLOAT),
+            DXGI_FORMAT_D32_FLOAT
+        );
+        assert_eq!(
+            effective_target_format(Some(DXGI_FORMAT_R8G8B8A8_UNORM), || {
+                panic!("an explicit host view format takes precedence")
+            }),
+            DXGI_FORMAT_R8G8B8A8_UNORM
+        );
+    }
 
     /// A root signature that indexes the heaps directly needs one of each
     /// kind bound before it is set: our sampler heap stands in for a title
