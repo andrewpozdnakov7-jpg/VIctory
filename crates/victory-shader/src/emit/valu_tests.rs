@@ -2281,3 +2281,30 @@ fn v_mul_legacy_f32_treats_denormals_as_zero() {
         );
     });
 }
+
+#[test]
+fn sat_pk_u8_i16_clamps_signed_halves_into_low_bytes() {
+    let limits = [i16::MIN, -257, -1, 0, 1, 254, 255, 256, i16::MAX];
+    let cases: Vec<_> = limits
+        .into_iter()
+        .flat_map(|low| {
+            limits.into_iter().map(move |high| {
+                let src = u32::from(low as u16) | (u32::from(high as u16) << 16);
+                [src, u32::MAX, 0, 0]
+            })
+        })
+        .collect();
+    let seed = vop1(0x001, 0, vgpr(2)); // v_mov_b32 v0, v2
+    let [op, src] = vop3(0x1e2, 0, vgpr(1), 0, 0);
+    for (encoding, code) in [
+        ("VOP1", &[seed, vop1(0x062, 0, vgpr(1))][..]),
+        ("VOP3", &[seed, op, src][..]),
+    ] {
+        let shader = build_valu_cs(code);
+        run_cases(&shader, &cases, |backend, _, [word, ..], actual| {
+            let low = (word as i16).clamp(0, 255) as u32;
+            let high = ((word >> 16) as i16).clamp(0, 255) as u32;
+            assert_eq!(actual, low | (high << 8), "{backend} {encoding}: {word:#010x}");
+        });
+    }
+}
