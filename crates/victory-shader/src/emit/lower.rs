@@ -7922,7 +7922,7 @@ impl<'a> Lower<'a> {
             let mip = if uav {
                 self.s.m.undef(self.s.t.i32)
             } else {
-                addr_at(self, 0, false, 0)?
+                addr_val(self, 0)?
             };
             let i32t = self.s.t.i32;
             let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
