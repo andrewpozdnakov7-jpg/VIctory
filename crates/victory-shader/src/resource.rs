@@ -1244,7 +1244,14 @@ impl<'a> Tracer<'a> {
         let Some(lanes) = self.lanes else {
             return true;
         };
-        let mut edge = vec![(lanes.reach[q], true)];
+        let mut edge = Known::new();
+        Self::assume_edge(lanes, q, b, &mut edge);
+        // The very test lowering makes, so both drop the same edges.
+        lanes.bools.meet(&edge)
+    }
+
+    fn assume_edge(lanes: &Structured, q: usize, b: usize, known: &mut Known) {
+        known.push((lanes.reach[q], true));
         if let LaneExit::Branch {
             when,
             taken,
@@ -1252,10 +1259,8 @@ impl<'a> Tracer<'a> {
         } = lanes.exits[q]
             && taken != not_taken
         {
-            edge.push((when, taken == b));
+            known.push((when, taken == b));
         }
-        // The very test lowering makes, so both drop the same edges.
-        lanes.bools.meet(&edge)
     }
 
     /// Words that `s_cselect` (or `s_cmov`) picks by one SCC value, traced
@@ -1541,7 +1546,7 @@ impl<'a> Tracer<'a> {
 
     /// [`Self::lane_term`], where every lane in `known` runs each VGPR copy
     /// it follows (or keeps an unchanged prior value on a masked `v_mov_b32`).
-    fn lane_value(&self, mut t: Term, known: &Known) -> Result<Term, &'static str> {
+    fn lane_value(&self, mut t: Term, known: &Known, depth: usize) -> Result<Term, &'static str> {
         for _ in 0..MAX_JOINS * 2 {
             let Term::Value(v) = t else { break };
             let next = self.vstep(v);
@@ -1552,7 +1557,7 @@ impl<'a> Tracer<'a> {
                 && let Some(site) = self.defs[v.0 as usize]
                 && let Err(why) = self.runs(site, known)
             {
-                if let Some(prior) = self.redundant_mov_prior(v, site, next, known) {
+                if let Some(prior) = self.redundant_mov_prior(v, site, next, known, depth) {
                     t = Term::Value(prior);
                     continue;
                 }
@@ -1572,6 +1577,7 @@ impl<'a> Tracer<'a> {
         site: Site,
         next: Term,
         known: &Known,
+        depth: usize,
     ) -> Option<Value> {
         let lanes = self.lanes?;
         let guard = *lanes.guards.get(site.0).and_then(|g| g.get(site.1))?;
@@ -1598,7 +1604,7 @@ impl<'a> Tracer<'a> {
             })?;
         let mut active = known.clone();
         active.extend([(lanes.reach[site.0], true), (guard, true)]);
-        if !self.consistent(&active) || self.same_under(Term::Value(prior), next, &active, 0) {
+        if !self.consistent(&active) || self.same_under(Term::Value(prior), next, &active, depth) {
             Some(prior)
         } else {
             None
@@ -1641,10 +1647,30 @@ impl<'a> Tracer<'a> {
         let (Some(ia), Some(ib)) = (self.def(a), self.def(b)) else {
             return false;
         };
-        ia.name() == ib.name()
-            && ia.name().starts_with("v_cmp_")
-            && ia.fields == ib.fields
-            && ia.reads == ib.reads
+        let name = ia.name();
+        if name != ib.name() || !name.starts_with("v_cmp_") || ia.fields != ib.fields {
+            return false;
+        }
+        if ia.reads == ib.reads {
+            return true;
+        }
+        // The lane atom is the comparison before masking its result with EXEC.
+        // A scalar EXEC operand still counts as an input, as do special sources
+        // such as execz, which are excluded by the operand checks below.
+        let Fields::Valu(fields) = &ia.fields else {
+            return false;
+        };
+        (name.ends_with("_u32") || name.ends_with("_i32"))
+            && fields.dpp.is_none()
+            && fields.sdwa.is_none()
+            && fields.src.iter().all(|src| match *src {
+                Operand::Vector { reg, dwords: 1 } => ia.read(Reg::V(reg)) == ib.read(Reg::V(reg)),
+                Operand::Scalar { code, dwords: 1 } => {
+                    ia.read(Reg::S(code)) == ib.read(Reg::S(code))
+                }
+                Operand::Literal(_) | Operand::Const(128..=248) => true,
+                _ => false,
+            })
     }
 
     /// Whether `a` and `b` resolve to the same value on every lane in `known`.
@@ -1652,10 +1678,10 @@ impl<'a> Tracer<'a> {
         if depth >= MAX_JOINS {
             return false;
         }
-        let Ok(a) = self.lane_value(a, known) else {
+        let Ok(a) = self.lane_value(a, known, depth + 1) else {
             return false;
         };
-        let Ok(b) = self.lane_value(b, known) else {
+        let Ok(b) = self.lane_value(b, known, depth + 1) else {
             return false;
         };
         if a == b {
@@ -1670,9 +1696,16 @@ impl<'a> Tracer<'a> {
             };
             let block = &self.p.blocks[pb];
             let phi = &block.phis[pi];
+            if block
+                .preds
+                .iter()
+                .any(|&pred| self.rpo[pred] >= self.rpo[pb])
+            {
+                return false;
+            }
             block.preds.iter().zip(&phi.args).all(|(&pred, &arg)| {
                 let mut edge = known.clone();
-                edge.push((lanes.reach[pred], true));
+                Self::assume_edge(lanes, pred, pb, &mut edge);
                 !self.consistent(&edge)
                     || self.same_under(Term::Value(arg), other, &edge, depth + 1)
             })
@@ -1741,7 +1774,7 @@ impl<'a> Tracer<'a> {
     ) -> Result<Source, &'static str> {
         let words = words
             .iter()
-            .map(|&w| self.lane_value(w, known))
+            .map(|&w| self.lane_value(w, known, 0))
             .collect::<Result<Vec<_>, _>>()?;
         let words = &words[..];
         let Some(&lane) = words.iter().find(|&&w| self.varies(w)) else {
@@ -1975,16 +2008,7 @@ impl<'a> Tracer<'a> {
         let mut args = Vec::new();
         for (j, &q) in preds.iter().enumerate() {
             let n = known.len();
-            known.push((lanes.reach[q], true));
-            if let LaneExit::Branch {
-                when,
-                taken,
-                not_taken,
-            } = lanes.exits[q]
-                && taken != not_taken
-            {
-                known.push((when, taken == block));
-            }
+            Self::assume_edge(lanes, q, block, known);
             let arg = if meet(lanes, known) {
                 let edge: Vec<Term> = words
                     .iter()
@@ -3996,8 +4020,9 @@ pub(crate) mod tests {
         );
     }
 
-    #[test]
-    fn joined_descriptor_redundant_partial_write() {
+    /// After the descriptor join, move s`source` to v4 in the lower 16 lanes.
+    /// s24 is the value that those lanes already hold, while s28 changes it.
+    pub(crate) fn joined_descriptor_partial_write(source: u32) -> Vec<u32> {
         let mut words = WATERFALL_JOINED_WAVE32.to_vec();
         let at = words.iter().position(|w| *w == 0x887e147e).unwrap() + 1;
         words.splice(
@@ -4005,26 +4030,35 @@ pub(crate) mod tests {
             [
                 0x7d880090, // compare lane ID < 16
                 0xbe923c6a, // save EXEC to s18 and enable the lower 16 lanes
-                0x7e080218, // v4 = s24, the original value from their then arm
+                0x7e080200 | source,
                 0xbefe0312, // restore EXEC
             ],
         );
-        waterfall(&words, false).unwrap();
+        words
+    }
+
+    #[test]
+    fn joined_descriptor_redundant_partial_write() {
+        let words = joined_descriptor_partial_write(24);
+        let found = waterfall(&words, false).unwrap();
+        let image = found
+            .descriptors
+            .iter()
+            .find(|d| matches!(d.source, Source::LanePhi { .. }))
+            .unwrap();
+        let mut offsets: Vec<_> = image
+            .source
+            .leaves()
+            .into_iter()
+            .map(|s| table_offset(&found, s))
+            .collect();
+        offsets.sort_unstable();
+        assert_eq!(offsets, [0, 0x20]);
     }
 
     #[test]
     fn joined_descriptor_non_redundant_partial_write_fails() {
-        let mut words = WATERFALL_JOINED_WAVE32.to_vec();
-        let at = words.iter().position(|w| *w == 0x887e147e).unwrap() + 1;
-        words.splice(
-            at..at,
-            [
-                0x7d880090, // compare lane ID < 16
-                0xbe923c6a, // save EXEC to s18 and enable the lower 16 lanes
-                0x7e08021c, // v4 = s28, overwriting the then arm's value
-                0xbefe0312, // restore EXEC
-            ],
-        );
+        let words = joined_descriptor_partial_write(28);
         let err = waterfall(&words, false).unwrap_err();
         assert!(
             matches!(

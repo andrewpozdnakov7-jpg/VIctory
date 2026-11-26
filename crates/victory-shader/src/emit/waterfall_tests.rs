@@ -177,12 +177,15 @@ fn sampled(shader: &HostShader) -> Vec<(&'static str, Vec<f32>)> {
 
 #[test]
 fn lanes_sample_the_texture_their_if_else_arm_chose() {
-    use crate::resource::tests::WATERFALL_JOINED_WAVE32;
-    let shader = build(WATERFALL_JOINED_WAVE32, false);
-    for (label, red) in sampled(&shader) {
-        // Lanes below 16 took the first texture, the others the second.
-        let want: Vec<f32> = (0..32).map(|l| if l < 16 { 1.0 } else { 2.0 }).collect();
-        assert_eq!(red, want, "{label}");
+    use crate::resource::tests::{WATERFALL_JOINED_WAVE32, joined_descriptor_partial_write};
+    let redundant = joined_descriptor_partial_write(24);
+    for words in [WATERFALL_JOINED_WAVE32, redundant.as_slice()] {
+        let shader = build(words, false);
+        for (label, red) in sampled(&shader) {
+            // Lanes below 16 took the first texture, the others the second.
+            let want: Vec<f32> = (0..32).map(|l| if l < 16 { 1.0 } else { 2.0 }).collect();
+            assert_eq!(red, want, "{label}");
+        }
     }
 }
 
