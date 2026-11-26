@@ -324,6 +324,22 @@ mod tests {
         assert_eq!(fake.borrow().log, ["q1: reset", "q1: after"]);
     }
 
+    #[test]
+    fn a_wait_satisfied_by_earlier_segments_never_reports_a_stall() {
+        let fake = RefCell::new(Fake::default());
+        fake.borrow_mut().writes.insert("publish", vec![(0x100, 7)]);
+        let mut held = Held::default();
+        held.push(1, Item::Segment("prepare", vec![]));
+        held.push(1, Item::Segment("publish", vec![]));
+        held.push(1, Item::Segment("consume", vec![ge(0x100, 7)]));
+
+        let p = pump(&mut held, &fake);
+        assert_eq!(fake.borrow().log, ["q1: prepare publish", "q1: consume"]);
+        assert_eq!((p.pieces, p.segments), (2, 3));
+        assert!(p.waited.is_empty(), "the first wait check must see the published value");
+        assert!(!held.holds_work(1));
+    }
+
     /// The compute queue's list waits for a value the graphics queue's list
     /// writes at its end: it runs after it.
     #[test]
