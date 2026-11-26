@@ -35,8 +35,6 @@ pub(crate) struct Pending {
     /// whether a worker took it (it may be in both queues).
     now: AtomicBool,
     taken: AtomicBool,
-    /// Taken by a worker from the slow queue.
-    was_slow: AtomicBool,
     made: OnceLock<Option<HostPipeline>>,
     #[cfg(feature = "diagnostics")]
     pub(super) skipped_shader: Option<String>,
@@ -79,7 +77,6 @@ impl Pending {
             queued: AtomicBool::new(false),
             now: AtomicBool::new(false),
             taken: AtomicBool::new(false),
-            was_slow: AtomicBool::new(false),
             made,
             #[cfg(feature = "diagnostics")]
             skipped_shader,
@@ -313,19 +310,19 @@ impl Queues {
         self.lists[idx].push_back(p);
     }
 
-    fn pop(&mut self, slow_cap: usize) -> Option<Arc<Pending>> {
+    /// The second field owns a slot in the slow-worker budget.
+    fn pop(&mut self, slow_cap: usize) -> Option<(Arc<Pending>, bool)> {
         if let Some(p) = self.lists[0]
             .pop_front()
             .or_else(|| self.lists[1].pop_front())
         {
-            return Some(p);
+            return Some((p, false));
         }
         if self.slow_now < slow_cap
             && let Some(p) = self.lists[2].pop_front()
         {
-            p.was_slow.store(true, Ordering::Relaxed);
             self.slow_now += 1;
-            return Some(p);
+            return Some((p, true));
         }
         None
     }
@@ -382,7 +379,7 @@ fn work() {
         slow_limit(std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8)));
     let (lock, work) = &QUEUES;
     loop {
-        let p = {
+        let entry = {
             let mut queues = lock.lock().unwrap_or_else(|e| e.into_inner());
             loop {
                 if let Some(p) = queues.pop(slow_cap) {
@@ -399,19 +396,8 @@ fn work() {
                 }
             }
         };
-        if p.taken.swap(true, Ordering::Relaxed) {
-            if p.was_slow.swap(false, Ordering::Relaxed) {
-                let mut queues = lock.lock().unwrap_or_else(|e| e.into_inner());
-                queues.slow_now = queues.slow_now.saturating_sub(1);
-                work.notify_one();
-            }
+        if !run_queued(entry, &QUEUES, Pending::make) {
             continue; // its other queue entry
-        }
-        p.make();
-        if p.was_slow.swap(false, Ordering::Relaxed) {
-            let mut queues = lock.lock().unwrap_or_else(|e| e.into_inner());
-            queues.slow_now = queues.slow_now.saturating_sub(1);
-            work.notify_one();
         }
         if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
             drained();
@@ -419,6 +405,23 @@ fn work() {
             super::library::save(false);
         }
     }
+}
+
+/// Compiles the first entry for a pipeline and returns this entry's slot.
+fn run_queued(
+    (pending, reserved_slow_slot): (Arc<Pending>, bool),
+    (lock, work): &(Mutex<Queues>, Condvar),
+    make: impl FnOnce(&Pending),
+) -> bool {
+    let first = !pending.taken.swap(true, Ordering::Relaxed);
+    if first {
+        make(&pending);
+    }
+    if reserved_slow_slot {
+        lock.lock().unwrap_or_else(|e| e.into_inner()).slow_now -= 1;
+        work.notify_one();
+    }
+    first
 }
 
 /// The most pipelines waiting at once since the workers last ran out.
@@ -498,6 +501,47 @@ mod tests {
     }
 
     #[test]
+    fn a_discarded_draw_entry_cannot_release_another_workers_slow_slot() {
+        let new = || {
+            Arc::new(Pending::new(
+                Vec::new(),
+                None,
+                #[cfg(feature = "diagnostics")]
+                &[],
+            ))
+        };
+        let (first, second) = (new(), new());
+        let queue = (Mutex::new(Queues::new()), Condvar::new());
+        {
+            let mut waiting = queue.0.lock().unwrap();
+            waiting.push(first.clone(), false, true);
+            waiting.push(second.clone(), false, true);
+        }
+
+        // The draw passed enqueue's taken check, but it has not acquired
+        // the queue lock to push the urgent entry yet.
+        assert!(!first.taken.load(Ordering::Relaxed));
+        let slow = queue.0.lock().unwrap().pop(1).unwrap();
+        assert!(Arc::ptr_eq(&slow.0, &first));
+        assert!(run_queued(slow, &queue, |_| {
+            let duplicate = {
+                let mut waiting = queue.0.lock().unwrap();
+                waiting.push(first.clone(), true, false);
+                waiting.pop(1).unwrap()
+            };
+            assert!(!run_queued(duplicate, &queue, |_| {
+                panic!("the pipeline is already compiling")
+            }));
+            assert!(
+                queue.0.lock().unwrap().pop(1).is_none(),
+                "the running slow compile still owns the only slot"
+            );
+        }));
+        let next = queue.0.lock().unwrap().pop(1).unwrap();
+        assert!(Arc::ptr_eq(&next.0, &second));
+    }
+
+    #[test]
     fn pipelines_known_to_take_long_leave_workers_for_the_others() {
         let new = || {
             Arc::new(Pending::new(
@@ -515,13 +559,14 @@ mod tests {
         queues.push(quick.clone(), false, false);
         // Requested and quick early pipelines go ahead of slow early ones;
         // at most `slow_cap` slow early pipelines run concurrently.
-        assert!(Arc::ptr_eq(&queues.pop(1).unwrap(), &asked));
-        assert!(!asked.was_slow.load(Ordering::Relaxed));
-        assert!(Arc::ptr_eq(&queues.pop(1).unwrap(), &quick));
-        assert!(Arc::ptr_eq(&queues.pop(1).unwrap(), &long));
+        let (pending, reserved_slow_slot) = queues.pop(1).unwrap();
+        assert!(Arc::ptr_eq(&pending, &asked));
+        assert!(!reserved_slow_slot);
+        assert!(Arc::ptr_eq(&queues.pop(1).unwrap().0, &quick));
+        assert!(Arc::ptr_eq(&queues.pop(1).unwrap().0, &long));
         assert!(queues.pop(1).is_none());
         queues.slow_now -= 1;
-        assert!(Arc::ptr_eq(&queues.pop(1).unwrap(), &longer));
+        assert!(Arc::ptr_eq(&queues.pop(1).unwrap().0, &longer));
         assert!(queues.pop(1).is_none());
     }
 
