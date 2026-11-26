@@ -278,6 +278,10 @@ fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
     }
 }
 
+#[cfg(all(test, feature = "diagnostics"))]
+#[path = "host/timing_stats_warp.rs"]
+mod timing_stats_warp;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -367,7 +371,7 @@ const STAMPS: u32 = 4096;
 #[cfg(feature = "diagnostics")]
 const STATS_BYTES: usize = 88;
 
-/// A marker's text and the host range its command reads (diagnostics).
+/// A command's text and the host range it reads (diagnostics).
 #[cfg(feature = "diagnostics")]
 type Note = (String, Option<(u64, u64)>);
 
@@ -387,7 +391,7 @@ pub(crate) fn dred_on() -> bool {
 
 /// Whether each list of a submission runs and is timed on its own, slow
 /// ones logged with their commands (`VICTORY_GPU_TIMING`, diagnostics
-/// builds; the commands are noted with `VICTORY_D3D12_DRED` on).
+/// builds).
 #[cfg(feature = "diagnostics")]
 fn timing() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
@@ -677,7 +681,9 @@ impl Host {
         crate::copystat::add(crate::copystat::C::FaultsPrep, crate::copystat::page_faults().saturating_sub(faults));
         // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
         #[cfg(feature = "diagnostics")]
-        let groups: Vec<&[Option<ID3D12CommandList>]> = if timing() {
+        let timed = timing();
+        #[cfg(feature = "diagnostics")]
+        let groups: Vec<&[Option<ID3D12CommandList>]> = if timed {
             firsts
                 .iter()
                 .zip(firsts.iter().skip(1).chain([&lists.len()]))
@@ -711,13 +717,19 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             crate::resource::life::note(0, crate::resource::life::RAN, *submitted, 0);
             #[cfg(feature = "diagnostics")]
-            if groups.len() > 1 && started.elapsed() > std::time::Duration::from_millis(50) {
-                // SAFETY: a plain query.
-                let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
-                let commands = runs[i].notes.lock().unwrap_or_else(|e| e.into_inner()).len();
-                tracing::warn!(ms = started.elapsed().as_millis(), commands, "slow host list");
-                for (ms, op) in runs[i].slowest(frequency, 6) {
-                    tracing::warn!("slow list command, {ms:.1} ms: {op}");
+            if timed && started.elapsed() > std::time::Duration::from_millis(50) {
+                // SAFETY: plain queries. Read back only a completed submission.
+                let completed = unsafe { self.fence.GetCompletedValue() };
+                // SAFETY: query the timestamp frequency of the live queue.
+                let frequency = unsafe { self.queue.GetTimestampFrequency() }.ok();
+                if completed != u64::MAX && completed >= *submitted
+                    && let Some(hz) = frequency.filter(|&hz| hz != 0)
+                {
+                    let commands = runs[i].notes.lock().unwrap_or_else(|e| e.into_inner()).len();
+                    tracing::warn!(ms = started.elapsed().as_millis(), commands, "slow host list");
+                    for (ms, op) in runs[i].slowest(hz, 6) {
+                        tracing::warn!("slow list command, {ms:.1} ms: {op}");
+                    }
                 }
             }
             // SAFETY: a plain query.
@@ -1112,7 +1124,11 @@ impl HostList {
     #[cfg(feature = "diagnostics")]
     fn slowest(&self, frequency: u64, n: usize) -> Vec<(f64, String)> {
         let notes = self.notes.lock().unwrap_or_else(|e| e.into_inner());
-        let (Some((_, back)), count) = (self.stamps(), notes.len().min(STAMPS as usize - 1)) else {
+        let count = notes.len().min(STAMPS as usize - 1);
+        if count == 0 {
+            return Vec::new();
+        }
+        let Some((_, back)) = self.stamps() else {
             return Vec::new();
         };
         let mut data = std::ptr::null_mut();
@@ -1128,7 +1144,7 @@ impl HostList {
         };
         // Each command's pipeline statistics (11 counters of 8 bytes).
         let stats: Vec<u64> = match self.stats() {
-            Some((_, back)) if count > 0 => {
+            Some((_, back)) => {
                 let mut data = std::ptr::null_mut();
                 let range = D3D12_RANGE { Begin: 0, End: count * STATS_BYTES };
                 // SAFETY: a read-back buffer the finished list resolved into.
@@ -1165,22 +1181,22 @@ impl HostList {
 
     pub(crate) fn close(&self) {
         #[cfg(feature = "diagnostics")]
-        if let Some((heap, back)) = self.stamps() {
+        {
             let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
-            // SAFETY: an open list, our heap and read-back buffer.
-            unsafe {
-                self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, count);
-                self.list.ResolveQueryData(heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, count + 1, back, 0);
-            }
-            if let Some((heap, back)) = self.stats() {
-                let open = self.stats_open.swap(u32::MAX, Ordering::Relaxed);
-                // SAFETY: an open list, our heap and read-back buffer; every query below `count` was begun
-                // and is ended here or at the next note.
+            if count != 0 && let Some((stamp_heap, stamp_back)) = self.stamps() {
+                let stats = self.stats();
+                // SAFETY: an open list and our query heaps and readback buffers.
+                // End the last stats query before the final timestamp and both resolves.
                 unsafe {
-                    if open != u32::MAX {
-                        self.list.EndQuery(heap, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, open);
+                    if let Some((heap, _)) = stats {
+                        let open = self.stats_open.swap(u32::MAX, Ordering::Relaxed);
+                        if open != u32::MAX {
+                            self.list.EndQuery(heap, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, open);
+                        }
                     }
-                    if count > 0 {
+                    self.list.EndQuery(stamp_heap, D3D12_QUERY_TYPE_TIMESTAMP, count);
+                    self.list.ResolveQueryData(stamp_heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, count + 1, stamp_back, 0);
+                    if let Some((heap, back)) = stats {
                         self.list.ResolveQueryData(heap, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 0, count, back, 0);
                     }
                 }
@@ -1392,23 +1408,30 @@ impl HostList {
 
     #[cfg(feature = "diagnostics")]
     fn note(&self, what: impl FnOnce() -> String, range: Option<(u64, u64)>) {
-        if dred_on() {
-            let at = self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32;
-            if let Some((heap, _)) = self.stamps() && at < STAMPS - 1 {
-                // SAFETY: an open list and our query heap.
-                unsafe { self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, at) };
-            }
-            if let Some((heap, _)) = self.stats() && at < STAMPS - 1 {
-                let open = self.stats_open.swap(at, Ordering::Relaxed);
-                // SAFETY: an open list and our query heap; one statistics query is open at a time.
-                unsafe {
+        let dred = dred_on();
+        if !dred && !timing() {
+            return;
+        }
+        let at = self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32;
+        if at < STAMPS - 1 && let Some((stamp_heap, _)) = self.stamps() {
+            let stats = self.stats().map(|(heap, _)| heap);
+            // SAFETY: an open list and our heaps. A boundary closes the
+            // previous stats query, takes its timestamp and opens the next.
+            unsafe {
+                if let Some(heap) = stats {
+                    let open = self.stats_open.swap(at, Ordering::Relaxed);
                     if open != u32::MAX {
                         self.list.EndQuery(heap, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, open);
                     }
+                }
+                self.list.EndQuery(stamp_heap, D3D12_QUERY_TYPE_TIMESTAMP, at);
+                if let Some(heap) = stats {
                     self.list.BeginQuery(heap, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, at);
                 }
             }
-            let what = what();
+        }
+        let what = what();
+        if dred {
             traced(&what);
             let text: Vec<u16> = what.encode_utf16().chain([0]).collect();
             const UNICODE: u32 = 0;
@@ -1416,11 +1439,8 @@ impl HostList {
             unsafe {
                 self.list.SetMarker(UNICODE, Some(text.as_ptr().cast()), 2 * text.len() as u32)
             };
-            self.notes
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .push((what, range));
         }
+        self.notes.lock().unwrap_or_else(|e| e.into_inner()).push((what, range));
     }
 
     /// Notes a texture the list renders to or writes, in a listed frame.
