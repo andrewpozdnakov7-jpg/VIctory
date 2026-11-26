@@ -35,6 +35,11 @@ fn the_code_table_starts_after_the_instructions() {
 
 /// Whether a synthetic compute program translates with these input registers.
 fn lowers(words: &[u32], rsrc2: u32) -> Result<(), crate::ShaderError> {
+    lowered(words, rsrc2).map(|_| ())
+}
+
+/// [`lowers`], keeping the lowered program so its DXIL can be inspected.
+fn lowered(words: &[u32], rsrc2: u32) -> Result<Lowered, crate::ShaderError> {
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
     let native = NativeProgram {
         stage: HwStage::Cs,
@@ -64,7 +69,6 @@ fn lowers(words: &[u32], rsrc2: u32) -> Result<(), crate::ShaderError> {
         mesh_stride: 0,
         view_marks: false,
     })
-    .map(|_| ())
 }
 
 /// Lowers a compute program with the root parameters `layout` (in user
@@ -309,6 +313,104 @@ fn a_compressed_export_unpacks_two_f16_channels_per_dword() {
     // stored values need a D3D run; the DXIL here is bitcode, whose
     // function names are not contiguous bytes to search.
     lowers_ps(&words).unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn a_compressed_export_draws_four_channels_through_register_copies() {
+    use crate::dxbc::{self, Container, FourCC};
+    use crate::emit::{container, emit, host, validator};
+    use crate::native::{Usage, VsInput};
+
+    let _one = crate::emit::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let host = match host::Host::new(false).or_else(|_| host::Host::new(true)) {
+        Ok(host) => host,
+        Err(e) => {
+            eprintln!("no SM 6.6 device ({e}); skipped");
+            return;
+        }
+    };
+    let mut words = vec![
+        0x7E00_02F2,                             // v_mov_b32 v0, 1.0
+        0x7E02_02F6,                             // v_mov_b32 v1, 4.0
+        0x2F << 25 | 2 << 17 | 0xF0,              // v_cvt_pkrtz_f16_f32 v2, 0.5, v0
+        0x2F << 25 | 3 << 17 | 1 << 9 | 0xF4,    // v_cvt_pkrtz_f16_f32 v3, 2.0, v1
+        0x7E00_0302,                             // v_mov_b32 v0, v2
+        0x7E02_0303,                             // v_mov_b32 v1, v3
+    ];
+    words.extend(exp_compr(0, 0, 1));
+    words.push(S_ENDPGM);
+    let ps = crate::emit::HostShader {
+        dxil: lowers_ps(&words).unwrap().dxil,
+        ..host::stub_ps()
+    };
+
+    let vs_words: [u32; 3] = [0xF800_08CF, 0x0706_0504, S_ENDPGM]; // exp pos0, v4..v7
+    let native = NativeProgram {
+        stage: HwStage::Vs,
+        wave64: true,
+        vgprs: 8,
+        layout: Vec::new(),
+        used: Vec::new(),
+        io: StageIo::Vs {
+            inputs: vec![VsInput {
+                usage: Usage::Generic,
+                row: 0,
+                mask: 0xF,
+                vgpr: 4,
+            }],
+            outputs: Vec::new(),
+        },
+        code: vs_words.iter().flat_map(|word| word.to_le_bytes()).collect(),
+    };
+    let position = |name: &str, kind, interp| container::SigElement {
+        name: name.into(),
+        index: 0,
+        kind,
+        comp: 9,
+        interp,
+        row: Some(0),
+        col: 0,
+        cols: 4,
+        usage: 0xF,
+        half: false,
+    };
+    let input = container::signature(&[position("POSITION", 0, 0)], true);
+    let output = container::signature(&[position("SV_Position", 3, 4)], false);
+    let dxbc = dxbc::build(&[(FourCC::ISG1, &input), (FourCC::OSG1, &output)]);
+    let shader = Container::parse(&dxbc).unwrap();
+    let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+    let st = structure::structure(&p).unwrap();
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+    let io = io::raise(&p, &native).unwrap();
+    let vs = emit(&shader, &native, &p, &st, &io, &res).unwrap();
+    if let Ok(mut validator) =
+        validator::Validator::load(validator::Validator::default_path().as_deref())
+    {
+        validator.validate(&mut ps.dxil.clone()).unwrap();
+        validator.validate(&mut vs.dxil.clone()).unwrap();
+    }
+    let (root, pipeline) = host.pipeline(&vs, &ps).unwrap();
+    let pixels = host
+        .draw(
+            &root,
+            &pipeline,
+            &host::Draw {
+                roots: Vec::new(),
+                textures: &[],
+                samplers: &[],
+                vertices: &[
+                    -1.0, -1.0, 0.0, 1.0, -1.0, 3.0, 0.0, 1.0, 3.0, -1.0, 0.0, 1.0,
+                ],
+                stride: 16,
+                size: (4, 4),
+                mesh_groups: 0,
+            },
+        )
+        .unwrap();
+    assert_eq!(pixels, vec![[0.5, 1.0, 2.0, 4.0]; 16]);
 }
 
 #[test]
@@ -997,6 +1099,79 @@ fn a_missing_value_stays_missing_through_two_live_joins() {
     assert_eq!(refusal(&words), refusal(&direct));
     words[8] = 0xBF07_8000; // read the group id instead; the timestamp is dead
     lowers(&words, group_ids_xy).expect("dead timestamp");
+}
+
+#[test]
+fn a_wave_prefix_of_min_lowers() {
+    // A whole-wave section that leaves the inclusive prefix of a min:
+    // each lane the minimum of the lanes up to and including it. The
+    // scan runs with `row_shr` steps inside each row, and the first
+    // row's prefix is read out and folded under the second. The store
+    // after the section reads the prefix, so the value cannot be left
+    // missing: a wave prefix of a min has to lower.
+    let words = [
+        0x7E00_0280, // v_mov_b32 v0, 0
+        // 32-bit scalar forms: the wave32 pass follows their masks.
+        0xBE84_3DC1, // s_or_saveexec_b32 s4, -1
+        0x876A_C104, // s_and_b32 s106, s4, -1
+        0x0202_00C1, // v_cndmask_b32 v1, -1, v0, vcc
+        0x2602_02FA, // v_min_u32 v1, v1 row_shr:1, v1
+        0xFF01_1101,
+        0x2602_02FA, // v_min_u32 v1, v1 row_shr:2, v1
+        0xFF01_1201,
+        0x2602_02FA, // v_min_u32 v1, v1 row_shr:3, v1
+        0xFF01_1301,
+        0x2602_02FA, // v_min_u32 v1, v1 row_shr:4, v1
+        0xFF01_1401,
+        0x2602_02FA, // v_min_u32 v1, v1 row_shr:5, v1
+        0xFF01_1501,
+        0x2602_02FA, // v_min_u32 v1, v1 row_shr:6, v1
+        0xFF01_1601,
+        0x2602_02FA, // v_min_u32 v1, v1 row_shr:7, v1
+        0xFF01_1701,
+        0x2602_02FA, // v_min_u32 v1, v1 row_shr:8, v1
+        0xFF01_1801,
+        0x2602_02FA, // v_min_u32 v1, v1 row_shr:9, v1
+        0xFF01_1901,
+        0x2602_02FA, // v_min_u32 v1, v1 row_shr:10, v1
+        0xFF01_1A01,
+        0x2602_02FA, // v_min_u32 v1, v1 row_shr:11, v1
+        0xFF01_1B01,
+        0x2602_02FA, // v_min_u32 v1, v1 row_shr:12, v1
+        0xFF01_1C01,
+        0x2602_02FA, // v_min_u32 v1, v1 row_shr:13, v1
+        0xFF01_1D01,
+        0x2602_02FA, // v_min_u32 v1, v1 row_shr:14, v1
+        0xFF01_1E01,
+        0x2602_02FA, // v_min_u32 v1, v1 row_shr:15, v1
+        0xFF01_1F01,
+        0xD760_0006, // v_readlane_b32 s6, v1, 15
+        0x0001_1F01,
+        0x7E04_0206, // v_mov_b32 v2, s6
+        0x2602_02FA, // v_min_u32 v1, v2 quad_perm:[0,1,2,3] row_mask:0x2, v1
+        0x2F00_E402,
+        0xBEFE_0304, // s_mov_b32 exec_lo, s4
+        0xD834_0000, // ds_write_b32 v0, v1
+        0x0000_0100,
+        S_ENDPGM,
+    ];
+    let out = lowered(&words, 1 << 15).unwrap();
+    // Drivers do not implement `wavePrefixOp` kinds 2 and 3 (a hardware
+    // readback run showed no prefix min or max), so the min prefix must
+    // lower to a `WaveReadLaneAt` scan instead.
+    assert_eq!(out.prefix_scans, 1, "a min prefix must scan, not prefix-op");
+    // The scan ballots the active lanes, so an inactive source lane takes
+    // the identity instead of an undefined `WaveReadLaneAt`.
+    assert!(out.wave_ops, "the scan must ballot the active lanes");
+    // dxil.dll, where there is one, checks the scan's module too.
+    #[cfg(windows)]
+    {
+        if let Ok(mut v) = super::super::validator::Validator::load(
+            super::super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut out.dxil.clone()).unwrap();
+        }
+    }
 }
 
 #[test]
