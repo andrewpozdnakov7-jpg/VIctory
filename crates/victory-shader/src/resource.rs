@@ -1563,29 +1563,54 @@ impl<'a> Tracer<'a> {
             }
             if self.varies(t)
                 && let Some(site) = self.defs[v.0 as usize]
+                && let Err(error) = self.runs(site, known)
+                && !self.repeats_move(site, next, known)
             {
-                self.runs(site, known)?;
+                return Err(error);
             }
             t = next;
         }
         Ok(t)
     }
 
+    /// A repetition leaves the same value in a lane that skips it, if
+    /// the previous move in this block wrote that value to every such lane.
+    fn repeats_move(&self, site: Site, source: Term, known: &Known) -> bool {
+        let inst = self.inst(site);
+        let [(reg @ Reg::V(_), _)] = inst.writes.as_slice() else {
+            return false;
+        };
+        let Some(old) = inst.read(*reg) else {
+            return false;
+        };
+        let Some(old_site) = self.defs[old.0 as usize] else {
+            return false;
+        };
+        old_site.0 == site.0
+            && self.move_source(inst) == Some(source)
+            && self.move_source(self.inst(old_site)) == Some(source)
+            && self.runs(old_site, known).is_ok()
+    }
+
     /// One copy of [`Self::vorigin`]: what the `v_mov_b32` writing `v`
     /// reads, or `v`'s origin.
     fn vstep(&self, v: Value) -> Term {
-        if let Some(inst) = self.def(v)
-            && inst.name() == "v_mov_b32"
+        self.def(v)
+            .and_then(|inst| self.move_source(inst))
+            .unwrap_or_else(|| self.origin(v))
+    }
+
+    fn move_source(&self, inst: &Inst) -> Option<Term> {
+        if inst.name() == "v_mov_b32"
             && let Fields::Valu(f) = &inst.fields
             && f.abs == 0
             && f.neg == 0
             && f.sdwa.is_none()
             && f.dpp.is_none()
-            && let Some(t) = f.src.first().and_then(|s| self.raw(inst, s))
         {
-            return t;
+            return f.src.first().and_then(|s| self.raw(inst, s));
         }
-        self.origin(v)
+        None
     }
 
     /// A VALU operand as `inst` reads it: a VGPR's value itself, other
@@ -3691,7 +3716,7 @@ pub(crate) mod tests {
         // first (0) instead. Whatever s_cselect picks, the dwords read from
         // the first lane are lane 0's, the second; the lanes that access
         // them all hold the first.
-        let words: &[u32] = &[
+        let mut words: [u32; 31] = [
             0xBE84_0300, // s_mov_b32 s4, s0
             0xBE85_0380, // s_mov_b32 s5, 0
             0xF408_0602,
@@ -3738,5 +3763,24 @@ pub(crate) mod tests {
             ),
             "{err:?}"
         );
+
+        // Repeat the exact first-lane descriptor sources under the same mask.
+        // Both sides of the select must now resolve to the entry at 0x20.
+        let masked = word_at(&words, 0x7E08_0218);
+        for word in &mut words[masked..masked + 4] {
+            *word += 4;
+        }
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let r = track(&p, &layout, HwStage::Cs, lanes(&p).as_ref()).unwrap();
+        let [descriptor] = r.descriptors.as_slice() else {
+            panic!("expected one buffer descriptor");
+        };
+        let Source::Select { args, .. } = &descriptor.source else {
+            panic!("{:?}", descriptor.source);
+        };
+        assert_eq!(args.len(), 2);
+        assert_eq!(table_offset(&r, &args[0]), 0x20);
+        assert_eq!(table_offset(&r, &args[1]), 0x20);
     }
 }
