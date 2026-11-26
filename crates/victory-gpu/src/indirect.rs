@@ -147,7 +147,7 @@ unsafe impl Sync for Clamp {}
 fn clamp() -> Option<&'static Clamp> {
     static CLAMP: std::sync::OnceLock<Option<Clamp>> = std::sync::OnceLock::new();
     CLAMP
-        .get_or_init(|| match make() {
+        .get_or_init(|| match compile(SOURCE, s!("clamp")) {
             Ok(c) => Some(c),
             Err(e) => {
                 tracing::warn!(error = %e, "no argument clamp: indirect execution dropped");
@@ -155,10 +155,6 @@ fn clamp() -> Option<&'static Clamp> {
             }
         })
         .as_ref()
-}
-
-fn make() -> windows::core::Result<Clamp> {
-    compile(SOURCE, s!("clamp"))
 }
 
 /// A clamp pipeline of `source` (named `name` in compiler messages).
@@ -212,16 +208,17 @@ fn compile(source: &str, name: windows::core::PCSTR) -> windows::core::Result<Cl
 /// Records, in `list`, the clamp of `records` records of `kind` (PC
 /// argument numbering) `stride` bytes apart at host address `gpu` (a title
 /// buffer's copy, only read) into the list's own argument buffer, left
-/// ready to be read as arguments: that buffer, for [`done`] after the
-/// execution. Replaces the list's compute root signature and pipeline
-/// (callers bind theirs after). `None` if the clamp is not available.
+/// ready to be read as arguments: that buffer. Replaces the list's compute
+/// root signature and pipeline (callers bind theirs after). `None` if the
+/// clamp is not available.
 ///
 /// Title buffers' copies are never transitioned: they are common between
 /// submissions and every use promotes them (shader and root views, the
 /// input assembler, these reads), with unordered-access barriers for order.
-/// Only the list's argument buffer moves, common, unordered access,
-/// indirect argument, common: its states are known whatever order lists
-/// run in.
+/// Only the list's argument buffer moves: common (or indirect argument,
+/// as the execution before left it), unordered access, indirect argument,
+/// and common again when the list closes (`HostList::close`): its states
+/// are known whatever order lists run in.
 // shortcut: a buffer a shader writes through an unordered view and the
 // input assembler then reads in one submission is, by the letter of D3D12,
 // promoted to a write state the input assembler may not use (the debug
@@ -236,7 +233,7 @@ pub(crate) fn bound(list: &HostList, gpu: u64, (kind, stride, records): (u32, u3
     if !gpu.is_multiple_of(4) || !stride.is_multiple_of(4) {
         return None;
     }
-    let out = list.arguments(u64::from(stride) * u64::from(records.max(1)))?;
+    let (out, from) = list.arguments(u64::from(stride) * u64::from(records.max(1)))?;
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::ClampSingle, 1);
     let l = &list.list;
@@ -244,10 +241,11 @@ pub(crate) fn bound(list: &HostList, gpu: u64, (kind, stride, records): (u32, u3
     // SAFETY: an open list; our root signature, pipeline and buffers, and
     // a title buffer's copy the caller's list holds.
     unsafe {
-        // Earlier shader writes (the title's argument passes) first.
+        // Earlier shader writes (the title's argument passes) first; the
+        // execution before has read its arguments.
         l.ResourceBarrier(&[
             uav_barrier(),
-            transition(&out, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+            transition(&out, from, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
         ]);
         l.SetComputeRootSignature(&c.root);
         l.SetPipelineState(&c.pso);
@@ -263,18 +261,6 @@ pub(crate) fn bound(list: &HostList, gpu: u64, (kind, stride, records): (u32, u3
         ]);
     }
     Some(out)
-}
-
-/// After the execution: the list's argument buffer back to common.
-pub(crate) fn done(list: &HostList, arguments: &ID3D12Resource) {
-    // SAFETY: an open list and a live buffer.
-    unsafe {
-        list.list.ResourceBarrier(&[transition(
-            arguments,
-            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-            D3D12_RESOURCE_STATE_COMMON,
-        )])
-    };
 }
 
 /// Whether consecutive indirect draws are clamped a window at a time
@@ -458,7 +444,7 @@ pub(crate) struct Window {
 }
 
 struct Open {
-    /// The list's argument buffer, indirect arguments until the window ends.
+    /// The list's shared argument buffer, still indirect arguments.
     out: ID3D12Resource,
     /// The table's CPU address (upload memory of the list).
     table: usize,
@@ -469,16 +455,13 @@ struct Open {
     bytes: u64,
 }
 
-/// Ends `list`'s window, if one is open: its argument buffer back to
-/// common. Before any command that may write buffers.
+/// Ends `list`'s logical window before a command may write buffers.
+/// The shared argument buffer stays readable until the next clamp or close.
 pub(crate) fn end_window(list: &HostList) {
     if !OPENED.load(std::sync::atomic::Ordering::Relaxed) {
         return;
     }
-    let open = list.clamp_window().open.take();
-    if let Some(open) = open {
-        done(list, &open.out);
-    }
+    list.clamp_window().open = None;
 }
 
 /// Forgets `list`'s windows (it was reset).
@@ -514,9 +497,7 @@ pub(crate) fn windowed(
     let mut window = list.clamp_window();
     let mut opened = false;
     if !window.open.as_ref().is_some_and(|o| o.fits(source, bytes, records)) {
-        if let Some(old) = window.open.take() {
-            done(list, &old.out);
-        }
+        window.open = None;
         let mut sources = vec![source];
         sources.extend(window.recent.iter().copied().filter(|&s| s != source).take(WINDOW_SOURCES - 1));
         window.recent.clone_from(&sources);
@@ -577,8 +558,8 @@ fn open(list: &HostList, sources: Vec<u64>) -> Option<Open> {
     let (Some(c), Some(budget)) = (window_clamp(), list.budget()) else {
         return None;
     };
-    let out = list.arguments(WINDOW_BYTES)?;
     let (table_gpu, table) = list.scratch(TABLE_BYTES)?;
+    let (out, from) = list.arguments(WINDOW_BYTES)?;
     // SAFETY: the header of the list's fresh upload memory.
     unsafe { std::ptr::write_bytes(table, 0, 16) };
     let l = &list.list;
@@ -588,7 +569,7 @@ fn open(list: &HostList, sources: Vec<u64>) -> Option<Open> {
         // Earlier shader writes (the title's argument passes) first.
         l.ResourceBarrier(&[
             uav_barrier(),
-            transition(&out, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+            transition(&out, from, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
         ]);
         l.SetComputeRootSignature(&c.root);
         l.SetPipelineState(&c.pso);
@@ -665,9 +646,7 @@ mod tests {
             let gpu = buffer.GetGPUVirtualAddress();
             let mut out = None;
             for _ in 0..calls {
-                let clamped = super::bound(&list, gpu, spec).unwrap();
-                super::done(&list, &clamped);
-                out = Some(clamped);
+                out = Some(super::bound(&list, gpu, spec).unwrap());
             }
             list.close();
             host.execute(&[&list]);
@@ -771,7 +750,6 @@ mod tests {
                 .iter()
                 .map(|l| {
                     let out = super::bound(l, gpu, (2, 12, 1)).unwrap();
-                    super::done(l, &out);
                     l.close();
                     (out, issued())
                 })
@@ -837,8 +815,11 @@ void main() { title.Store(at, value); }
     /// each draw clamped on its own or (`window`) in windows, and runs it:
     /// the words of each draw's clamped records. `None` without a host GPU.
     fn run(init: &[Vec<u32>], steps: &[Step], window: bool) -> Option<Vec<Vec<u32>>> {
-        use super::{D3D12_RESOURCE_STATE_COMMON as COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE as COPY_SOURCE};
-        use super::{D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT as ARGUMENTS, transition};
+        use super::{
+            D3D12_RESOURCE_STATE_COPY_SOURCE as COPY_SOURCE,
+            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT as ARGUMENTS,
+            transition,
+        };
         let host = super::host()?;
         let titles: Vec<_> = init
             .iter()
@@ -866,11 +847,11 @@ void main() { title.Store(at, value); }
             if let (Some(out), false) = (out.as_ref(), draws.is_empty()) {
                 // SAFETY: an open list, live buffers.
                 unsafe {
-                    list.list.ResourceBarrier(&[transition(out, COMMON, COPY_SOURCE)]);
+                    list.list.ResourceBarrier(&[transition(out, ARGUMENTS, COPY_SOURCE)]);
                     for &(at, len, to) in draws.iter() {
                         list.list.CopyBufferRegion(&results, to, out, at, len);
                     }
-                    list.list.ResourceBarrier(&[transition(out, COPY_SOURCE, COMMON)]);
+                    list.list.ResourceBarrier(&[transition(out, COPY_SOURCE, ARGUMENTS)]);
                 }
             }
             draws.clear();
@@ -881,7 +862,7 @@ void main() { title.Store(at, value); }
                     let spec = (kind, stride(kind), records);
                     let len = u64::from(stride(kind)) * u64::from(records.max(1));
                     let source = titles[buffer].1;
-                    if window {
+                    if window && kind != 2 {
                         if !super::joins(&list, source, spec) {
                             flush(&mut pending);
                         }
@@ -889,6 +870,9 @@ void main() { title.Store(at, value); }
                         pending.0.push((at, len, at_results));
                         pending.1 = Some(out);
                     } else {
+                        if window {
+                            flush(&mut pending);
+                        }
                         let out = super::bound(&list, source + offset, spec).unwrap();
                         // SAFETY: an open list, live buffers.
                         unsafe {
@@ -896,7 +880,6 @@ void main() { title.Store(at, value); }
                             list.list.CopyBufferRegion(&results, at_results, &out, 0, len);
                             list.list.ResourceBarrier(&[transition(&out, COPY_SOURCE, ARGUMENTS)]);
                         }
-                        super::done(&list, &out);
                     }
                     // An execution of no records reads none: nothing to
                     // compare (the single clamp leaves what was there).
@@ -943,6 +926,37 @@ void main() { title.Store(at, value); }
         Some(windowed)
     }
 
+    #[test]
+    fn windowed_mesh_and_single_dispatches_keep_their_records_and_states() {
+        use crate::host::tests::{issued, replay};
+        let mesh = [[3, 2, 4], [2, 3, 5], [1, 1, 1]].concat();
+        let mut dispatch = vec![3, 2, 1, 5, 1, 1];
+        dispatch.resize(3 * 6_001, 0);
+        let steps = [
+            Step::Draw(0, 0, 10, 1),
+            Step::Draw(1, 0, 2, 1),
+            Step::Draw(0, 12, 10, 1),
+            Step::Draw(1, 12, 2, 6_000), // grows the single argument buffer
+            Step::Draw(0, 24, 10, 1),
+        ];
+        issued();
+        let Some(records) = run(&[mesh, dispatch], &steps, true) else {
+            return;
+        };
+        let barriers = issued();
+        assert!(!barriers.is_empty(), "the run recorded argument transitions");
+        let mut states = barriers.iter().map(|&(buffer, _, _)| (buffer, 0)).collect();
+        replay(&barriers, &mut states).unwrap();
+        assert!(states.values().all(|&s| s == 0), "all argument buffers finish common");
+        assert_eq!(records[0], [24, 1, 1]);
+        assert_eq!(records[1], [3, 2, 1]);
+        assert_eq!(records[2], [30, 1, 1]);
+        assert_eq!(records[3].len(), 3 * 6_000);
+        assert_eq!(records[3][..3], [5, 1, 1]);
+        assert!(records[3][3..].iter().all(|&word| word == 0));
+        assert_eq!(records[4], [1, 1, 1]);
+    }
+
     /// Mesh dispatches, draws and indexed draws from two buffers, every
     /// seventh mesh record garbage (all ones) so that the budget runs out
     /// in the middle; more draws than a table holds, one of 100 records
@@ -981,7 +995,7 @@ void main() { title.Store(at, value); }
         };
         let ran = out.iter().filter(|r| r.first().is_some_and(|&w| w != 0)).count();
         assert!(ran > 50 && ran + 50 < out.len(), "the budget ran out in the middle: {ran} of {} ran", out.len());
-        assert_eq!(out[0], [100, 1, 0], "a record as it is");
+        assert_eq!(out[0], [0, 1, 1], "a zero Z axis flattens to zero groups");
     }
 
     /// Mesh grids with more than one group along y or z (the case reported
@@ -1097,6 +1111,120 @@ void main() { title.Store(at, value); }
                 p.cast::<[u32; 6]>().read_volatile()
             };
             assert_eq!(clamped, [3, 1, 1, 4, 1, 1]);
+        }
+    }
+
+    /// Indirect dispatches in one list, each with its own records, through
+    /// the list's one argument buffer (left readable as arguments from one
+    /// execution to the clamp of the next, and replaced by a bigger one
+    /// while readable): every execution runs the groups its own records
+    /// hold, clamped, and every barrier starts from the buffer's current
+    /// state, all common at the close.
+    #[test]
+    fn each_execution_reads_its_own_clamped_records() {
+        use super::*;
+        use crate::host::tests::{issued, replay};
+        use windows::core::Interface;
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        // Each group adds one to the word of its execution.
+        let counting = super::compile(
+            r#"
+#define RS "RootConstants(num32BitConstants=1, b0), UAV(u0)"
+cbuffer Execution : register(b0) { uint execution; };
+RWByteAddressBuffer groups : register(u0);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main() {
+    uint before;
+    groups.InterlockedAdd(execution * 4, 1, before);
+}
+"#,
+            s!("count indirect groups"),
+        )
+        .unwrap();
+        let argument = D3D12_INDIRECT_ARGUMENT_DESC {
+            Type: D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH,
+            ..Default::default()
+        };
+        let desc = D3D12_COMMAND_SIGNATURE_DESC {
+            ByteStride: 12,
+            NumArgumentDescs: 1,
+            pArgumentDescs: &argument,
+            NodeMask: 0,
+        };
+        let mut signature: Option<ID3D12CommandSignature> = None;
+        // SAFETY: one argument, no root arguments.
+        unsafe {
+            host.device
+                .CreateCommandSignature(&desc, None::<&ID3D12RootSignature>, &mut signature)
+        }
+        .unwrap();
+        let signature = signature.unwrap();
+        // Records, and the groups each execution runs: x past 65,535;
+        // 2^21 groups in all (run empty); 6,000 records (past the first
+        // argument buffer's 64 KiB) of which only the first has groups;
+        // then the bigger buffer again.
+        let big = 6_000;
+        let executions: [(Vec<[u32; 3]>, u32); 5] = [
+            (vec![[3, 2, 1]], 6),
+            (vec![[70_000, 1, 1]], 65_535),
+            (vec![[2_048, 1_024, 1]], 0),
+            (
+                std::iter::once([5, 1, 1])
+                    .chain(std::iter::repeat_n([0, 0, 0], big - 1))
+                    .collect(),
+                5,
+            ),
+            (vec![[7, 1, 1]], 7),
+        ];
+        let words: usize = executions.iter().map(|(r, _)| r.len() * 3).sum();
+        let (title, data) = host.shared_buffer(words as u64 * 4).unwrap();
+        let (counts, counted) = host.shared_buffer(256).unwrap();
+        let list = host.new_list().unwrap();
+        issued();
+        let mut outs = Vec::new();
+        // SAFETY: our mapped buffers, written before the list runs and read
+        // after it has; an open list, our pipelines and live buffers.
+        unsafe {
+            counted.cast::<[u32; 64]>().write_volatile([0; 64]);
+            let mut at = 0;
+            for (i, (records, _)) in executions.iter().enumerate() {
+                let gpu = title.GetGPUVirtualAddress() + at as u64 * 4;
+                for (k, r) in records.iter().enumerate() {
+                    data.cast::<[u32; 3]>().add(at / 3 + k).write_volatile(*r);
+                }
+                at += records.len() * 3;
+                let out = super::bound(&list, gpu, (2, 12, records.len() as u32)).unwrap();
+                let l = &list.list;
+                l.SetComputeRootSignature(&counting.root);
+                l.SetPipelineState(&counting.pso);
+                l.SetComputeRoot32BitConstants(0, 1, [i as u32].as_ptr().cast(), 0);
+                l.SetComputeRootUnorderedAccessView(1, counts.GetGPUVirtualAddress());
+                l.ExecuteIndirect(&signature, records.len() as u32, &out, 0, None, 0);
+                if outs
+                    .last()
+                    .is_none_or(|o: &ID3D12Resource| o.as_raw() != out.as_raw())
+                {
+                    outs.push(out);
+                }
+            }
+            list.close();
+            let mut states: std::collections::HashMap<usize, u32> =
+                outs.iter().map(|o| (o.as_raw() as usize, 0)).collect();
+            let run = issued();
+            host.execute(&[&list]);
+            replay(&run, &mut states).unwrap();
+            assert!(states.values().all(|&s| s == 0), "all common again");
+            assert_eq!(
+                outs.len(),
+                2,
+                "the argument buffer was replaced by a bigger one"
+            );
+            let ran = counted.cast::<[u32; 64]>().read_volatile();
+            let expected: Vec<u32> = executions.iter().map(|(_, groups)| *groups).collect();
+            assert_eq!(ran[..executions.len()], expected[..]);
         }
     }
 
