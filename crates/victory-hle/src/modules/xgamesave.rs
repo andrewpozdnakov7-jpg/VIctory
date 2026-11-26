@@ -334,20 +334,47 @@ fn containers(root: &Path) -> Vec<(String, PathBuf)> {
 }
 
 /// Moves a container of the old layout (blob files named by encoded name,
-/// a `.display` file) into a committed version, then removes it.
+/// a `.display` file) into a committed version, then removes it. A blob or
+/// a `.display` that is there but cannot be read (another process holds it)
+/// leaves the old layout as it is, for a later listing to move: committing
+/// without it would lose it once the old folder is removed.
 fn migrate(root: &Path, name: &str, old: &Path) -> Option<PathBuf> {
     let dir = container_dir(root, name);
     let done = current_named(&dir, name).ok()?.is_some(); // a crash after the commit
     if !done {
-        let display = std::fs::read_to_string(old.join(".display")).unwrap_or_default();
-        let mut blobs: Vec<(String, Vec<u8>)> = std::fs::read_dir(old)
-            .ok()?
-            .flatten()
-            .filter_map(|e| {
-                let blob = decode(e.file_name().to_str()?)?;
-                Some((blob, std::fs::read(e.path()).ok()?))
-            })
-            .collect();
+        let kept = |what: &Path, e: std::io::Error| {
+            let file = what.display();
+            tracing::warn!(container = name, %file, %e, "game save left in the old layout for now");
+        };
+        let display_path = old.join(".display");
+        let display = match std::fs::read_to_string(&display_path) {
+            Ok(display) => display,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => {
+                kept(&display_path, e);
+                return None;
+            }
+        };
+        let mut blobs: Vec<(String, Vec<u8>)> = Vec::new();
+        for e in std::fs::read_dir(old).ok()? {
+            let e = match e {
+                Ok(e) => e,
+                Err(err) => {
+                    kept(old, err);
+                    return None;
+                }
+            };
+            let Some(blob) = e.file_name().to_str().and_then(decode) else {
+                continue;
+            };
+            match std::fs::read(e.path()) {
+                Ok(data) => blobs.push((blob, data)),
+                Err(err) => {
+                    kept(&e.path(), err);
+                    return None;
+                }
+            }
+        }
         blobs.sort();
         let sources: Vec<_> = blobs
             .iter()
@@ -358,6 +385,15 @@ fn migrate(root: &Path, name: &str, old: &Path) -> Option<PathBuf> {
     std::fs::remove_dir_all(old).ok()?;
     tracing::info!(container = name, "game save moved to the versioned layout");
     Some(dir)
+}
+
+/// Whether nothing of the old layout under `name` is left to move. A
+/// version committed while the old folder waits would be taken by
+/// `migrate` for its own (a crash after its commit) and the old folder
+/// removed, so nothing commits or deletes a container until it moved.
+fn old_moved(root: &Path, name: &str) -> bool {
+    let old = root.join(file_name(name));
+    !old.is_dir() || migrate(root, name, &old).is_some()
 }
 
 fn used_bytes(root: &Path) -> u64 {
@@ -462,6 +498,10 @@ impl Update {
     /// Applies the update as one new version of the container.
     fn submit(&self) -> HRESULT {
         let _saves = saves_lock();
+        let root = self.dir.parent().unwrap_or(&self.dir);
+        if !old_moved(root, &self.name) {
+            return NO_ACCESS;
+        }
         let current = match current(&self.dir) {
             Ok(v) => v,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
@@ -501,7 +541,6 @@ impl Update {
             let changed = sizes.iter().filter(|(n, _)| self.changes.iter().any(|(c, _)| c == n));
             changed.map(|(_, size)| size).sum()
         });
-        let root = self.dir.parent().unwrap_or(&self.dir);
         let free = storage::disk_free(root);
         if let Some(hr) = no_room(written as u64, replaced, used_bytes(root), free) {
             return hr;
@@ -524,6 +563,9 @@ impl Update {
 /// Deletes a container: renamed away (one step), then removed.
 fn delete(root: &Path, name: &str) -> HRESULT {
     let _saves = saves_lock();
+    if !old_moved(root, name) {
+        return NO_ACCESS;
+    }
     let dir = container_dir(root, name);
     match current_named(&dir, name) {
         Ok(Some(_)) => {}
@@ -1210,6 +1252,71 @@ mod tests {
         );
         let v = current_named(&c.dir, "Player").unwrap().unwrap();
         assert_eq!((v.dir.file_name(), v.display.as_str()), (Some("v1".as_ref()), "Chapter 1"));
+    }
+
+    /// A `.display` or a blob of the old layout that another process holds
+    /// (no sharing) is not moved without: the old layout stays, nothing is
+    /// committed, and the next listing moves it whole, display name included.
+    /// Meanwhile an update or a delete of that container is refused: a
+    /// version it committed would be taken for the moved one and the old
+    /// folder removed with what it holds.
+    #[cfg(windows)]
+    #[test]
+    fn an_unreadable_old_display_or_blob_leaves_the_old_layout_for_later() {
+        use std::os::windows::fs::OpenOptionsExt;
+        for locked in [".display", "Save%20Game%20Data"] {
+            let saves = tempfile::tempdir().unwrap();
+            let root = saves
+                .path()
+                .join(format!("{:016X}", xuser::XUID))
+                .join("scid");
+            let old = root.join("Player");
+            std::fs::create_dir_all(&old).unwrap();
+            std::fs::write(old.join("Save%20Game%20Data"), b"data").unwrap();
+            std::fs::write(old.join("Save%20Game%20Header"), b"header").unwrap();
+            std::fs::write(old.join(".display"), b"Chapter 1").unwrap();
+            let held = std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(0)
+                .open(old.join(locked))
+                .unwrap();
+            let p = Provider::open(saves.path(), Some("scid")).unwrap();
+            assert!(old.exists(), "{locked} held: the old layout is kept");
+            let c = p.container("Player");
+            let none = current_named(&c.dir, "Player").unwrap().is_none();
+            assert!(none, "{locked} held: nothing committed");
+            let update = Update {
+                name: "Player".into(),
+                dir: c.dir.clone(),
+                display: None,
+                changes: vec![("Other".into(), Some(b"new".to_vec()))],
+            };
+            assert_eq!(update.submit(), NO_ACCESS, "{locked} held: update");
+            assert_eq!(
+                delete(&p.root, "Player"),
+                NO_ACCESS,
+                "{locked} held: delete"
+            );
+            let none = current_named(&c.dir, "Player").unwrap().is_none();
+            assert!(
+                none && old.exists(),
+                "{locked} held: nothing committed or removed"
+            );
+            drop(held);
+            let p = Provider::open(saves.path(), Some("scid")).unwrap();
+            assert!(!old.exists(), "{locked} free again: moved over");
+            let c = p.container("Player");
+            assert_eq!(
+                read(&c, None).unwrap(),
+                [
+                    ("Save Game Data".into(), b"data".to_vec()),
+                    ("Save Game Header".into(), b"header".to_vec())
+                ],
+                "{locked}"
+            );
+            let v = current_named(&c.dir, "Player").unwrap().unwrap();
+            assert_eq!(v.display, "Chapter 1", "{locked}");
+        }
     }
 
     /// An empty configuration id names none. As a folder name it would be
