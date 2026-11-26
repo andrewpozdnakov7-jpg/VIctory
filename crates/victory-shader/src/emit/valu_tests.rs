@@ -2473,3 +2473,204 @@ fn vop3_forms_of_vop1_and_vop2_16bit_ops_ignore_op_sel() {
         }
     }
 }
+
+/// With MODE bit 7 clear (`s_denorm_mode` bit 3, or `s_setreg` of the bit),
+/// an f16 result below the smallest normal half, once rounded to a half's
+/// precision, is a zero of its sign; the minimum and maximum keep theirs.
+/// Rows measured on gfx1036 (RDNA2) with the same instruction words.
+#[test]
+fn f16_results_flush_output_denormals_as_the_mode_says() {
+    // v_cvt_f16_f32: halves for s_denorm_mode 12 (kept), 4 and 0 (flushed),
+    // in nearest-even, then toward-zero mode. The high half is kept.
+    let cvt: &[(u32, [u16; 6])] = &[
+        (0x33800000, [0x0001, 0x0000, 0x0000, 0x0001, 0x0000, 0x0000]),
+        (0xb3800000, [0x8001, 0x8000, 0x8000, 0x8001, 0x8000, 0x8000]),
+        (0x33000001, [0x0001, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000]),
+        (0x38000000, [0x0200, 0x0000, 0x0000, 0x0200, 0x0000, 0x0000]),
+        (0x387fe000, [0x0400, 0x0000, 0x0000, 0x03ff, 0x0000, 0x0000]),
+        (0x387fefff, [0x0400, 0x0000, 0x0000, 0x03ff, 0x0000, 0x0000]),
+        (0x387ff000, [0x0400, 0x0400, 0x0400, 0x03ff, 0x0000, 0x0000]),
+        (0x387fffff, [0x0400, 0x0400, 0x0400, 0x03ff, 0x0000, 0x0000]),
+        (0xb87ff000, [0x8400, 0x8400, 0x8400, 0x83ff, 0x8000, 0x8000]),
+        (0x38800000, [0x0400, 0x0400, 0x0400, 0x0400, 0x0400, 0x0400]),
+        (0x3f800000, [0x3c00, 0x3c00, 0x3c00, 0x3c00, 0x3c00, 0x3c00]),
+        (0x80000001, [0x8000, 0x8000, 0x8000, 0x8000, 0x8000, 0x8000]),
+    ];
+    let inputs: Vec<[u32; 4]> = cvt.iter().map(|&(x, _)| [x, 0, 0, 0xABCD_1234]).collect();
+    for (column, (denorm, round)) in [(12u32, 0u32), (4, 0), (0, 0), (12, 3), (4, 3), (0, 3)]
+        .into_iter()
+        .enumerate()
+    {
+        let shader = build_valu_cs(&[
+            0xBFA5_0000 | denorm,     // s_denorm_mode
+            0xBFA4_0000 | round << 2, // s_round_mode
+            vop1(0x001, 0, vgpr(4)),  // v_mov_b32 v0, v4
+            vop1(0x00A, 0, vgpr(1)),  // v_cvt_f16_f32 v0, v1
+        ]);
+        run_cases(&shader, &inputs, |backend, i, input, got| {
+            let want = 0xABCD_0000 | u32::from(cvt[i].1[column]);
+            assert_eq!(
+                got, want,
+                "{backend}: s_denorm_mode {denorm}, round {round}, {:#010x}",
+                input[0]
+            );
+        });
+    }
+
+    // Other f16 results with s_denorm_mode 4: input denormals kept, output
+    // denormals flushed. Each row: v1, v2, v3, v4 (the destination before),
+    // then v0 as gfx1036 gives it.
+    type Rows = &'static [([u32; 4], u32)];
+    let ops: &[(&str, &[u32], Rows)] = &[
+        (
+            "v_add_f16 v0, v1, v2",
+            &[0x32 << 25 | 2 << 9 | 257],
+            &[
+                ([0xac680001, 0x12cb8003, 0x6166a223, 0x03525a6d], 0x03528000),
+                ([0xe44e0200, 0xbeca8400, 0x68a8020c, 0x1335455a], 0x13358000),
+                ([0xbeca8400, 0x68a8020c, 0xe44e0200, 0x1335455a], 0x13358000),
+                ([0x3d6d8200, 0xd01f0202, 0xb6b2b800, 0x928ed725], 0x928e0000),
+                ([0x55b48400, 0xd38903fd, 0x6fd83000, 0xfd24556d], 0xfd248000),
+                ([0x12cb8003, 0x6166a223, 0xac680001, 0x03525a6d], 0x0352a223),
+                ([0x6166a223, 0xac680001, 0x12cb8003, 0x03525a6d], 0x0352a223),
+            ],
+        ),
+        (
+            "v_mul_f16 v0, v1, v2",
+            &[0x35 << 25 | 2 << 9 | 257],
+            &[
+                ([0x91093c01, 0x330d8001, 0xaead0aa8, 0xa48bd6a0], 0xa48b8000),
+                ([0x0e3a5c00, 0x89d90002, 0x6d103000, 0xf6f1f61b], 0xf6f10000),
+                ([0xd01f0202, 0xb6b2b800, 0x3d6d8200, 0x928ed725], 0x928e8000),
+                ([0xb6b2b800, 0x3d6d8200, 0xd01f0202, 0x928ed725], 0x928e0000),
+                ([0x60ab03ff, 0x564622ef, 0xa9dab800, 0xc8e4fc3e], 0xc8e40000),
+                ([0xac680001, 0x12cb8003, 0x6166a223, 0x03525a6d], 0x03528000),
+                ([0x12cb8003, 0x6166a223, 0xac680001, 0x03525a6d], 0x03520000),
+                ([0x6166a223, 0xac680001, 0x12cb8003, 0x03525a6d], 0x03528000),
+            ],
+        ),
+        (
+            "v_fma_f16 v0, v1, v2, v3",
+            &[
+                vop3(0x34B, 0, vgpr(1), vgpr(2), vgpr(3))[0],
+                vop3(0x34B, 0, vgpr(1), vgpr(2), vgpr(3))[1],
+            ],
+            &[
+                ([0x12cb8003, 0x6166a223, 0xac680001, 0x03525a6d], 0x03520000),
+                ([0x6166a223, 0xac680001, 0x12cb8003, 0x03525a6d], 0x03528000),
+                ([0xe44e0200, 0xbeca8400, 0x68a8020c, 0x1335455a], 0x13350000),
+                ([0xbeca8400, 0x68a8020c, 0xe44e0200, 0x1335455a], 0x13350000),
+                ([0xd01f0202, 0xb6b2b800, 0x3d6d8200, 0x928ed725], 0x928e8000),
+                ([0xac680001, 0x12cb8003, 0x6166a223, 0x03525a6d], 0x0352a223),
+            ],
+        ),
+        (
+            "v_fract_f16 v0, v1",
+            &[vop1(0x05F, 0, vgpr(1))],
+            &[
+                ([0xac680001, 0x12cb8003, 0x6166a223, 0x03525a6d], 0x03520000),
+                ([0x89d90002, 0x6d103000, 0x0e3a5c00, 0xf6f1f61b], 0xf6f10000),
+                ([0xe44e0200, 0xbeca8400, 0x68a8020c, 0x1335455a], 0x13350000),
+                ([0x68a8020c, 0xe44e0200, 0xbeca8400, 0x1335455a], 0x13350000),
+                ([0xd01f0202, 0xb6b2b800, 0x3d6d8200, 0x928ed725], 0x928e0000),
+                ([0x12cb8003, 0x6166a223, 0xac680001, 0x03525a6d], 0x03523bff),
+                ([0x6166a223, 0xac680001, 0x12cb8003, 0x03525a6d], 0x03523be7),
+            ],
+        ),
+        (
+            "v_pk_mul_f16 v0, v1, v2",
+            &[0xCC10_4000, 0x1802_0501],
+            &[
+                ([0x37ff0aa8, 0x84013c01, 0x3a008001, 0x7c5141ac], 0x80000aaa),
+                ([0x84013c01, 0x3a008001, 0x37ff0aa8, 0x7c5141ac], 0x80008000),
+                ([0x64005c00, 0x0a500002, 0x3c013000, 0xf7620d06], 0x32500000),
+                ([0x9c010200, 0x044a8400, 0x1c00020c, 0xa8c6d6b9], 0x80008000),
+                ([0x044a8400, 0x1c00020c, 0x9c010200, 0xa8c6d6b9], 0x00008000),
+            ],
+        ),
+        (
+            "v_fma_mixlo_f16 v0, v1, 1.0, 0",
+            &[0xCC21_0000, 0x0201_E501],
+            &[
+                ([0x33800000, 0xb3800000, 0x387fffff, 0xc6d76f10], 0xc6d70000),
+                ([0xb3800000, 0x387fffff, 0x33800000, 0xc6d76f10], 0xc6d78000),
+                ([0x33000001, 0x47800000, 0xc7800000, 0x2e72f05c], 0x2e720000),
+                ([0xb3000001, 0x33400000, 0x32ffffff, 0xb22c4a03], 0xb22c8000),
+                ([0x33400000, 0x32ffffff, 0xb3000001, 0xb22c4a03], 0xb22c0000),
+                ([0xbc78847a, 0x47ed5a78, 0x392b2cd8, 0x812a43ed], 0x812aa3c4),
+                ([0x47ed5a78, 0x392b2cd8, 0xbc78847a, 0x812a43ed], 0x812a7c00),
+                ([0x392b2cd8, 0xbc78847a, 0x47ed5a78, 0x812a43ed], 0x812a0959),
+            ],
+        ),
+        (
+            "v_cvt_pkrtz_f16_f32 v0, v1, v2",
+            &[0x2F << 25 | 2 << 9 | 257],
+            &[
+                ([0x33800000, 0xb3800000, 0x387fffff, 0xc6d76f10], 0x80000000),
+                ([0xb3800000, 0x387fffff, 0x33800000, 0xc6d76f10], 0x00008000),
+                ([0x387fffff, 0x33800000, 0xb3800000, 0xc6d76f10], 0x00000000),
+                ([0xb87fffff, 0x38800000, 0xb8800000, 0x1b3818df], 0x04008000),
+                ([0xb8800000, 0xb87fffff, 0x38800000, 0x1b3818df], 0x80008400),
+            ],
+        ),
+        (
+            "v_max_f16 v0, v1, v2 (not flushed)",
+            &[0x39 << 25 | 2 << 9 | 257],
+            &[
+                ([0xac680001, 0x12cb8003, 0x6166a223, 0x03525a6d], 0x03520001),
+                ([0x12cb8003, 0x6166a223, 0xac680001, 0x03525a6d], 0x03528003),
+                ([0x6166a223, 0xac680001, 0x12cb8003, 0x03525a6d], 0x03520001),
+                ([0xe44e0200, 0xbeca8400, 0x68a8020c, 0x1335455a], 0x13350200),
+                ([0x330d8001, 0xaead0aa8, 0x91093c01, 0xa48bd6a0], 0xa48b0aa8),
+                ([0x89d90002, 0x6d103000, 0x0e3a5c00, 0xf6f1f61b], 0xf6f13000),
+            ],
+        ),
+        (
+            "v_min_f16 v0, v1, v2 (not flushed)",
+            &[0x3A << 25 | 2 << 9 | 257],
+            &[
+                ([0xac680001, 0x12cb8003, 0x6166a223, 0x03525a6d], 0x03528003),
+                ([0x12cb8003, 0x6166a223, 0xac680001, 0x03525a6d], 0x0352a223),
+                ([0x6166a223, 0xac680001, 0x12cb8003, 0x03525a6d], 0x0352a223),
+                ([0x330d8001, 0xaead0aa8, 0x91093c01, 0xa48bd6a0], 0xa48b8001),
+                ([0x89d90002, 0x6d103000, 0x0e3a5c00, 0xf6f1f61b], 0xf6f10002),
+                ([0xe44e0200, 0xbeca8400, 0x68a8020c, 0x1335455a], 0x13358400),
+            ],
+        ),
+    ];
+    for &(what, words, rows) in ops {
+        // s_denorm_mode 4; v_mov_b32 v0, v4; the operation
+        let mut body = vec![0xBFA5_0004, vop1(0x001, 0, vgpr(4))];
+        body.extend_from_slice(words);
+        let shader = build_valu_cs(&body);
+        let inputs: Vec<[u32; 4]> = rows.iter().map(|r| r.0).collect();
+        run_cases(&shader, &inputs, |backend, i, input, got| {
+            assert_eq!(got, rows[i].1, "{backend}: {what} of {input:#010x?}");
+        });
+    }
+
+    // MODE bit 7 written alone by s_setreg_imm32_b32 hwreg(HW_REG_MODE, 7, 1),
+    // from the opposite state: on gfx1036, v_cvt_f16_f32 of 0x33800000 gives
+    // 0x0000 after s_denorm_mode 12 and a 0 bit, 0x0001 after s_denorm_mode 0
+    // and a 1 bit.
+    for (start, bit, want) in [(12u32, 0u32, 0u32), (0, 1, 1)] {
+        let shader = build_valu_cs(&[
+            0xBFA5_0000 | start,       // s_denorm_mode
+            sopk(0x15, 0, 1 | 7 << 6), // s_setreg_imm32_b32 hwreg(MODE, 7, 1), bit
+            bit,
+            vop1(0x001, 0, vgpr(4)),
+            vop1(0x00A, 0, vgpr(1)),
+        ]);
+        run_cases(
+            &shader,
+            &[[0x3380_0000, 0, 0, 0xABCD_1234]],
+            |backend, _, _, got| {
+                assert_eq!(
+                    got,
+                    0xABCD_0000 | want,
+                    "{backend}: s_denorm_mode {start}, MODE[7] {bit}"
+                );
+            },
+        );
+    }
+}

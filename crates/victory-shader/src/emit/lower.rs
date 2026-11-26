@@ -19,8 +19,10 @@ use crate::ir::{Block, EXEC, Exit, Inst, Phi, Program, Reg, Value};
 use crate::native::{HwStage, NativeProgram, ResourceType, RootType, StageIo, Usage, UsedResource};
 use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER_DATA};
 use crate::structure::{Atom, Bool, LaneExit, Structured};
+use fp16_mode::{denorm16, denorm16_after, round16, round16_after};
 
 mod bvh;
+mod fp16_mode;
 
 type Why = &'static str;
 
@@ -284,65 +286,10 @@ struct Lower<'a> {
     /// the one in force at the instruction being lowered (see [`round16`]).
     round16: Vec<Option<u8>>,
     mode16: Option<u8>,
-}
-
-/// The 16/64-bit round mode (MODE bits 3:2: 0 nearest even, 3 toward zero)
-/// after `inst`, from `mode` before it (`None`: not known).
-fn round16_after(inst: &Inst, mode: Option<u8>) -> Option<u8> {
-    match (inst.name(), &inst.fields) {
-        ("s_round_mode", Fields::Sopp { imm }) => Some((imm >> 2 & 3) as u8),
-        (
-            "s_setreg_imm32_b32" | "s_setreg_b32",
-            Fields::Sop {
-                src, imm: Some(h), ..
-            },
-        ) => {
-            let (id, off, size) = (h & 0x3F, h >> 6 & 0x1F, (h >> 11 & 0x1F) + 1);
-            if id != 1 || off >= 4 || off + size <= 2 {
-                return mode;
-            }
-            match src.first() {
-                Some(&Operand::Literal(x)) if off <= 2 && off + size >= 4 => {
-                    Some((x >> (2 - off) & 3) as u8)
-                }
-                _ => None,
-            }
-        }
-        _ => mode,
-    }
-}
-
-/// The 16/64-bit round mode each block starts with: nearest even at the
-/// program's start, then as the MODE writes on the way set it; `None` where
-/// paths that set it differently join (or a write is not a constant).
-fn round16(p: &crate::ir::Program) -> Vec<Option<u8>> {
-    // None: not reached yet; Some(m): the mode (m None: not known).
-    let mut entry: Vec<Option<Option<u8>>> = vec![None; p.blocks.len()];
-    entry[0] = Some(Some(0));
-    let order = crate::ir::reverse_postorder(&p.blocks);
-    loop {
-        let mut changed = false;
-        for &b in &order {
-            let Some(mut m) = entry[b] else { continue };
-            for inst in &p.blocks[b].insts {
-                m = round16_after(inst, m);
-            }
-            for s in p.blocks[b].exit.successors() {
-                let new = match entry[s] {
-                    None => Some(m),
-                    Some(old) if old == m => continue,
-                    Some(_) => Some(None),
-                };
-                if entry[s] != new {
-                    entry[s] = new;
-                    changed = true;
-                }
-            }
-        }
-        if !changed {
-            return entry.into_iter().map(Option::flatten).collect();
-        }
-    }
+    /// Whether 16/64-bit results keep their denormals (MODE bit 7) as each
+    /// block starts, and at the instruction being lowered (see [`denorm16`]).
+    denorm16: Vec<Option<bool>>,
+    keep16: Option<bool>,
 }
 
 /// Iterations after which a loop is left (per entry into it), unless
@@ -725,6 +672,8 @@ impl<'a> Lower<'a> {
             abort: None,
             round16: round16(p),
             mode16: Some(0),
+            denorm16: denorm16(p),
+            keep16: Some(true),
         }
     }
 
@@ -1353,6 +1302,7 @@ impl<'a> Lower<'a> {
             }
             let mut i = 0;
             self.mode16 = self.round16[b];
+            self.keep16 = self.denorm16[b];
             while i < p.blocks[b].insts.len() {
                 if let Some(&lanes) = self.x.st.discards.get(&(b, i)) {
                     // A pixel's discard: the lanes stay on as helpers.
@@ -1366,6 +1316,7 @@ impl<'a> Lower<'a> {
                 }
                 self.inst(b, i)?;
                 self.mode16 = round16_after(&p.blocks[b].insts[i], self.mode16);
+                self.keep16 = denorm16_after(&p.blocks[b].insts[i], self.keep16);
                 if let Some(end) = self.sections.get(&b).and_then(|s| s.get(&i)).map(|s| s.end) {
                     for j in i + 1..end {
                         self.section_inst(b, j, i);
@@ -2391,7 +2342,9 @@ impl<'a> Lower<'a> {
         let round_up = m.cast(c, Cast::ZExt, round_up, self.s.t.i32);
         let rounded = m.bin(c, Bin::Add, lower, round_up);
         let rounded = m.select(c, tiny, zero, rounded);
+        let rounded = self.flush16_exact(rounded, magnitude, error);
 
+        let m = &mut self.s.m;
         let limit = m.i32(0x4780_0000); // 65536; smaller overflows round up above
         let overflow = m.cmp(c, pred::IUGE, magnitude, limit);
         let infinity = m.i32(0x7C00);
@@ -6509,6 +6462,7 @@ impl<'a> Lower<'a> {
                     None => self.s.m.i32(0),
                 };
                 let h = self.narrow16(r);
+                let h = self.flush16(h, r, self.mode16);
                 let (keep, h) = if name == "v_fma_mixhi_f16" {
                     let k16 = self.s.m.i32(16);
                     (0xFFFF, self.s.m.bin(c, Bin::Shl, h, k16))
@@ -6528,7 +6482,9 @@ impl<'a> Lower<'a> {
             "v_cvt_pkrtz_f16_f32" => {
                 let (a, bb) = (f(self, 0)?, f(self, 1)?);
                 let lo = self.f16_toward_zero(a);
+                let lo = self.flush16(lo, a, Some(3));
                 let hi = self.f16_toward_zero(bb);
+                let hi = self.flush16(hi, bb, Some(3));
                 let sh = self.s.m.i32(16);
                 let hi = self.s.m.bin(c, Bin::Shl, hi, sh);
                 let r = self.s.m.bin(c, Bin::Or, lo, hi);
@@ -7051,6 +7007,11 @@ impl<'a> Lower<'a> {
                 f = l.unary(7, f);
             }
             let h = l.narrow16(f);
+            let select = matches!(
+                name,
+                "v_max_f16" | "v_min_f16" | "v_max3_f16" | "v_min3_f16" | "v_med3_f16"
+            );
+            let h = if select { h } else { l.flush16(h, f, l.mode16) };
             l.write_half(inst, h, guard)
         };
         if name == "v_cvt_f16_f32" {
@@ -7409,7 +7370,12 @@ impl<'a> Lower<'a> {
                 if v.clamp {
                     f = self.unary(7, f);
                 }
-                self.narrow16(f)
+                let h = self.narrow16(f);
+                if matches!(op, "min_f16" | "max_f16") {
+                    h
+                } else {
+                    self.flush16(h, f, self.mode16)
+                }
             } else {
                 let k16 = self.s.m.i32(16);
                 let sext = |l: &mut Self, x: V| {

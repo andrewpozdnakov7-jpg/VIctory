@@ -3274,3 +3274,32 @@ fn v_fmac_f16_accumulator_modifiers_ignore_op_sel() {
         .collect();
     assert_clean(check(&probes));
 }
+
+#[test]
+fn v_fmac_f16_flushes_the_exact_result_in_output_denorm_mode() {
+    const INPUTS: [[u32; 4]; 5] = [
+        [0x3C00, 0x0400, 0xBEEF_8001, OLD], // positive largest subnormal
+        [0x3C00, 0x8400, 0x5010_0001, OLD], // negative largest subnormal
+        [0x0400, 0x3BFF, 0xA9F1_0000, OLD], // just below minimum normal, rounds up
+        [0x8400, 0x3BFF, 0x4B00_0000, OLD], // same boundary with negative sign
+        [0x0401, 0x3BFE, 0x71A0_0000, OLD], // within half precision of minimum normal
+    ];
+    let fmac = |mode: u32, expected: [u32; 5]| {
+        let mut body = vec![
+            0xBFA5_0000 | mode, // s_denorm_mode
+            vop1(0x01, 5, v(3)),
+        ];
+        body.extend(vop3(0x136, 5, [v(1), v(2), 0], NONE));
+        probe(body, INPUTS.to_vec(), INT, move |i| {
+            let index = INPUTS
+                .iter()
+                .position(|&input| input == i)
+                .expect("known input");
+            vec![(i[2] & 0xFFFF_0000) | expected[index]]
+        })
+    };
+    assert_clean(check(&[
+        fmac(12, [0x03FF, 0x83FF, 0x0400, 0x8400, 0x0400]),
+        fmac(4, [0x0000, 0x8000, 0x0000, 0x8000, 0x0400]),
+    ]));
+}
