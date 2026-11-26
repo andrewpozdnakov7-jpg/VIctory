@@ -764,20 +764,19 @@ impl HostHeap {
             let Some(held) = held else {
                 return true;
             };
-            is_placed_texture(&view)
-                && placed_texture(&view).is_some_and(|p| {
-                    let (View::Shader(r, _) | View::Unordered(r, ..)) = p else {
-                        return false;
-                    };
-                    !crate::resource::host_copy(r as crate::object::This).is_some_and(|copy| {
-                        windows::core::Interface::as_raw(&copy.texture) == held
-                            || copy.twin.get().and_then(Option::as_ref).is_some_and(|t| {
-                                t.planes
-                                    .iter()
-                                    .any(|p| windows::core::Interface::as_raw(&p.texture) == held)
-                            })
+            let resolved = placed_texture(&view);
+            let target = resolved.as_ref().unwrap_or(&view);
+            let (View::Shader(r, _) | View::Unordered(r, ..)) = *target else {
+                return false;
+            };
+            !crate::resource::host_copy(r as crate::object::This).is_some_and(|copy| {
+                windows::core::Interface::as_raw(&copy.texture) == held
+                    || copy.twin.get().and_then(Option::as_ref).is_some_and(|t| {
+                        t.planes
+                            .iter()
+                            .any(|p| windows::core::Interface::as_raw(&p.texture) == held)
                     })
-                })
+            })
         };
         if made[index as usize] == key && !needs_remake() {
             return Some(view);
@@ -887,6 +886,35 @@ impl HostHeap {
             if index < self.count {
                 self.viewed.set(index, view.as_ref(), false);
                 crate::shadow::forget_read(index);
+            }
+        }
+    }
+
+    /// Re-mirrors title slots viewing any replaced host texture in `textures`
+    /// (raw pointers) so bindless and table shaders see the upgraded host
+    /// texture without the title rewriting those slots.
+    pub(crate) fn refresh_replaced(
+        &self,
+        textures: &std::collections::HashSet<usize>,
+        start: u64,
+        step: u64,
+    ) {
+        let slots: Vec<u32> = {
+            let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+            (0..self.count.min(kept.len() as u32))
+                .filter(|&i| {
+                    kept[i as usize].as_ref().is_some_and(|k| {
+                        k.1.is_none()
+                            && textures
+                                .contains(&(windows::core::Interface::as_raw(&k.0) as usize))
+                    })
+                })
+                .collect()
+        };
+        for index in slots {
+            let handle = start + u64::from(index) * step;
+            if crate::host::read_into(handle as *const u8, &mut [0u8; 12]) {
+                self.mirror(index, handle, true);
             }
         }
     }
@@ -1630,7 +1658,8 @@ fn prepare(view: &View) {
 }
 
 /// Whether `view` is a shader view of a texture (one placed in memory, or a
-/// resource object's): such a slot left null is made when read.
+/// resource object's): such a slot left null or viewing a replaced host
+/// texture is made again when read.
 fn is_texture(view: &View) -> bool {
     is_placed_texture(view)
         || matches!(view, View::Shader(r, _) if crate::resource::texture_memory(*r as crate::object::This).is_some())
@@ -2461,5 +2490,200 @@ mod tests {
         // SAFETY: plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
         assert_eq!(host.log_messages(), None);
+    }
+
+    fn create_test_texture(
+        address: u64,
+        width: u64,
+        height: u32,
+        format: u32,
+        layout: u32,
+        flags: u32,
+    ) -> crate::object::This {
+        let mut desc = placed_tex_desc(width, height, format, flags);
+        desc[11] = layout;
+        let mut out = std::ptr::null();
+        let iid = crate::object::guid(
+            0x696442be,
+            0xa72e,
+            0x4059,
+            [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+        );
+        let hr = crate::resource::create_at_address(
+            std::ptr::null(),
+            address,
+            desc.as_ptr().cast(),
+            0,
+            std::ptr::null(),
+            &iid,
+            &mut out,
+        );
+        assert_eq!(hr, 0);
+        out
+    }
+
+    #[test]
+    fn non_placed_srv_remakes_on_table_mirror_after_host_texture_replacement() {
+        let Some(host) = host() else {
+            return;
+        };
+        let _ = host.log_messages();
+        let null = std::ptr::null();
+        let layout = std::alloc::Layout::from_size_align(1 << 16, 1 << 16).unwrap();
+        // SAFETY: non-zero power-of-two allocation freed after releasing test resources.
+        let backing = unsafe { std::alloc::alloc_zeroed(layout) };
+        assert!(!backing.is_null());
+        let va = backing as u64;
+
+        let heap_desc: [u32; 8] = [0, 8, 1, 0, 0, 0, 0, 0];
+        let mut heap = null;
+        let iid = crate::object::guid(
+            0x8efb471d,
+            0x616c,
+            0x4f49,
+            [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
+        );
+        assert_eq!(
+            crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap),
+            0
+        );
+        let title_heap = crate::descriptor::heap(heap);
+        let slot0 = title_heap.start;
+        let heap_host = title_heap.host().expect("a host view heap");
+
+        const LINEAR: u32 = 0x100;
+        let r_srv = create_test_texture(va, 4, 4, 28, LINEAR, 0);
+        let srv_words: [u32; 10] = [28, 4, 0x1688, 0, 0, 1, 0, 0, 0, 0];
+        crate::descriptor::create_srv(null, r_srv, &srv_words, slot0);
+        let old_copy = crate::resource::host_copy(r_srv).expect("initial HostTexture");
+        let old_raw = windows::core::Interface::as_raw(&old_copy.texture) as usize;
+        assert_eq!(heap_host.textures_at(&[0]), [old_raw]);
+
+        // Upgrading the memory with a render-target texture retargets `r_srv`,
+        // and a table-bound mirror (`for_draw = true`) refreshes slot 0 right away.
+        let r_rt = create_test_texture(va, 4, 4, 28, LINEAR, 1);
+        let new_copy = crate::resource::host_copy(r_rt).expect("upgraded HostTexture");
+        let new_raw = windows::core::Interface::as_raw(&new_copy.texture) as usize;
+        assert_ne!(new_raw, old_raw);
+        assert!(std::sync::Arc::ptr_eq(
+            &crate::resource::host_copy(r_srv).expect("retargeted HostTexture"),
+            &new_copy
+        ));
+        heap_host.mirror(0, slot0, true).expect("remirrored SRV");
+        assert_eq!(
+            heap_host.textures_at(&[0]),
+            [new_raw],
+            "table-bound mirror must re-mirror non-placed SRV to upgraded HostTexture"
+        );
+        crate::descriptor::sync_heaps();
+        assert_eq!(heap_host.textures_at(&[0]), [new_raw]);
+
+        // SAFETY: plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+        assert_eq!(host.log_messages(), None);
+
+        let release = |obj: crate::object::This| {
+            crate::object::slot::<extern "system" fn(crate::object::This) -> u32>(obj, 0x10)(obj);
+        };
+        release(r_rt);
+        release(r_srv);
+        release(heap);
+        // SAFETY: `backing` was allocated with `layout` above and all resources are released.
+        unsafe { std::alloc::dealloc(backing, layout) };
+    }
+
+    #[test]
+    fn gpu_written_replaced_host_texture_stays_with_its_owner_while_placed_views_refresh() {
+        let Some(host) = host() else {
+            return;
+        };
+        let _ = host.log_messages();
+        let null = std::ptr::null();
+        let va = placed_memory();
+
+        let heap_desc: [u32; 8] = [0, 8, 1, 0, 0, 0, 0, 0];
+        let mut heap = null;
+        let iid = crate::object::guid(
+            0x8efb471d,
+            0x616c,
+            0x4f49,
+            [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
+        );
+        assert_eq!(
+            crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap),
+            0
+        );
+        let title_heap = crate::descriptor::heap(heap);
+        let slot = |i: u64| title_heap.start + i * 32;
+        let heap_host = title_heap.host().expect("a host view heap");
+
+        const LINEAR: u32 = 0x100;
+        // `r_rt` is GPU-writable (`ALLOW_RENDER_TARGET`), so its HostTexture
+        // may hold rendered contents and must NOT be retargeted away when a
+        // later UAV resource replaces the memory's entry.
+        let r_rt = create_test_texture(va, 4, 4, 28, LINEAR, 1);
+        let rt_copy = crate::resource::host_copy(r_rt).expect("RT HostTexture");
+        let old_raw = windows::core::Interface::as_raw(&rt_copy.texture) as usize;
+        let srv_words: [u32; 10] = [28, 4, 0x1688, 0, 0, 1, 0, 0, 0, 0];
+        crate::descriptor::create_srv(null, r_rt, &srv_words, slot(0));
+
+        let mut res_ro = placed_tex_desc(4, 4, 28, 0);
+        res_ro[11] = LINEAR;
+        let placed_srv = placed_tex_srv_desc(va, 28);
+        crate::descriptor::create_placed_srv(null, &res_ro, &placed_srv, slot(1));
+        heap_host
+            .mirror(1, slot(1), true)
+            .expect("placed SRV on RT texture");
+        assert_eq!(heap_host.textures_at(&[0, 1]), [old_raw, old_raw]);
+
+        // Also check a title-written resource that was already written by a
+        // host copy (`host_written == true`): it must keep its HostTexture too.
+        let va2 = placed_memory();
+        let r_copied = create_test_texture(va2, 4, 4, 28, LINEAR, 0);
+        let copied_old = crate::resource::host_copy(r_copied).expect("host-written HostTexture");
+        copied_old
+            .host_written
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let r_rt2 = create_test_texture(va2, 4, 4, 28, LINEAR, 1);
+        let copied_new = crate::resource::host_copy(r_rt2).expect("upgraded HostTexture");
+        assert!(!std::sync::Arc::ptr_eq(&copied_old, &copied_new));
+        assert!(
+            std::sync::Arc::ptr_eq(&crate::resource::host_copy(r_copied).unwrap(), &copied_old),
+            "host-written texture must not be retargeted away from its contents"
+        );
+
+        let r_uav = create_test_texture(va, 4, 4, 28, LINEAR, 4);
+        let new_copy = crate::resource::host_copy(r_uav).expect("RT|UAV HostTexture");
+        let new_raw = windows::core::Interface::as_raw(&new_copy.texture) as usize;
+        assert_ne!(new_raw, old_raw);
+
+        crate::descriptor::sync_heaps();
+        assert!(
+            std::sync::Arc::ptr_eq(&crate::resource::host_copy(r_rt).unwrap(), &rt_copy),
+            "GPU-writable owner must keep its original HostTexture"
+        );
+        assert_eq!(
+            heap_host.textures_at(&[0]),
+            [old_raw],
+            "slot viewing the GPU-writable owner stays on its HostTexture"
+        );
+        assert_eq!(
+            heap_host.textures_at(&[1]),
+            [new_raw],
+            "placed view slot refreshes to the upgraded HostTexture"
+        );
+
+        // SAFETY: plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+        assert_eq!(host.log_messages(), None);
+
+        let release = |obj: crate::object::This| {
+            crate::object::slot::<extern "system" fn(crate::object::This) -> u32>(obj, 0x10)(obj);
+        };
+        release(r_uav);
+        release(r_rt);
+        release(r_rt2);
+        release(r_copied);
+        release(heap);
     }
 }

@@ -687,4 +687,227 @@ void main(uint3 id : SV_DispatchThreadID) {
             }
         }
     }
+
+    fn resource_at_flags(
+        address: usize,
+        width: u64,
+        height: u32,
+        format: u32,
+        layout: u32,
+        flags: u32,
+    ) -> This {
+        let desc: [u32; 14] = [
+            3,
+            0,
+            0,
+            0,
+            width as u32,
+            (width >> 32) as u32,
+            height,
+            1 | 1 << 16,
+            format,
+            1,
+            0,
+            layout,
+            flags,
+            0,
+        ];
+        let mut out = std::ptr::null();
+        let iid = crate::object::guid(
+            0x696442be,
+            0xa72e,
+            0x4059,
+            [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+        );
+        let made = crate::resource::create_at_address(
+            std::ptr::null(),
+            address as u64,
+            desc.as_ptr().cast(),
+            0,
+            std::ptr::null(),
+            &iid,
+            &mut out,
+        );
+        assert_eq!(made, S_OK);
+        out
+    }
+
+    fn bindless_upgrade_test(placed: bool, expected_red: u8) {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let _ = host.log_messages();
+        let null = std::ptr::null();
+        let (src, dst) = (resource(1, 256, 1, 0, 1), resource(1, 256, 1, 0, 1));
+        let (src_bytes, _) = crate::resource::buffer_bytes(src).unwrap();
+        let (dst_bytes, _) = crate::resource::buffer_bytes(dst).unwrap();
+        let base = 4000u32;
+        // SAFETY: `src` owns 256 bytes of title memory.
+        unsafe {
+            let words = std::slice::from_raw_parts_mut(src_bytes.cast::<u32>(), 64);
+            for (i, w) in words.iter_mut().enumerate() {
+                *w = base + i as u32;
+            }
+        }
+        // Dedicated 64 KiB console texture memory shared by an SRV view and a
+        // later render target at the exact same address.
+        let layout = std::alloc::Layout::from_size_align(1 << 16, 1 << 16).unwrap();
+        // SAFETY: non-zero power-of-two allocation freed at the end of the test.
+        let backing = unsafe { std::alloc::alloc_zeroed(layout) };
+        assert!(!backing.is_null());
+        let addr = backing as u64;
+
+        let heap_desc: [u32; 8] = [0, 8, 1, 0, 0, 0, 0, 0];
+        let mut heap = null;
+        let iid = crate::object::guid(
+            0x8efb471d,
+            0x616c,
+            0x4f49,
+            [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
+        );
+        assert_eq!(
+            crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap),
+            S_OK
+        );
+        let title_heap = crate::descriptor::heap(heap);
+        let slot = |i: u64| title_heap.start + 32 * i;
+        let srv: [u32; 10] = [39, 1, 0x1688, 0, 0, 0, 64, 0, 1, 0];
+        let uav: [u32; 10] = [39, 1, 0, 0, 64, 0, 0, 0, 1, 0];
+        crate::descriptor::create_srv(null, src, &srv, slot(0));
+        crate::descriptor::create_uav(null, dst, null, &uav, slot(1));
+
+        let mut r_srv = null;
+        if placed {
+            let res_words: [u32; 14] = [3, 0, 0, 0, 4, 0, 1, 1 | 1 << 16, 28, 1, 0, LINEAR, 0, 0];
+            let mut view = [0u32; 16];
+            view[..6].copy_from_slice(&[28, 4, 0x1688, 0, 0, 1]);
+            (view[10], view[11]) = (addr as u32, (addr >> 32) as u32);
+            crate::descriptor::create_placed_srv(null, &res_words, &view, slot(2));
+        } else {
+            r_srv = resource_at_flags(backing as usize, 4, 1, 28, LINEAR, 0);
+            crate::descriptor::create_srv(null, r_srv, std::ptr::null(), slot(2));
+        }
+
+        let heap_host = title_heap.host().expect("a host view heap");
+        if placed {
+            // Simulate a bindless shader's first read populating slot 2 with the
+            // initial non-render-target HostTexture.
+            crate::descriptor::make_read(&[2]);
+        }
+        let before_raw = heap_host.textures_at(&[2]);
+        assert_eq!(
+            before_raw.len(),
+            1,
+            "slot 2 materialized on initial HostTexture"
+        );
+
+        let (root, pso) = compile();
+        let out = crate::shadow::find(dst_bytes as u64, 256).expect("the output's host copy");
+        let list = host.new_list().unwrap();
+
+        // Submission 1: sample slot 2 before the render target exists (reads 0).
+        // SAFETY: an open list, live objects of ours.
+        unsafe {
+            list.list
+                .SetDescriptorHeaps(&[Some(heap_host.heap.clone())]);
+            list.list.SetComputeRootSignature(&root);
+            list.list.SetComputeRootDescriptorTable(0, heap_host.gpu(0));
+            list.list.SetPipelineState(&pso);
+            list.list.Dispatch(4, 1, 1);
+        }
+        list.defer_heap(&heap_host.viewed);
+        list.close();
+        host.execute(&[&list]);
+        let words = out.read_host(dst_bytes as u64, 4);
+        assert_eq!(
+            words,
+            [base, base + 1, base + 2, base + 3],
+            "initial black texture"
+        );
+
+        // Now create an ALLOW_RENDER_TARGET resource at the exact same address,
+        // replacing the memory's HostTexture with one the GPU can render into.
+        let r_rt = resource_at_flags(backing as usize, 4, 1, 28, LINEAR, 1);
+        let rt_copy = crate::resource::host_copy(r_rt).expect("upgraded HostTexture");
+        let rt_raw = windows::core::Interface::as_raw(&rt_copy.texture) as usize;
+        assert_ne!(
+            rt_raw, before_raw[0],
+            "shared_texture must have replaced the old HostTexture"
+        );
+
+        // Submission 2: clear the render target to `expected_red` and sample slot 2
+        // without rewriting slot 2 in the descriptor heap.
+        list.reset();
+        const RENDER_TARGET: u32 = 0x4;
+        const SHADER_RESOURCE: u32 = 0x40 | 0x80;
+        crate::list::ensure_state(&list, r_rt, RENDER_TARGET);
+        let rtv = host.rtv(&rt_copy.texture, None);
+        let color = [f32::from(expected_red) / 255.0, 0.0, 0.0, 1.0];
+        // SAFETY: an open list, valid RTV and heap.
+        unsafe {
+            list.list.ClearRenderTargetView(rtv, &color, None);
+        }
+        crate::list::ensure_state(&list, r_rt, SHADER_RESOURCE);
+        // SAFETY: an open list, live objects of ours.
+        unsafe {
+            list.list
+                .SetDescriptorHeaps(&[Some(heap_host.heap.clone())]);
+            list.list.SetComputeRootSignature(&root);
+            list.list.SetComputeRootDescriptorTable(0, heap_host.gpu(0));
+            list.list.SetPipelineState(&pso);
+            list.list.Dispatch(4, 1, 1);
+        }
+        list.defer_heap(&heap_host.viewed);
+        list.close();
+        host.execute(&[&list]);
+
+        let words = out.read_host(dst_bytes as u64, 4);
+        for (i, &v) in words.iter().enumerate() {
+            assert_eq!(
+                v,
+                base + i as u32 + u32::from(expected_red),
+                "bindless shader must sample the upgraded render target (dword {i})"
+            );
+        }
+        assert_eq!(
+            heap_host.textures_at(&[2]),
+            [rt_raw],
+            "slot 2 must be refreshed to view the upgraded HostTexture"
+        );
+        if !placed {
+            let srv_copy = crate::resource::host_copy(r_srv).expect("retargeted SRV HostTexture");
+            assert!(
+                Arc::ptr_eq(&srv_copy, &rt_copy),
+                "read-only sibling resource must retarget to the upgraded HostTexture"
+            );
+        }
+        // SAFETY: plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+        assert_eq!(host.log_messages(), None);
+
+        let release = |obj: This| {
+            if !obj.is_null() {
+                crate::object::slot::<extern "system" fn(This) -> u32>(obj, 0x10)(obj);
+            }
+        };
+        release(r_rt);
+        release(r_srv);
+        release(src);
+        release(dst);
+        release(heap);
+        if !placed {
+            // SAFETY: `backing` was allocated with `layout` above; `r_rt` and `r_srv` are released.
+            unsafe { std::alloc::dealloc(backing, layout) };
+        }
+    }
+
+    #[test]
+    fn bindless_placed_srv_sees_render_target_that_replaces_its_host_texture() {
+        bindless_upgrade_test(true, 0x80);
+    }
+
+    #[test]
+    fn bindless_resource_srv_sees_render_target_that_replaces_its_host_texture() {
+        bindless_upgrade_test(false, 0xC0);
+    }
 }

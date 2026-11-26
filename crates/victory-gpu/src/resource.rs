@@ -1207,6 +1207,34 @@ static MEMORY: std::sync::Mutex<
     Option<std::collections::HashMap<MemoryKey, std::sync::Weak<HostTexture>>>,
 > = std::sync::Mutex::new(None);
 
+/// Host textures (raw pointers) replaced in [`MEMORY`] since the last heap
+/// sync: slots still viewing one are refreshed before the next submission.
+#[cfg(windows)]
+static HAS_REPLACED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[cfg(windows)]
+static REPLACED_TEXTURES: std::sync::Mutex<Option<std::collections::HashSet<usize>>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(windows)]
+fn note_replaced(texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource) {
+    use windows::core::Interface;
+    let mut set = REPLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+    set.get_or_insert_with(Default::default)
+        .insert(texture.as_raw() as usize);
+    HAS_REPLACED.store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// Host textures replaced since the last call, if any.
+#[cfg(windows)]
+pub(crate) fn take_replaced() -> Option<std::collections::HashSet<usize>> {
+    if !HAS_REPLACED.load(std::sync::atomic::Ordering::Acquire) {
+        return None;
+    }
+    let mut set = REPLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+    HAS_REPLACED.store(false, std::sync::atomic::Ordering::Release);
+    set.take()
+}
+
 /// The host texture of the memory at `address` that `desc` describes: the
 /// live one if it takes `desc` (its uses, a format it can be viewed in),
 /// else a new one, which becomes the memory's.
@@ -1219,8 +1247,8 @@ fn shared_texture(
 ) -> Option<std::sync::Arc<HostTexture>> {
     let d = host_desc(desc)?;
     let key = memory_key(address, desc);
-    let mut map = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
-    let map = map.get_or_insert_with(Default::default);
+    let mut memory = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+    let map = memory.get_or_insert_with(Default::default);
     let live = key.and_then(|k| map.get(&k)?.upgrade());
     if let Some(t) = &live
         && takes(t, &d)
@@ -1247,9 +1275,10 @@ fn shared_texture(
             }
         }
     }
-    // shortcut: title textures of a replaced host texture keep it (placed
-    // views move to the new one, `texture_at`); copies (`alias_source`)
-    // bridge the two where the shapes allow.
+    // Read-only sibling title textures retarget to the upgraded host texture
+    // below; GPU-written ones keep theirs (bridged by `alias_source`), while
+    // placed views move to the new one (`texture_at`) and heap slots viewing
+    // the replaced texture are refreshed before the next submission.
     let mut t = make_texture(&d, state, clear)?;
     t.key = key;
     let t = std::sync::Arc::new(t);
@@ -1263,6 +1292,30 @@ fn shared_texture(
             map.retain(|_, w| w.strong_count() > 0);
         }
         map.insert(k, std::sync::Arc::downgrade(&t));
+    }
+    drop(memory);
+    if let Some(old) = live {
+        if crate::texture::title_written(&old.texture)
+            && !old.host_written.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            let at = TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner());
+            for r in at
+                .get(&address)
+                .into_iter()
+                .flatten()
+                .map(|&r| resource(r as This))
+            {
+                if memory_key(address, &r.desc) == key
+                    && host_desc(&r.desc).is_some_and(|hd| takes(&t, &hd))
+                {
+                    let mut h = r.host.lock().unwrap_or_else(|e| e.into_inner());
+                    if matches!(&*h, Some(Some(x)) if std::sync::Arc::ptr_eq(x, &old)) {
+                        *h = Some(Some(t.clone()));
+                    }
+                }
+            }
+        }
+        note_replaced(&old.texture);
     }
     Some(t)
 }

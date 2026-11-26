@@ -169,16 +169,19 @@ fn mirror(handle: u64) {
 pub(crate) fn sync_heaps() {
     // Held throughout: a heap is not dropped while its slots are made.
     let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let replaced = crate::resource::take_replaced();
     for &(start, _, at) in heaps.iter() {
         // SAFETY: registered heaps are live (removed when dropped).
         let heap = unsafe { &*(at as *const Heap) };
-        let (Some(Some(host)), Some(written), Some(step)) =
-            (heap.host.get(), &heap.written, increment(heap.desc.kind))
-        else {
+        let (Some(Some(host)), Some(step)) = (heap.host.get(), increment(heap.desc.kind)) else {
             continue;
         };
         let step = u64::from(step);
-        for (from, to) in written.take(start as usize, usize::MAX) {
+        for (from, to) in heap
+            .written
+            .iter()
+            .flat_map(|written| written.take(start as usize, usize::MAX))
+        {
             // By page: one with nothing mapped (the title unmaps heap pages
             // too) holds no records.
             let page_size = crate::watch::PAGE;
@@ -195,6 +198,11 @@ pub(crate) fn sync_heaps() {
                 );
                 host.sync_slots(first as u32, last.min(u64::from(heap.desc.count)) as u32, start, step);
             }
+        }
+        if let Some(replaced) = &replaced
+            && heap.desc.kind == VIEWS_KIND
+        {
+            host.refresh_replaced(replaced, start, step);
         }
     }
 }
