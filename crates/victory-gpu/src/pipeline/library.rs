@@ -73,11 +73,11 @@ fn is_translation(dir: &Path) -> bool {
     ours && dir.is_dir() && library_in(dir)
 }
 
-/// Whether `dir` holds a library: its first shard, or the single file a
-/// directory written before the split has (`host-pipelines.bin`). Both are
-/// read so a library made by either build is pruned as this crate's own.
+/// A library may have the old single file or only the shards that gained
+/// pipelines. Recognize every shard filename the writer uses.
 fn library_in(dir: &Path) -> bool {
-    dir.join(shard_file(0)).is_file() || dir.join("host-pipelines.bin").is_file()
+    dir.join("host-pipelines.bin").is_file()
+        || (0..SHARDS).any(|shard| dir.join(shard_file(shard)).is_file())
 }
 
 /// How many translations keep a library: the one in use and the previous
@@ -1043,6 +1043,24 @@ mod keyed_tests {
     /// Pruning keeps only directories this wrote: a `backup/` (or any
     /// directory without a hash name) in the cache directory survives,
     /// with what is in it, even when it is the oldest thing there.
+    #[test]
+    fn a_translation_with_only_a_later_shard_is_recognized() {
+        let root = tempfile::tempdir().unwrap();
+        let fixtures = [
+            ("0000000000000001", "host-pipelines.bin".to_owned(), true),
+            ("0000000000000002", shard_file(0), true),
+            ("0000000000000003", shard_file(SHARDS - 1), true),
+            ("0000000000000004", shard_file(SHARDS), false),
+            ("backup", shard_file(SHARDS - 1), false),
+        ];
+        for (name, file, expected) in fixtures {
+            let dir = root.path().join(name);
+            std::fs::create_dir(&dir).unwrap();
+            std::fs::write(dir.join(&file), b"synthetic shard").unwrap();
+            assert_eq!(is_translation(&dir), expected, "{name}/{file}");
+        }
+    }
+
     #[test]
     fn pruning_leaves_foreign_directories_alone() {
         let dir = std::env::temp_dir().join(format!("victory-keyed-{}", std::process::id()));
