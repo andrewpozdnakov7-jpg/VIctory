@@ -2831,6 +2831,120 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn automatic_mips_have_native_footprints_across_array_slices() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC};
+
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let input = ResourceDesc {
+            depth_or_array_size: 2,
+            ..texture(10, 6, 28, 0)
+        };
+        let null = std::ptr::null();
+        let mut guest = null;
+        assert_eq!(
+            create_committed(null, &PROPERTIES, 0, &input, 0, null.cast(), &RESOURCE_IIDS[0], &mut guest),
+            S_OK
+        );
+        let mut desc = input;
+        slot::<extern "system" fn(This, *mut ResourceDesc)>(guest, 0x50)(guest, &mut desc);
+        assert_eq!(slot::<Release>(guest, 0x10)(guest), 0);
+
+        let input = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 10,
+            Height: 6,
+            DepthOrArraySize: 2,
+            MipLevels: 0,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            ..Default::default()
+        };
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let mut native: Option<ID3D12Resource> = None;
+        // SAFETY: valid small texture and our output slot.
+        let native_desc = unsafe {
+            host.device
+                .CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &input,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    None,
+                    &mut native,
+                )
+                .unwrap();
+            native.unwrap().GetDesc()
+        };
+        assert_eq!(native_desc.MipLevels, 4);
+        assert_eq!(desc.mip_levels, native_desc.MipLevels, "GetDesc mip count");
+
+        let last_mip = u32::from(desc.mip_levels) - 1;
+        // The last mip of slice 0, then the first two mips of slice 1.
+        for base in [0, 1, 513] {
+            let mut layouts = [NO_FOOTPRINT; 3];
+            let mut rows = [0; 3];
+            let mut row_sizes = [0; 3];
+            let mut total = 0;
+            copyable_footprints(
+                null,
+                &desc,
+                last_mip,
+                3,
+                base,
+                layouts.as_mut_ptr(),
+                rows.as_mut_ptr(),
+                row_sizes.as_mut_ptr(),
+                &mut total,
+            );
+
+            let mut expected = [D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); 3];
+            let mut expected_rows = [0; 3];
+            let mut expected_sizes = [0; 3];
+            let mut expected_total = 0;
+            // SAFETY: a native GetDesc result and three entries in each output array.
+            unsafe {
+                host.device.GetCopyableFootprints(
+                    &native_desc,
+                    last_mip,
+                    3,
+                    base,
+                    Some(expected.as_mut_ptr()),
+                    Some(expected_rows.as_mut_ptr()),
+                    Some(expected_sizes.as_mut_ptr()),
+                    Some(&mut expected_total),
+                );
+            }
+            assert_eq!(layouts.map(|f| (f.width, f.height)), [(1, 1), (10, 6), (5, 3)]);
+            for (guest, native) in layouts.into_iter().zip(expected) {
+                let f = native.Footprint;
+                assert_eq!(
+                    guest,
+                    PlacedFootprint {
+                        offset: native.Offset,
+                        format: f.Format.0 as u32,
+                        width: f.Width,
+                        height: f.Height,
+                        depth: f.Depth,
+                        row_pitch: f.RowPitch,
+                    },
+                    "footprint at base {base}"
+                );
+            }
+            assert_eq!(rows, expected_rows);
+            assert_eq!(row_sizes, expected_sizes);
+            assert_eq!(total, expected_total);
+            println!("base {base}, rows {rows:?}, bytes {total}");
+        }
+    }
+
     #[test]
     fn depth_stencil_footprints_follow_the_pc_plane_order() {
         // Native D3D12 reports the same layout for both depth/stencil families
