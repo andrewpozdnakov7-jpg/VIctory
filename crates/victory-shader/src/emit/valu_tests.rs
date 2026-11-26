@@ -55,6 +55,35 @@ const fn vop3(op: u16, vdst: u8, src0: u16, src1: u16, src2: u16) -> [u32; 2] {
     ]
 }
 
+/// VOP3P `op vdst, src0, src1, src2` with `opsel`, `opsel_hi`, `neg`, `neg_hi`, `clamp`.
+#[allow(clippy::too_many_arguments)]
+const fn vop3p(
+    op: u8,
+    vdst: u8,
+    src0: u16,
+    src1: u16,
+    src2: u16,
+    opsel: u8,
+    opsel_hi: u8,
+    neg: u8,
+    neg_hi: u8,
+    clamp: bool,
+) -> [u32; 2] {
+    let w0 = 0x33 << 26
+        | (op as u32 & 0x7F) << 16
+        | (clamp as u32) << 15
+        | ((opsel_hi as u32 >> 2) & 1) << 14
+        | (opsel as u32 & 7) << 11
+        | (neg_hi as u32 & 7) << 8
+        | vdst as u32;
+    let w1 = (neg as u32 & 7) << 29
+        | (opsel_hi as u32 & 3) << 27
+        | (src2 as u32 & 0x1FF) << 18
+        | (src1 as u32 & 0x1FF) << 9
+        | (src0 as u32 & 0x1FF);
+    [w0, w1]
+}
+
 /// MUBUF `buffer_store_dword vdata, off, s[srsrc:srsrc+3], 0 offset:byte_off`.
 const fn buffer_store_dword(vdata: u8, srsrc: u8, byte_off: u16) -> [u32; 2] {
     [
@@ -79,6 +108,13 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
 }
 
 fn try_build_valu_cs(body: &[u32]) -> Result<HostShader, crate::ShaderError> {
+    let native = build_valu_native(body);
+    let (p, st) = range::build(&native.code, native.wave64, native.vgprs)?;
+    let st = st?;
+    finish_valu_cs(&native, &p, &st)
+}
+
+fn build_valu_native(body: &[u32]) -> NativeProgram {
     let mut words = Vec::new();
     // s[4:5] = descriptor table address (heap index 0 -> byte offset 0).
     words.push(s_mov_b32(5, 0x80)); // inline constant 0
@@ -93,7 +129,7 @@ fn try_build_valu_cs(body: &[u32]) -> Result<HostShader, crate::ShaderError> {
     words.push(S_ENDPGM);
 
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
-    let native = NativeProgram {
+    NativeProgram {
         stage: HwStage::Cs,
         wave64: false,
         vgprs: 16,
@@ -130,20 +166,25 @@ fn try_build_valu_cs(body: &[u32]) -> Result<HostShader, crate::ShaderError> {
             threads: [1, 1, 1],
         }),
         code,
-    };
-
-    lower_valu_cs(&native)
+    }
 }
 
 fn lower_valu_cs(native: &NativeProgram) -> Result<HostShader, crate::ShaderError> {
     let (p, st) = range::build(&native.code, native.wave64, native.vgprs)?;
-    let st = st?;
-    let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
-    let io = io::raise(&p, native)?;
+    finish_valu_cs(native, &p, &st?)
+}
+
+fn finish_valu_cs(
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+) -> Result<HostShader, crate::ShaderError> {
+    let res = resource::track(p, &native.layout, native.stage, Some(st))?;
+    let io = io::raise(p, native)?;
     let lowered = lower::lower(&lower::Parts {
         native,
-        p: &p,
-        st: &st,
+        p,
+        st,
         io: &io,
         res: &res,
         inputs: Vec::new(),
@@ -592,6 +633,160 @@ fn normalized_codes_truncate_back_to_themselves() {
         let cases: Vec<[u32; 4]> = normalized_codes(bits).iter().map(|&a| [a, 0, 0, 0]).collect();
         run_cases(&shader, &cases, |backend, _, [a, ..], got| {
             assert_eq!(got, a, "{backend}: {bits}-bit code {a} comes back as {got}");
+        });
+    }
+}
+
+fn run_fma_mix_f16(high: bool, modifiers: [u32; 2], cases: &[([u32; 3], u16)]) {
+    const OLD: u32 = 0xA55A_69C3;
+    let op = if high { 0xCC22_0000 } else { 0xCC21_0000 };
+    let shader = build_valu_cs(&[
+        vop1(0x001, 0, vgpr(4)), // v_mov_b32 v0, v4
+        op | modifiers[0],
+        0x040E_0501 | modifiers[1], // v_fma_mix{lo,hi}_f16 v0, v1, v2, v3
+    ]);
+    let container = crate::Container::parse(&shader.dxil).unwrap();
+    let sfi0 = container.part(crate::FourCC::SFI0).unwrap();
+    let requirements = u64::from_le_bytes(sfi0.data.try_into().unwrap());
+    const WIDE_OPS: u64 = 0x0001 | 0x0020 | 0x8000; // Doubles, double extensions, int64.
+    assert_eq!(requirements & WIDE_OPS, 0);
+
+    let inputs: Vec<_> = cases.iter().map(|&([a, b, c], _)| [a, b, c, OLD]).collect();
+    run_cases(&shader, &inputs, |backend, i, src, got| {
+        let (result, other, kept) = if high {
+            ((got >> 16) as u16, got as u16, OLD as u16)
+        } else {
+            (got as u16, (got >> 16) as u16, (OLD >> 16) as u16)
+        };
+        assert_eq!(other, kept, "{backend}: high={high}, inputs={src:08x?}");
+        let expected = cases[i].1;
+        if is_f16_nan(expected) {
+            assert!(
+                is_f16_nan(result),
+                "{backend}: expected NaN, got {result:04x}"
+            );
+        } else {
+            assert_eq!(
+                result, expected,
+                "{backend}: high={high}, inputs={src:08x?}"
+            );
+        }
+    });
+}
+
+#[test]
+fn v_fma_mix_f16_rounds_once() {
+    let half_ulp = 2.0f32.powi(-11);
+    let eps = f32::EPSILON;
+    let normal_boundary = 2.0f32.powi(-14) - 2.0f32.powi(-25);
+    let cases = [
+        // The exact sums miss the midpoint by +2^-46 and -2^-46.
+        // Rounding first to f32 would give 0x3C00 and 0x3C02, respectively.
+        ([1.0 + eps, 1.0 + eps, half_ulp - 2.0 * eps], 0x3C01),
+        ([1.0 + eps, 1.0 - eps, 3.0 * half_ulp], 0x3C01),
+        // A contribution too small to keep in the aligned significand can still break a tie.
+        ([1.0 + half_ulp, 1.0, f32::MIN_POSITIVE], 0x3C01),
+        ([f32::MIN_POSITIVE, -1.0, 1.0 + 3.0 * half_ulp], 0x3C01),
+        ([1.0 + half_ulp, 1.0, 0.0], 0x3C00), // exact ties to even
+        ([1.0 + 3.0 * half_ulp, 1.0, 0.0], 0x3C02),
+        // Flushed f32 denormals leave the ties intact and multiply as zeros.
+        ([1.0 + half_ulp, 1.0, f32::from_bits(1)], 0x3C00),
+        ([f32::from_bits(1), -1.0, 1.0 + 3.0 * half_ulp], 0x3C02),
+        ([f32::from_bits(1), 2.0f32.powi(127), 0.0], 0x0000),
+        // Cancellation down to -2^-22.
+        (
+            [4096.0 + half_ulp, 4096.0 - half_ulp, -16_777_216.0],
+            0x8004,
+        ),
+        // The midpoint between zero and the smallest subnormal, and just above it.
+        ([2.0f32.powi(-25), 1.0, 0.0], 0x0000),
+        ([2.0f32.powi(-25), 1.0, 2.0f32.powi(-55)], 0x0001),
+        // The midpoint below the smallest normal, and just below the midpoint.
+        ([normal_boundary, 1.0, 0.0], 0x0400),
+        ([normal_boundary, 1.0, -2.0f32.powi(-40)], 0x03FF),
+        // The overflow midpoint, and just below it.
+        ([65_520.0, 1.0, 0.0], 0x7C00),
+        ([65_520.0, 1.0, -2.0f32.powi(-12)], 0x7BFF),
+    ]
+    .map(|(src, half)| (src.map(f32::to_bits), half));
+    for high in [false, true] {
+        run_fma_mix_f16(high, [0; 2], &cases);
+    }
+}
+
+#[test]
+fn v_fma_mix_f16_preserves_special_values() {
+    let inf = f32::INFINITY;
+    let nan = f32::NAN;
+    let cases = [
+        ([-0.0, 1.0, -0.0], 0x8000),
+        ([-0.0, 1.0, 0.0], 0x0000),
+        (
+            [f32::from_bits(0x8000_0001), 1.0 + f32::EPSILON, 0.0],
+            0x0000,
+        ),
+        ([-0.0, 1.0, f32::from_bits(0x8000_0001)], 0x8000),
+        ([-1.0, 1.0, 1.0], 0x0000),
+        ([-2.0f32.powi(-26), 1.0, 0.0], 0x8000),
+        ([inf, -1.0, 0.0], 0xFC00),
+        ([f32::MAX, 2.0, -inf], 0xFC00),
+        ([inf, f32::from_bits(1), 0.0], 0x7E00),
+        ([inf, 0.0, 1.0], 0x7E00),
+        ([inf, 1.0, -inf], 0x7E00),
+        ([1.0, 1.0, nan], 0x7E00),
+    ]
+    .map(|(src, half)| (src.map(f32::to_bits), half));
+    run_fma_mix_f16(false, [0; 2], &cases);
+}
+
+#[test]
+fn v_fma_mix_f16_clamps_the_rounded_half() {
+    let inf = f32::INFINITY;
+    let cases = [
+        ([0.5 + 2.0f32.powi(-12), 1.0, 2.0f32.powi(-26)], 0x3801),
+        ([2.0f32.powi(-25), 1.0, 2.0f32.powi(-55)], 0x0001),
+        ([2.0, 1.0, 0.0], 0x3C00),
+        ([-1.0, 1.0, 0.0], 0x0000),
+        ([-0.0, 1.0, -0.0], 0x0000),
+        ([inf, 1.0, 0.0], 0x3C00),
+        ([-inf, 1.0, 0.0], 0x0000),
+        ([f32::NAN, 1.0, 0.0], 0x0000),
+        ([1.0, inf, -inf], 0x0000),
+    ]
+    .map(|(src, half)| (src.map(f32::to_bits), half));
+    for high in [false, true] {
+        run_fma_mix_f16(high, [1 << 15, 0], &cases);
+    }
+}
+
+#[test]
+fn v_fma_mix_f16_selects_and_modifies_sources() {
+    // Negate the f32 in v1, take the absolute value of v2.hi, and add v3.lo.
+    let cases = [
+        (
+            [(1.0 + f32::EPSILON).to_bits(), 0xB800_7E00, 0x7C00_3800],
+            0x8001,
+        ),
+        ([1, 0xBC00_7E00, 0x7C00_0000], 0x0000), // negated f32 subnormal plus +0
+        ([1.0f32.to_bits(), 0x8001_7E00, 0x7C00_0000], 0x8001), // f16 subnormal
+    ];
+    run_fma_mix_f16(true, [0x5200, 0x3000_0000], &cases);
+}
+
+#[test]
+fn v_fma_mix_f16_keeps_toward_zero_mode() {
+    let cases = [
+        [0x3f80_0000, 0x3f80_0000, 0x3a40_0000, 0xa55a_69c3],
+        [0xbf80_0000, 0x3f80_0000, 0xba40_0000, 0xa55a_69c3],
+    ];
+    for (mode, want) in [(0, [0x3c01, 0xbc01]), (3, [0x3c00, 0xbc00])] {
+        let shader = build_valu_cs(&[
+            0xba80_0881, mode, // MODE.FP_ROUND16_64
+            vop1(0x001, 0, vgpr(4)),
+            0xcc21_0000, 0x040e_0501, // v_fma_mixlo_f16 v0, v1, v2, v3
+        ]);
+        run_cases(&shader, &cases, |backend, i, _, got| {
+            assert_eq!(got, 0xa55a_0000 | want[i], "{backend}: mode={mode}, case {i}");
         });
     }
 }
@@ -2278,6 +2473,420 @@ fn v_mul_legacy_f32_treats_denormals_as_zero() {
             got, want,
             "{backend}: v_mul_legacy_f32({:#010x}, {:#010x}) = {got:#010x}, want {want:#010x}",
             inp[0], inp[1],
+        );
+    });
+}
+
+/// Exact IEEE-754 `u128` reference model for `fma(a: f32, b: f32, c: f32) -> f16`
+/// with single round-to-nearest-even to binary16.
+fn fma_f32_to_f16_ref(a: u32, b: u32, c: u32) -> u16 {
+    #[derive(Clone, Copy)]
+    struct Unpacked {
+        sign: bool,
+        mant: u128, // normalized to [2^47, 2^48 - 1] when non-zero
+        exp: i32,   // value = (-1)^sign * mant * 2^exp
+        is_nan: bool,
+        is_inf: bool,
+        is_zero: bool,
+    }
+    fn unpack(x: u32) -> Unpacked {
+        let sign = (x >> 31) != 0;
+        let mag = x & 0x7FFF_FFFF;
+        let exp_raw = (mag >> 23) as i32;
+        let frac = mag & 0x007F_FFFF;
+        let is_nan = mag > 0x7F80_0000;
+        let is_inf = mag == 0x7F80_0000;
+        let is_zero = exp_raw == 0;
+        if is_nan || is_inf || is_zero {
+            return Unpacked {
+                sign,
+                mant: 0,
+                exp: 0,
+                is_nan,
+                is_inf,
+                is_zero,
+            };
+        }
+        let m24 = u128::from(frac | 0x0080_0000);
+        let e24 = exp_raw - 150;
+        Unpacked {
+            sign,
+            mant: m24 << 24,
+            exp: e24 - 24,
+            is_nan: false,
+            is_inf: false,
+            is_zero: false,
+        }
+    }
+    fn round_u128_to_f16(sign: bool, mag: u128, exp: i32, sticky: bool) -> u16 {
+        let s = u16::from(sign) << 15;
+        if mag == 0 {
+            return if sticky { s | 1 } else { 0 };
+        }
+        let top_bit = 127 - mag.leading_zeros() as i32;
+        let e_top = exp + top_bit;
+        if e_top >= 16 {
+            return s | 0x7C00;
+        }
+        if e_top <= -26 {
+            return s;
+        }
+        let keep = if e_top >= -14 { 11 } else { 25 + e_top };
+        let shift = top_bit + 1 - keep;
+        let (sig, round_bit, stk) = if shift > 0 {
+            let sig = (mag >> shift) as u16;
+            let round_bit = ((mag >> (shift - 1)) & 1) != 0;
+            let rem_mask = (1u128 << (shift - 1)) - 1;
+            let stk = sticky || (mag & rem_mask) != 0;
+            (sig, round_bit, stk)
+        } else {
+            ((mag << (-shift)) as u16, false, sticky)
+        };
+        let round_up = round_bit && (stk || (sig & 1) != 0);
+        let sig_r = sig + u16::from(round_up);
+        if e_top >= -14 {
+            let (exp_f, mant_f) = if sig_r == 2048 {
+                ((e_top + 16) as u16, 0)
+            } else {
+                ((e_top + 15) as u16, sig_r & 0x3FF)
+            };
+            if exp_f >= 31 {
+                s | 0x7C00
+            } else {
+                s | (exp_f << 10) | mant_f
+            }
+        } else {
+            s | sig_r
+        }
+    }
+
+    let ua = unpack(a);
+    let ub = unpack(b);
+    let uc = unpack(c);
+    let s_prod = ua.sign ^ ub.sign;
+    if ua.is_nan
+        || ub.is_nan
+        || uc.is_nan
+        || (ua.is_inf && ub.is_zero)
+        || (ub.is_inf && ua.is_zero)
+        || ((ua.is_inf || ub.is_inf) && uc.is_inf && s_prod != uc.sign)
+    {
+        return 0x7E00;
+    }
+    if ua.is_inf || ub.is_inf {
+        return (u16::from(s_prod) << 15) | 0x7C00;
+    }
+    if uc.is_inf {
+        return (u16::from(uc.sign) << 15) | 0x7C00;
+    }
+    if ua.is_zero || ub.is_zero {
+        if uc.is_zero {
+            return u16::from(s_prod && uc.sign) << 15;
+        }
+        return round_u128_to_f16(uc.sign, uc.mant, uc.exp, false);
+    }
+
+    // Exact 48-bit product of 24-bit mantissas.
+    let ma = ua.mant >> 24;
+    let mb = ub.mant >> 24;
+    let mut m_p = ma * mb;
+    let mut e_p = (ua.exp + 24) + (ub.exp + 24);
+    if m_p < (1u128 << 47) {
+        m_p <<= 1;
+        e_p -= 1;
+    }
+    if uc.is_zero {
+        return round_u128_to_f16(s_prod, m_p, e_p, false);
+    }
+
+    let p_ge_c = (e_p > uc.exp) || (e_p == uc.exp && m_p >= uc.mant);
+    let (s_big, m_big, e_big, s_small, m_small, e_small) = if p_ge_c {
+        (s_prod, m_p, e_p, uc.sign, uc.mant, uc.exp)
+    } else {
+        (uc.sign, uc.mant, uc.exp, s_prod, m_p, e_p)
+    };
+    let diff = e_big - e_small;
+    // Place m_big at bits 70..117 so shifts <= 70 are exact in u128.
+    let big_aligned = m_big << 70;
+    let e_base = e_big - 70;
+    let (small_aligned, sticky) = if diff <= 70 {
+        (m_small << (70 - diff), false)
+    } else {
+        let r = diff - 70;
+        if r >= 48 {
+            (0, true)
+        } else {
+            (m_small >> r, (m_small & ((1u128 << r) - 1)) != 0)
+        }
+    };
+    if s_big == s_small {
+        round_u128_to_f16(s_big, big_aligned + small_aligned, e_base, sticky)
+    } else {
+        let sub = big_aligned - small_aligned - u128::from(sticky);
+        if sub == 0 && !sticky {
+            0x0000
+        } else {
+            round_u128_to_f16(s_big, sub, e_base, sticky)
+        }
+    }
+}
+
+#[test]
+fn v_fma_mix_f16_single_rounding_matches_ieee754_on_gpu_and_warp() {
+    // Initialize v0 from v4 so we also check preservation of the untouched half.
+    let mut lo_body = vec![vop1(0x001, 0, vgpr(4))];
+    lo_body.extend_from_slice(&vop3p(
+        0x21,
+        0,
+        vgpr(1),
+        vgpr(2),
+        vgpr(3),
+        0,
+        0,
+        0,
+        0,
+        false,
+    ));
+    let mix_lo = build_valu_cs(&lo_body);
+
+    let mut hi_body = vec![vop1(0x001, 0, vgpr(4))];
+    hi_body.extend_from_slice(&vop3p(
+        0x22,
+        0,
+        vgpr(1),
+        vgpr(2),
+        vgpr(3),
+        0,
+        0,
+        0,
+        0,
+        false,
+    ));
+    let mix_hi = build_valu_cs(&hi_body);
+
+    let f = f32::to_bits;
+    let p_one = f(1.0);
+    let n_one = f(-1.0);
+    let pz = 0x0000_0000u32;
+    let nz = 0x8000_0000u32;
+    let pinf = f32::INFINITY.to_bits();
+    let ninf = f32::NEG_INFINITY.to_bits();
+    let qnan = 0x7FC0_0001u32;
+    let snan = 0x7F80_0001u32;
+
+    // All 7 midpoint tie classes + special values + extreme exponents.
+    let test_triples: &[(u32, u32, u32, Option<u16>)] = &[
+        // Class 1: Even LSB + exact midpoint -> tie to even (0x3C00)
+        (p_one, p_one, f(2f32.powi(-11)), Some(0x3C00)),
+        // Class 2: Odd LSB + exact midpoint -> tie to even (0x3C02)
+        (
+            f(1.0 + 2f32.powi(-10)),
+            p_one,
+            f(2f32.powi(-11)),
+            Some(0x3C02),
+        ),
+        // Class 3: Even LSB + tiny positive above midpoint (double-rounding trap!) -> 0x3C01
+        (p_one, p_one, 0x3A00_0001, Some(0x3C01)),
+        (
+            f(2f32.powi(-100)),
+            f(2f32.powi(-100)),
+            f(1.0 + 2f32.powi(-11)),
+            Some(0x3C01),
+        ),
+        // Class 4: Odd LSB + tiny negative below midpoint -> 0x3C01
+        (
+            f(1.0 + 2f32.powi(-10)),
+            p_one,
+            f(2f32.powi(-11) - 2f32.powi(-35)),
+            Some(0x3C01),
+        ),
+        (
+            f(-2f32.powi(-100)),
+            f(2f32.powi(-100)),
+            f(1.0 + 2f32.powi(-11)),
+            Some(0x3C00),
+        ),
+        (
+            f(-2f32.powi(-100)),
+            f(2f32.powi(-100)),
+            f(1.0 + 2f32.powi(-10) + 2f32.powi(-11)),
+            Some(0x3C01),
+        ),
+        // Class 5: Subnormal ties (0 <-> 2^-24, 1 <-> 2, 2 <-> 3, 1023 <-> 1024 boundary)
+        (p_one, f(2f32.powi(-25)), pz, Some(0x0000)),
+        (p_one, f(2f32.powi(-25)), f(2f32.powi(-48)), Some(0x0001)),
+        (f(2f32.powi(-25)), p_one, f(-2f32.powi(-48)), Some(0x0000)),
+        (p_one, f(1.5 * 2f32.powi(-24)), pz, Some(0x0002)),
+        (p_one, f(2.5 * 2f32.powi(-24)), pz, Some(0x0002)),
+        (
+            p_one,
+            f(2.5 * 2f32.powi(-24)),
+            f(2f32.powi(-48)),
+            Some(0x0003),
+        ),
+        (p_one, f(1023.5 * 2f32.powi(-24)), pz, Some(0x0400)),
+        (
+            p_one,
+            f(1023.5 * 2f32.powi(-24)),
+            f(-2f32.powi(-48)),
+            Some(0x03FF),
+        ),
+        // Class 6: Negative ties (exact & perturbed)
+        (n_one, p_one, f(-2f32.powi(-11)), Some(0xBC00)),
+        (
+            f(-(1.0 + 2f32.powi(-10))),
+            p_one,
+            f(-2f32.powi(-11)),
+            Some(0xBC02),
+        ),
+        (n_one, p_one, 0xBA00_0001, Some(0xBC01)),
+        (n_one, f(2f32.powi(-25)), nz, Some(0x8000)),
+        (n_one, f(2f32.powi(-25)), f(-2f32.powi(-48)), Some(0x8001)),
+        // Class 7: Overflow midpoint (65520.0 -> Inf; 65520.0 - eps -> 65504.0)
+        (f(65504.0), p_one, f(16.0), Some(0x7C00)),
+        (f(65504.0), p_one, f(16.0 - 2f32.powi(-8)), Some(0x7BFF)),
+        (f(-65504.0), p_one, f(-16.0), Some(0xFC00)),
+        (f(-65504.0), p_one, f(-16.0 + 2f32.powi(-8)), Some(0xFBFF)),
+        // Extreme f32 exponents, cancellation, signed zero, Inf, NaN
+        (
+            f(2f32.powi(80)),
+            f(2f32.powi(-80)),
+            0x3A00_0001,
+            Some(0x3C01),
+        ),
+        (
+            f(2f32.powi(120)),
+            f(2f32.powi(-120)),
+            f(2f32.powi(-11)),
+            Some(0x3C00),
+        ),
+        (f(2f32.powi(120)), f(2f32.powi(20)), ninf, Some(0xFC00)),
+        (
+            f(2f32.powi(6) + 2f32.powi(-17)),
+            f(2f32.powi(6)),
+            f(-2f32.powi(12)),
+            Some(0x1000),
+        ),
+        // Deep cancellation clearing upper 32 bits of 64-bit accumulator:
+        // 2^20*(1 + 2^-22) * 2^20*(1 - 2^-22) - 2^40 = -2^-4 (-0.0625 -> 0xAC00)
+        (
+            f(2f32.powi(20) * (1.0 + 2f32.powi(-22))),
+            f(2f32.powi(20) * (1.0 - 2f32.powi(-22))),
+            f(-2f32.powi(40)),
+            Some(0xAC00),
+        ),
+        // f32 subnormal inputs flush to signed zero per RDNA2 console float mode
+        (0x0000_0001, f(2f32.powi(125)), pz, Some(0x0000)),
+        (0x8000_0001, f(2f32.powi(125)), nz, Some(0x8000)),
+        (0x0000_0001, 0x8000_0001, pz, Some(0x0000)),
+        (
+            0x0040_0000,
+            f(2f32.powi(127)),
+            f(2f32.powi(-11)),
+            Some(0x1000),
+        ),
+        (
+            f(1.0 + 2f32.powi(-23)),
+            f(1.0 - 2f32.powi(-23)),
+            n_one,
+            Some(0x8000),
+        ),
+        (nz, p_one, nz, Some(0x8000)),
+        (nz, p_one, pz, Some(0x0000)),
+        (pz, p_one, nz, Some(0x0000)),
+        (n_one, p_one, p_one, Some(0x0000)),
+        (f(-2f32.powi(-20)), f(2f32.powi(-20)), pz, Some(0x8000)),
+        (pz, p_one, f(1.5), Some(0x3E00)),
+        (pz, p_one, f(65536.0), Some(0x7C00)),
+        (pz, p_one, f(-65536.0), Some(0xFC00)),
+        (pinf, f(2.0), n_one, Some(0x7C00)),
+        (ninf, f(2.0), p_one, Some(0xFC00)),
+        (pinf, pz, p_one, None),
+        (pz, ninf, p_one, None),
+        (pinf, p_one, ninf, None),
+        (qnan, p_one, pz, None),
+        (p_one, snan, pz, None),
+        (p_one, p_one, qnan, None),
+    ];
+
+    let sentinel = 0xA55A_5AA5u32;
+    let inputs: Vec<[u32; 4]> = test_triples
+        .iter()
+        .map(|&(a, b, c, _)| [a, b, c, sentinel])
+        .collect();
+
+    for (label, shader, high) in [
+        ("v_fma_mixlo_f16", &mix_lo, false),
+        ("v_fma_mixhi_f16", &mix_hi, true),
+    ] {
+        run_cases(shader, &inputs, |backend, i, inp, got| {
+            let expected = fma_f32_to_f16_ref(inp[0], inp[1], inp[2]);
+            let (got_h, kept_h, want_kept) = if high {
+                ((got >> 16) as u16, got as u16, sentinel as u16)
+            } else {
+                (got as u16, (got >> 16) as u16, (sentinel >> 16) as u16)
+            };
+            assert_eq!(
+                kept_h, want_kept,
+                "{backend}: {label} clobbered preserved half: got {got:#010x}",
+            );
+            if let Some(lit_want) = test_triples[i].3 {
+                assert_eq!(
+                    lit_want, expected,
+                    "reference model mismatch on case {i}: ({:#010x}, {:#010x}, {:#010x})",
+                    inp[0], inp[1], inp[2],
+                );
+                assert_eq!(
+                    got_h, expected,
+                    "{backend}: {label}({:#010x}, {:#010x}, {:#010x}) = {got_h:#06x}, want {expected:#06x}",
+                    inp[0], inp[1], inp[2],
+                );
+            } else {
+                assert!(is_f16_nan(expected));
+                assert!(
+                    is_f16_nan(got_h),
+                    "{backend}: {label}({:#010x}, {:#010x}, {:#010x}) = {got_h:#06x}, want NaN",
+                    inp[0],
+                    inp[1],
+                    inp[2],
+                );
+            }
+        });
+    }
+
+    // Also verify opsel_hi / opsel / neg / neg_hi(abs) / clamp on v_fma_mixlo_f16.
+    // src0 = hi(f16) with abs & neg, src1 = lo(f16), src2 = f32, clamp = true.
+    let mut mod_body = vec![vop1(0x001, 0, vgpr(4))];
+    mod_body.extend_from_slice(&vop3p(
+        0x21,
+        0,
+        vgpr(1),
+        vgpr(2),
+        vgpr(3),
+        0b001, // opsel[0] = 1 (high half)
+        0b011, // opsel_hi = f16 for src0, src1; f32 for src2
+        0b001, // neg[0] = 1
+        0b001, // neg_hi[0] = abs(src0)
+        true,  // clamp to [0, 1]
+    ));
+    let mix_mod = build_valu_cs(&mod_body);
+    let mod_cases: &[([u32; 4], u16)] = &[
+        // -abs(-0.5h) * 1.0h + (1.0 + 2^-12 + 2^-35) = 0.5 + 2^-12 + 2^-35 -> 0x3801
+        ([0xB800_0000, 0x0000_3C00, 0x3F80_0801, sentinel], 0x3801),
+        // -abs(2.0h) * 1.0h + 0.5 = -1.5 -> clamped to 0.0 (0x0000)
+        ([0x4000_0000, 0x0000_3C00, f(0.5), sentinel], 0x0000),
+        // -abs(0.5h) * (-4.0h) + 0.0 = 2.0 -> clamped to 1.0 (0x3C00)
+        ([0x3800_0000, 0x0000_C400, pz, sentinel], 0x3C00),
+        // NaN -> clamped to 0.0 (0x0000)
+        ([0x7E00_0000, 0x0000_3C00, pz, sentinel], 0x0000),
+    ];
+    let mod_in: Vec<[u32; 4]> = mod_cases.iter().map(|c| c.0).collect();
+    run_cases(&mix_mod, &mod_in, |backend, i, inp, got| {
+        let want = mod_cases[i].1;
+        assert_eq!(
+            got,
+            (sentinel & 0xFFFF_0000) | u32::from(want),
+            "{backend}: v_fma_mixlo_f16 modifiers case {i} ({inp:08x?}) = {got:#010x}",
         );
     });
 }

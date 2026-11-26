@@ -21,6 +21,7 @@ use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 mod bvh;
+mod mixed_fma;
 
 type Why = &'static str;
 
@@ -6451,12 +6452,9 @@ impl<'a> Lower<'a> {
                     }
                     xs.push(x);
                 }
-                let mut r = self.fmad(xs[0], xs[1], xs[2]);
                 if name == "v_fma_mix_f32" {
+                    let r = self.fmad(xs[0], xs[1], xs[2]);
                     return float(self, r);
-                }
-                if v.clamp {
-                    r = self.unary(7, r);
                 }
                 // The f16 result goes to one half; the other half stays.
                 let Some(Operand::Vector { reg, .. }) = v.dst else {
@@ -6476,7 +6474,15 @@ impl<'a> Lower<'a> {
                     },
                     None => self.s.m.i32(0),
                 };
-                let h = self.narrow16(r);
+                let mut h = if self.mode16 == Some(3) {
+                    let r = self.fmad(xs[0], xs[1], xs[2]);
+                    self.narrow16(r)
+                } else {
+                    self.fma_f32_to_f16(xs[0], xs[1], xs[2])
+                };
+                if v.clamp {
+                    h = self.clamp_f16(h);
+                }
                 let (keep, h) = if name == "v_fma_mixhi_f16" {
                     let k16 = self.s.m.i32(16);
                     (0xFFFF, self.s.m.bin(c, Bin::Shl, h, k16))
