@@ -206,7 +206,13 @@ enum Mode {
 /// lane from structured SRV `t0` (heap index 0), runs a whole-wave prefix sum
 /// (`float`: `v_add_f32`, else `v_add_nc_u32`; `inclusive` or exclusive), and
 /// writes each lane's result to raw UAV `u0` (heap index 1) at `lane * 4`.
-fn build_prefix_cs(wave64: bool, float: bool, inclusive: bool, mode: Mode) -> HostShader {
+fn build_prefix_cs(
+    wave64: bool,
+    float: bool,
+    inclusive: bool,
+    mode: Mode,
+    warp: bool,
+) -> HostShader {
     let wave = if wave64 { 64u32 } else { 32 };
     let add_op: u8 = if float { 0x03 } else { 0x25 }; // v_add_f32 / v_add_nc_u32
     let mut w = Vec::new();
@@ -410,7 +416,7 @@ fn build_prefix_cs(wave64: bool, float: bool, inclusive: bool, mode: Mode) -> Ho
     let res =
         resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
     let io = io::raise(&p, &native).expect("io::raise");
-    let lowered = lower::lower(&lower::Parts {
+    let parts = lower::Parts {
         native: &native,
         p: &p,
         st: &st,
@@ -421,8 +427,8 @@ fn build_prefix_cs(wave64: bool, float: bool, inclusive: bool, mode: Mode) -> Ho
         prims: Vec::new(),
         mesh_stride: 0,
         view_marks: false,
-    })
-    .expect("lower");
+    };
+    let lowered = lower::lower_with(&parts, warp).expect("lower");
 
     let shader = HostShader {
         stage: HwStage::Cs,
@@ -514,7 +520,6 @@ fn base_terms(n: usize) -> Vec<u32> {
 
 fn run_f32_suite(wave64: bool, inclusive: bool, mode: Mode) {
     let wave = if wave64 { 64usize } else { 32 };
-    let shader = build_prefix_cs(wave64, true, inclusive, mode);
 
     let nan = 0x7FC0_0000u32;
     let pinf = f32::INFINITY.to_bits();
@@ -596,6 +601,7 @@ fn run_f32_suite(wave64: bool, inclusive: bool, mode: Mode) {
             );
             continue;
         }
+        let shader = build_prefix_cs(wave64, true, inclusive, mode, h.warp);
         let (root, pso) = h
             .host
             .compute_pipeline(&shader)
@@ -668,7 +674,7 @@ fn wave_prefix_sum_f32_wave64() {
 
 #[test]
 fn wave_prefix_sum_u32_reads_back() {
-    let shader = build_prefix_cs(false, false, false, Mode::Plain);
+    let shader = build_prefix_cs(false, false, false, Mode::Plain, false);
     let terms: Vec<u32> = (0..32u32)
         .map(|i| i.wrapping_mul(0x0101_0003).wrapping_add(7))
         .collect();

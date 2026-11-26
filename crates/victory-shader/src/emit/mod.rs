@@ -377,7 +377,7 @@ pub struct Options {
     /// "Write marks"); the host must then bind the view-mark table and the
     /// bitmap ([`HostShader::view_marks`]).
     pub view_marks: bool,
-    /// Use four-lane reads for compute permutations on WARP.
+    /// Use WARP-specific compute permutation and prefix-sum lowering.
     pub warp_permute: bool,
 }
 
