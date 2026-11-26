@@ -43,7 +43,7 @@ pub(super) fn round16(p: &Program) -> Vec<Option<u8>> {
     mode_at_blocks(p, Some(0), round16_after)
 }
 
-fn mode_at_blocks<T: Copy + Eq>(
+pub(super) fn mode_at_blocks<T: Copy + Eq>(
     p: &Program,
     initial: Option<T>,
     after: fn(&Inst, Option<T>) -> Option<T>,

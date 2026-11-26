@@ -3303,3 +3303,38 @@ fn v_fmac_f16_flushes_the_exact_result_in_output_denorm_mode() {
         fmac(4, [0x0000, 0x8000, 0x0000, 0x8000, 0x0400]),
     ]));
 }
+
+#[test]
+fn fp16_input_and_output_denormal_modes_are_independent() {
+    let inputs = [
+        [0x0101, 0x0400, 0x3800, OLD],
+        [0x8101, 0x8400, 0x3800, OLD],
+    ];
+    // The conversion reads a subnormal. The multiply-add only reads
+    // normals and zero, and produces a signed subnormal.
+    let probes: Vec<_> = [0u32, 4, 8, 12]
+        .into_iter()
+        .map(|mode| {
+            let mut body = vec![
+                0xBFA5_0000 | mode, // s_denorm_mode
+                vop1(0x01, 5, 128), // v_mov_b32 v5, 0
+                vop1(0x63, 5, v(1)), // v_cvt_norm_i16_f16
+                vop1(0x01, 6, 128), // v_mov_b32 v6, 0
+            ];
+            body.extend(vop3(0x136, 6, [v(2), v(3), 0], NONE));
+            probe(body, inputs.to_vec(), INT, move |input| {
+                let normalized = if mode & 4 == 0 {
+                    0
+                } else if input[0] & 0x8000 == 0 {
+                    1
+                } else {
+                    0xFFFF
+                };
+                let sign = input[1] & 0x8000;
+                let accum = if mode & 8 == 0 { sign } else { sign | 0x0200 };
+                vec![normalized, accum]
+            })
+        })
+        .collect();
+    assert_clean(check(&probes));
+}

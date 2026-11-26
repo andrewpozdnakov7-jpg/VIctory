@@ -1277,6 +1277,66 @@ fn v_cvt_norm_i16_and_u16_f16_round_the_exact_product() {
 }
 
 #[test]
+fn v_cvt_norm_f16_honors_input_denormal_mode() {
+    let halves = [
+        0x0000, 0x0001, 0x0081, 0x0101, 0x03FF, 0x0400, 0x3800, 0x3C00, 0x7C00, 0x7E00, 0x8000,
+        0x8101, 0x83FF, 0x8400, 0xB800, 0xBC00, 0xFC00,
+    ];
+    let inputs: Vec<_> = halves
+        .iter()
+        .map(|&h| [0xDEAD_0000 | u32::from(h), 0, 0, 0xABCD_1234])
+        .collect();
+
+    for (op, signed) in [(0x063, true), (0x064, false)] {
+        for denorm in 0..4 {
+            for setreg in [false, true] {
+                let mut words = if setreg {
+                    // Set only MODE[6]. Begin in the opposite input mode
+                    // to verify that this write takes effect.
+                    vec![
+                        0xBFA5_0000 | (((denorm ^ 1) << 2) | 3),
+                        sopk(0x15, 0, 1 | 6 << 6),
+                        denorm & 1,
+                    ]
+                } else {
+                    vec![0xBFA5_0000 | (denorm << 2) | 3]
+                };
+                words.extend([vop1(0x001, 0, vgpr(4)), vop1(op, 0, vgpr(1))]);
+                let shader = build_valu_cs(&words);
+                run_cases(&shader, &inputs, |backend, i, _, got| {
+                    let h = halves[i];
+                    let subnormal = h & 0x7FFF < 0x0400;
+                    let half = if denorm & 1 == 0 && subnormal {
+                        0
+                    } else {
+                        cvt_norm16_reference(h, signed)
+                    };
+                    assert_eq!(
+                        got,
+                        0xABCD_0000 | u32::from(half),
+                        "{backend}: opcode {op:#x}, denorm {denorm}, setreg {setreg}, {h:#06x}"
+                    );
+                });
+            }
+        }
+    }
+
+    let joined = build_valu_cs(&[
+        0xBF06_8001, // s_cmp_eq_u32 s1, 0
+        0xBF85_0002, // s_cbranch_scc1 -> s_setreg_imm32_b32
+        0xBFA5_0003, // s_denorm_mode: flush half input
+        0xBF82_0002, // s_branch -> join
+        sopk(0x15, 0, 1 | 6 << 6),
+        0, // s_setreg_imm32_b32 MODE[6], 0
+        vop1(0x063, 0, vgpr(1)),
+    ]);
+    let inputs = [[0x03FF, 0, 0, 0], [0x03FF, 1, 0, 0]];
+    run_cases(&joined, &inputs, |backend, _, input, got| {
+        assert_eq!(got, 0, "{backend}: branch operand {}", input[1]);
+    });
+}
+
+#[test]
 fn v_sin_and_v_cos_f32_reduce_large_turns() {
     let sin_shader = build_valu_cs(&[vop1(0x035, 0, vgpr(1))]);
     let cos_shader = build_valu_cs(&[vop1(0x036, 0, vgpr(1))]);
