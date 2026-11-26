@@ -291,17 +291,23 @@ pub(crate) fn ready_for_targets<'a>(
         start(p, true);
         wait(p, crate::frame::current());
     }
-    let base = p.made.get()?.as_ref()?;
+    #[cfg(feature = "diagnostics")]
+    if p.skipped_shader.is_some() {
+        return None;
+    }
+    // Failure with the original formats can still leave a usable variant
+    // for the targets the draw actually binds.
+    let base = p.made.get()?.as_ref();
     let Some(g) = p.graphics.as_deref() else {
-        return Some(base);
+        return base;
     };
     if !Pending::target_variants_enabled() {
-        return Some(base);
+        return base;
     }
     let want = TargetKey::from_formats(targets, dsv_format);
     let have = TargetKey::from_formats(&g.targets, g.depth_format);
     if want == have {
-        return Some(base);
+        return base;
     }
     p.make_variant(want)
 }
@@ -507,6 +513,41 @@ mod tests {
         assert!(matches!(p.made.get(), Some(None)));
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn a_refused_base_still_checks_the_bound_target_variant() {
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R32_UINT, DXGI_FORMAT_UNKNOWN};
+
+        let graphics = GraphicsState::default();
+        let base = graphics.targets;
+        let p = Arc::new(Pending::new(
+            Vec::new(),
+            Some(Box::new(graphics)),
+            #[cfg(feature = "diagnostics")]
+            &[],
+        ));
+        assert!(p.made.set(None).is_ok());
+        assert!(ready_for_targets(&p, &base, DXGI_FORMAT_UNKNOWN).is_none());
+        assert!(p.variants.lock().unwrap().is_empty());
+
+        let mut targets = base;
+        targets.NumRenderTargets = 1;
+        targets.RTFormats[0] = DXGI_FORMAT_R32_UINT;
+        for _ in 0..2 {
+            assert!(ready_for_targets(&p, &targets, DXGI_FORMAT_UNKNOWN).is_none());
+        }
+        let variants = p.variants.lock().unwrap();
+        if Pending::target_variants_enabled() {
+            assert_eq!(variants.len(), 1);
+            let (key, cell) = &variants[0];
+            assert_eq!(*key, TargetKey::from_formats(&targets, DXGI_FORMAT_UNKNOWN));
+            // The variant really ran and cached its result (no shaders).
+            assert!(matches!(cell.get(), Some(None)));
+        } else {
+            assert!(variants.is_empty());
+        }
+    }
+
     #[cfg(feature = "diagnostics")]
     #[test]
     fn skipped_pipeline_stays_off_the_queue() {
@@ -531,6 +572,17 @@ mod tests {
         );
         assert!(matches!(cold.made.get(), Some(None)));
         assert!(matches!(warm.made.get(), Some(None)));
+        #[cfg(windows)]
+        {
+            use windows::Win32::Graphics::Direct3D12::D3D12_RT_FORMAT_ARRAY;
+            use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R32_UINT, DXGI_FORMAT_UNKNOWN};
+
+            let skipped = Arc::new(Pending::new(vec![shader.clone()], Some(Box::default()), &hashes));
+            let mut targets = D3D12_RT_FORMAT_ARRAY { NumRenderTargets: 1, ..Default::default() };
+            targets.RTFormats[0] = DXGI_FORMAT_R32_UINT;
+            assert!(ready_for_targets(&skipped, &targets, DXGI_FORMAT_UNKNOWN).is_none());
+            assert!(skipped.variants.lock().unwrap().is_empty());
+        }
         assert!(shader.translated.get().is_none());
     }
 }
