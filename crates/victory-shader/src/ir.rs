@@ -20,7 +20,7 @@
 use std::collections::HashMap;
 
 use crate::ShaderError;
-use crate::gfx10::{self, Fields, Flow, Instruction, Operand};
+use crate::gfx10::{self, Encoding, Fields, Flow, Instruction, Operand};
 
 /// One register dword. Scalar codes as in [`Operand::Scalar`]: 0-105 SGPRs,
 /// 106/107 VCC, 108-123 trap temporaries, 124 M0, 126/127 EXEC.
@@ -110,6 +110,27 @@ pub struct Inst {
 impl Inst {
     pub fn name(&self) -> &'static str {
         self.machine.name().unwrap_or("")
+    }
+
+    /// The `op_sel` bits of a 16-bit VALU instruction that pick halves: none on
+    /// the VOP3 forms of VOP1 and VOP2 operations, which read the low halves and
+    /// write the low half whatever the bits say (gfx1036, measured for the
+    /// conversions between f16 and 16-bit integers or f32, `v_rcp_f16`,
+    /// `v_sqrt_f16`, `v_floor_f16`, `v_fract_f16`, `v_cvt_norm_i16_f16`,
+    /// `v_add_f16`, `v_mul_f16`, `v_max_f16` and `v_fmac_f16`). The VOP3-only
+    /// 16-bit operations (`v_fma_f16`, `v_med3_f16`, `v_add_nc_u16`,
+    /// `v_mul_lo_u16`, `v_max_u16`, `v_lshlrev_b16`) honour them.
+    pub(crate) fn half_opsel(&self) -> u8 {
+        let Fields::Valu(v) = &self.fields else {
+            return 0;
+        };
+        // VOP3 opcodes 0x100..0x13f are VOP2 operations, 0x180..0x1ff VOP1 ones.
+        let m = &self.machine;
+        if m.encoding == Encoding::Vop3 && matches!(m.opcode, 0x100..0x140 | 0x180..0x200) {
+            0
+        } else {
+            v.opsel
+        }
     }
 
     /// The value `reg` holds when this instruction reads it.

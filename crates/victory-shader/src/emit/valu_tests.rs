@@ -2422,3 +2422,54 @@ fn v_mul_legacy_f32_treats_denormals_as_zero() {
         );
     });
 }
+
+/// The VOP3 forms of VOP1 and VOP2 16-bit operations ignore `op_sel`: they
+/// read the low halves and write the low half, so each result is the one
+/// op_sel 0 gives. The VOP3-only 16-bit operations honour it. Rows measured
+/// on gfx1036 (RDNA2) with the same instruction words: each source holds
+/// two different halves, the destination starts as v4.
+#[test]
+fn vop3_forms_of_vop1_and_vop2_16bit_ops_ignore_op_sel() {
+    let inputs: [[u32; 4]; 3] = [
+        [0xaf6639cb, 0xc8d3c502, 0xadfa320b, 0xee3aec10],
+        [0x4a9137b3, 0x2a99bb28, 0xcfdab5ce, 0x5e04de79],
+        [0xbe0543e7, 0x4f2f2804, 0x291c44b4, 0xa9f1cf51],
+    ];
+    // (operation, VOP3 opcode, sources, op_sel values, v0 for each input)
+    type Case = (&'static str, u16, usize, &'static [u32], [u32; 3]);
+    #[rustfmt::skip]
+    let cases: &[Case] = &[
+        ("v_cvt_f16_u16", 0x1d0, 1, &[1, 8, 9], [0xee3a7339, 0x5e0472f6, 0xa9f1743e]),
+        ("v_cvt_f16_i16", 0x1d1, 1, &[1, 8, 9], [0xee3a7339, 0x5e0472f6, 0xa9f1743e]),
+        ("v_cvt_u16_f16", 0x1d2, 1, &[1, 8, 9], [0xee3a0000, 0x5e040000, 0xa9f10003]),
+        ("v_cvt_i16_f16", 0x1d3, 1, &[1, 8, 9], [0xee3a0000, 0x5e040000, 0xa9f10003]),
+        ("v_rcp_f16", 0x1d4, 1, &[1, 8], [0xee3a3d86, 0x5e044028, 0xa9f1340d]),
+        ("v_sqrt_f16", 0x1d5, 1, &[1, 8], [0xee3a3acf, 0x5e04398d, 0xa9f13ff3]),
+        ("v_floor_f16", 0x1db, 1, &[1, 8], [0xee3a0000, 0x5e040000, 0xa9f14200]),
+        ("v_fract_f16", 0x1df, 1, &[1, 8], [0xee3a39cb, 0x5e0437b3, 0xa9f13b9c]),
+        ("v_cvt_norm_i16_f16", 0x1e3, 1, &[1, 8], [0xee3a5caf, 0x5e043d98, 0xa9f17fff]),
+        ("v_cvt_f16_f32", 0x18a, 1, &[8], [0xee3a8000, 0x5e047c00, 0xa9f1b02a]),
+        ("v_cvt_f32_f16", 0x18b, 1, &[1], [0x3f396000, 0x3ef66000, 0x407ce000]),
+        ("v_add_f16", 0x132, 2, &[1, 2, 8, 11], [0xee3ac449, 0x5e04b69d, 0xa9f143f7]),
+        ("v_mul_f16", 0x135, 2, &[3, 8], [0xee3ac341, 0x5e04b6e3, 0xa9f12fef]),
+        ("v_max_f16", 0x139, 2, &[3, 8], [0xee3a39cb, 0x5e0437b3, 0xa9f143e7]),
+        ("v_fmac_f16", 0x136, 2, &[3, 8], [0xee3aec11, 0x5e04de7b, 0xa9f1cf49]),
+        // VOP3-only controls: op_sel picks the halves.
+        ("v_fma_f16", 0x34b, 3, &[7], [0xee3a3c17, 0x5e04cfaf, 0xa9f1d166]),
+        ("v_fma_f16", 0x34b, 3, &[8], [0xc2e0ec10, 0xba59de79, 0x44d4cf51]),
+        ("v_add_nc_u16", 0x303, 2, &[3], [0xee3a7839, 0x5e04752a, 0xa9f10d34]),
+    ];
+    for &(name, op, n, opsels, want) in cases {
+        for &opsel in opsels {
+            let src = |k: usize| if k < n { vgpr(1 + k as u8) } else { 0 };
+            let [w0, w1] = vop3(op, 0, src(0), src(1), src(2));
+            let shader = build_valu_cs(&[vop1(0x001, 0, vgpr(4)), w0 | opsel << 11, w1]);
+            run_cases(&shader, &inputs, |backend, i, input, got| {
+                assert_eq!(
+                    got, want[i],
+                    "{backend}: {name} op_sel {opsel:#06b} of {input:#010x?}"
+                );
+            });
+        }
+    }
+}

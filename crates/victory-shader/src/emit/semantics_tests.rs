@@ -3228,20 +3228,19 @@ fn v_fmac_f16_accumulator_modifiers_match_rdna2_oracle() {
     ]));
 }
 
-/// Moving the accumulator to the high half should move the write with it.
-/// These finite examples exercise destination selection separately from the
-/// gfx1031 table, which measures low-half destinations only.
+/// The VOP3 encoding of this VOP2 opcode ignores op_sel. Wide half
+/// selection must preserve the low-half arithmetic and the upper half.
 #[test]
-fn v_fmac_f16_accumulator_modifiers_use_the_selected_high_half() {
+fn v_fmac_f16_accumulator_modifiers_ignore_op_sel() {
     // a * b = 2 for the normal operands and 2^-14 for the subnormal cases.
     // Adding or subtracting 2^-24 crosses the minimum-normal boundary.
     const INPUTS: [[u32; 4]; 4] = [
-        [0x3C00, 0x4000, 0x3C00_C800, OLD],
-        [0x3C00, 0x4000, 0xBC00_4480, OLD],
-        [0x3C00, 0x0400, 0x0001_71A0, OLD],
-        [0x3C00, 0x0400, 0x8001_5A10, OLD],
+        [0x4480_3C00, 0xBC00_4000, 0xC800_3C00, OLD],
+        [0x4480_3C00, 0xBC00_4000, 0x4480_BC00, OLD],
+        [0x4480_3C00, 0xBC00_0400, 0x71A0_0001, OLD],
+        [0x4480_3C00, 0xBC00_0400, 0x5A10_8001, OLD],
     ];
-    let high = |abs, neg, expected: [u32; 4]| {
+    let fmac = |opsel, abs, neg, expected: [u32; 4]| {
         let mut body = vec![vop1(0x01, 5, v(3))];
         body.extend(vop3(
             0x136,
@@ -3250,7 +3249,7 @@ fn v_fmac_f16_accumulator_modifiers_use_the_selected_high_half() {
             M {
                 abs,
                 neg,
-                opsel: 8,
+                opsel,
                 ..NONE
             },
         ));
@@ -3259,12 +3258,19 @@ fn v_fmac_f16_accumulator_modifiers_use_the_selected_high_half() {
                 .iter()
                 .position(|&input| input == i)
                 .expect("known input");
-            vec![(expected[index] << 16) | (i[2] & 0xFFFF)]
+            vec![(i[2] & 0xFFFF_0000) | expected[index]]
         })
     };
-    assert_clean(check(&[
-        high(0, 4, [0x3C00, 0x4200, 0x03FF, 0x0401]),
-        high(4, 0, [0x4200, 0x4200, 0x0401, 0x0401]),
-        high(4, 4, [0x3C00, 0x3C00, 0x03FF, 0x03FF]),
-    ]));
+    let probes: Vec<_> = [0, 1, 2, 8, 11]
+        .into_iter()
+        .flat_map(|opsel| {
+            [
+                fmac(opsel, 0, 0, [0x4200, 0x3C00, 0x0401, 0x03FF]),
+                fmac(opsel, 0, 4, [0x3C00, 0x4200, 0x03FF, 0x0401]),
+                fmac(opsel, 4, 0, [0x4200, 0x4200, 0x0401, 0x0401]),
+                fmac(opsel, 4, 4, [0x3C00, 0x3C00, 0x03FF, 0x03FF]),
+            ]
+        })
+        .collect();
+    assert_clean(check(&probes));
 }

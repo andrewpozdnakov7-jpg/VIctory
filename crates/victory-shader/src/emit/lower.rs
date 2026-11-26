@@ -6832,14 +6832,14 @@ impl<'a> Lower<'a> {
     }
 
     /// Source `k` of a 16-bit operation in the low 16 bits (the rest 0):
-    /// op_sel (or an SDWA word select) picks the high half; inline float
-    /// constants are f16 values here.
+    /// op_sel ([`half_opsel`]) or an SDWA word select picks the high half;
+    /// inline float constants are f16 values here.
     fn half_src(&mut self, inst: &Inst, k: usize) -> Result<V, Why> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
         };
         let op = *v.src.get(k).ok_or("a missing operand")?;
-        let mut high = v.opsel >> k & 1 != 0;
+        let mut high = inst.half_opsel() >> k & 1 != 0;
         if let Some(sd) = v.sdwa {
             match sd.src_sel.get(k).copied().unwrap_or(6) {
                 4 => {}
@@ -6918,8 +6918,8 @@ impl<'a> Lower<'a> {
     }
 
     /// Writes a 16-bit result (low bits of `x`) into the destination's low
-    /// half, or its high half with op_sel bit 3 (or an SDWA WORD_1 select);
-    /// the other half is kept (GFX10).
+    /// half, or its high half with op_sel bit 3 ([`half_opsel`]) or an SDWA
+    /// WORD_1 select; the other half is kept (GFX10).
     fn write_half(&mut self, inst: &Inst, x: V, guard: Option<V>) -> Result<(), Why> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
@@ -6927,7 +6927,7 @@ impl<'a> Lower<'a> {
         let Some(Operand::Vector { reg, .. }) = v.dst else {
             return Err("a 16-bit result outside a VGPR");
         };
-        let mut high = v.opsel >> 3 & 1 != 0;
+        let mut high = inst.half_opsel() >> 3 & 1 != 0;
         // SDWA: the word written, the other one kept (preserve) or zero
         // (pad; a sign extension above the high word adds nothing).
         let mut keep = true;
@@ -7078,7 +7078,7 @@ impl<'a> Lower<'a> {
                     return Err("an accumulator");
                 };
                 let x = self.i32_of(inst.read(Reg::V(reg)).ok_or("an accumulator")?)?;
-                let x = if v.opsel >> 3 & 1 != 0 {
+                let x = if inst.half_opsel() >> 3 & 1 != 0 {
                     let k16 = self.s.m.i32(16);
                     self.s.m.bin(c, Bin::LShr, x, k16)
                 } else {
