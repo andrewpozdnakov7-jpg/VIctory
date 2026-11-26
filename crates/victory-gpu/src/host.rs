@@ -42,6 +42,7 @@ const RTV_RING: u32 = 1024;
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
     pub(crate) depth_bounds_supported: bool,
+    software: bool,
     queue: ID3D12CommandQueue,
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
@@ -127,10 +128,25 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
     }
 }
 
+static HOST: OnceLock<Option<Host>> = OnceLock::new();
+
+fn prefer_warp() -> bool {
+    static PREFER_WARP: OnceLock<bool> = OnceLock::new();
+    *PREFER_WARP.get_or_init(|| {
+        cfg!(feature = "diagnostics") && crate::switch::on("VICTORY_D3D12_WARP")
+    })
+}
+
+/// Selects the same adapter variant for offline warming and runtime lookup.
+/// The first translation may initialize the host. Offline translation can
+/// still use the explicit setting when a D3D12 device is unavailable.
+pub(crate) fn uses_software_adapter() -> bool {
+    host().map_or_else(prefer_warp, |host| host.software)
+}
+
 /// The host GPU, created on first use; `None` without one (a run then
 /// behaves as before: nothing executes).
 pub(crate) fn host() -> Option<&'static Host> {
-    static HOST: OnceLock<Option<Host>> = OnceLock::new();
     HOST.get_or_init(|| match create() {
         Ok(host) => Some(host),
         Err(e) => {
@@ -185,7 +201,8 @@ fn create() -> windows::core::Result<Host> {
         // Diagnostics: the software adapter, on which a shader's wild access
         // is an access violation in this process (a crash report with the
         // address and instruction) instead of a GPU fault and driver reset.
-        if cfg!(feature = "diagnostics") && crate::switch::on("VICTORY_D3D12_WARP") {
+        let warp = prefer_warp();
+        if warp {
             let adapter = warp_adapter()?;
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
@@ -195,6 +212,7 @@ fn create() -> windows::core::Result<Host> {
             crate::tdr::log();
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
+        let software = warp || victory_shader::emit::host::on_software_adapter(&device);
         let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS2::default();
         let depth_bounds_supported = device
             .CheckFeatureSupport(
@@ -250,6 +268,7 @@ fn create() -> windows::core::Result<Host> {
         Ok(Host {
             device,
             depth_bounds_supported,
+            software,
             queue,
             fence,
             submitted: Mutex::new(0),
