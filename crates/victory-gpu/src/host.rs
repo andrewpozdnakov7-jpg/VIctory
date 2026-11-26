@@ -465,6 +465,60 @@ pub(crate) mod tests {
 
     use super::*;
 
+    #[test]
+    #[ignore = "synthetic sparse-copy timing comparison"]
+    fn sparse_copy_shape_matrix() {
+        use windows_sys::Win32::System::Memory::*;
+        const PAGE: usize = 4096;
+        const SIZE: usize = 8 << 20;
+        const TRIALS: usize = 15;
+
+        for (label, holes) in [
+            ("fully-committed", Vec::new()),
+            ("one-hole", vec![SIZE / 2]),
+            ("alternating-pages", (PAGE..SIZE).step_by(2 * PAGE).collect()),
+        ] {
+            let mut expected = vec![0x37; SIZE];
+            let mut output = vec![0x81; SIZE];
+            // SAFETY: the allocation is private to this fixture. Hole offsets
+            // are page-aligned and inside it. Only the committed bytes are
+            // written by this test, before the holes are decommitted.
+            let source = unsafe {
+                let source = VirtualAlloc(
+                    std::ptr::null(),
+                    SIZE,
+                    MEM_RESERVE | MEM_COMMIT,
+                    PAGE_READWRITE,
+                ).cast::<u8>();
+                assert!(!source.is_null());
+                source.write_bytes(0x37, SIZE);
+                for &offset in &holes {
+                    assert_ne!(VirtualFree(source.add(offset).cast(), PAGE, MEM_DECOMMIT), 0);
+                    expected[offset..offset + PAGE].fill(0);
+                }
+                source
+            };
+
+            // The caller holds a writable host buffer and passes the private
+            // title allocation to the production copy path, including holes.
+            super::copy_mapped(output.as_mut_ptr(), source, SIZE, false);
+            assert_eq!(output, expected, "{label}: warm-up bytes");
+            let mut times = [0; TRIALS];
+            for duration in &mut times {
+                output.fill(0x81);
+                let start = std::time::Instant::now();
+                super::copy_mapped(output.as_mut_ptr(), source, SIZE, false);
+                *duration = start.elapsed().as_micros();
+                assert_eq!(output, expected, "{label}: measured bytes");
+            }
+            // SAFETY: releases the original private reservation after use.
+            assert_ne!(unsafe { VirtualFree(source.cast(), 0, MEM_RELEASE) }, 0);
+            times.sort_unstable();
+            println!("{label}: bytes={SIZE} holes={} median_us={} min_us={} max_us={}",
+                holes.len(), times[TRIALS / 2], times[0], times[TRIALS - 1]);
+        }
+    }
+
     /// Shaders that use title memory mark their reads in their own bitmap:
     /// read marks of both bitmaps are taken, each slot once until it is
     /// forgotten, and a forgotten slot's next read is taken again.
