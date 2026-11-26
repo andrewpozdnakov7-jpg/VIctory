@@ -787,21 +787,25 @@ fn f16_max_and_min_order_negative_zero_below_positive_zero() {
     }
 }
 
-/// RDNA2 max/min with a NaN operand return the other operand; if both are
-/// NaN, keep a NaN. For 3-operand forms the NaN is ignored and the result is
-/// min/max of the remaining operands (measured on RDNA2/WARP; DXIL FMax/FMin
-/// has the same semantics, but keep it explicit so driver quirks cannot turn
-/// NaNs into black pixels).
+/// RDNA2 min/max with a NaN operand return the other operand; if both are
+/// NaN, keep the first operand's NaN. For 3-operand forms the NaN is
+/// ignored and the result is min/max of the remaining operands; if all are
+/// NaN, keep the first NaN (measured on RDNA2/WARP; DXIL FMax/FMin has the
+/// same semantics, but keep it explicit so driver quirks cannot turn NaNs
+/// into black pixels).
 #[test]
 fn max_and_min_treat_a_nan_as_the_other_operand() {
-    let nan = f32::NAN.to_bits();
+    let nan = 0x7FC0_0001u32;
+    let nan2 = 0x7FC0_0002u32;
+    let nan3 = 0x7FC0_0003u32;
     let a = 1.0f32.to_bits();
     let b = 2.0f32.to_bits();
     // (inputs, 2-op want, max3 want, min3 want)
     let cases = [
         ([nan, a, b, 0], a, b, a),
         ([a, nan, b, 0], a, b, a),
-        ([nan, nan, b, 0], nan, b, b),
+        ([nan, nan2, b, 0], nan, b, b),
+        ([nan, nan2, nan3, 0], nan, nan, nan),
     ];
     let ops = [
         ("v_max_f32", 0x110u16),
@@ -820,14 +824,7 @@ fn max_and_min_treat_a_nan_as_the_other_operand() {
                     "v_max3_f32" => cases[i].2,
                     _ => cases[i].3,
                 };
-                if want == nan {
-                    assert!(
-                        f32::from_bits(got).is_nan(),
-                        "{backend}: {name} {inp:x?} = {got:#010x}"
-                    );
-                } else {
-                    assert_eq!(got, want, "{backend}: {name} {inp:x?}");
-                }
+                assert_eq!(got, want, "{backend}: {name} {inp:x?}");
             },
         );
     }
@@ -835,14 +832,17 @@ fn max_and_min_treat_a_nan_as_the_other_operand() {
 
 #[test]
 fn f16_max_and_min_treat_a_nan_as_the_other_operand() {
-    let nan = 0x7E00u32;
+    let nan = 0x7E01u32;
+    let nan2 = 0x7E02u32;
+    let nan3 = 0x7E03u32;
     let a = 0x3C00u32; // 1.0
     let b = 0x4000u32; // 2.0
     // (inputs, 2-op want, max3 want, min3 want)
     let cases = [
         ([nan, a, b, 0], a, b, a),
         ([a, nan, b, 0], a, b, a),
-        ([nan, nan, b, 0], nan, b, b),
+        ([nan, nan2, b, 0], nan, b, b),
+        ([nan, nan2, nan3, 0], nan, nan, nan),
     ];
     let ops = [
         ("v_max_f16", 0x139u16),
@@ -862,14 +862,7 @@ fn f16_max_and_min_treat_a_nan_as_the_other_operand() {
                     _ => cases[i].3,
                 };
                 let got = got & 0xFFFF;
-                if want == nan {
-                    assert!(
-                        is_f16_nan(got as u16),
-                        "{backend}: {name} {inp:x?} = {got:#06x}"
-                    );
-                } else {
-                    assert_eq!(got, want, "{backend}: {name} {inp:x?}");
-                }
+                assert_eq!(got, want, "{backend}: {name} {inp:x?}");
             },
         );
     }

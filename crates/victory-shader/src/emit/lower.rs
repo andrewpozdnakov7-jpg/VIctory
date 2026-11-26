@@ -528,7 +528,11 @@ fn smem_dwords(name: &str) -> Option<u32> {
 /// at `lowest`, the lowest offset any load or descriptor names). The
 /// program's constants follow its instructions, and a load at a computed
 /// offset reads them, not instruction bytes.
-fn code_table_start(p: &crate::ir::Program, addresses: &[&crate::resource::Address], lowest: u32) -> u32 {
+fn code_table_start(
+    p: &crate::ir::Program,
+    addresses: &[&crate::resource::Address],
+    lowest: u32,
+) -> u32 {
     let code_end = p
         .blocks
         .iter()
@@ -536,8 +540,14 @@ fn code_table_start(p: &crate::ir::Program, addresses: &[&crate::resource::Addre
         .map(|i| i.machine.offset + 4 * i.machine.words.len())
         .max()
         .unwrap_or(0) as u32;
-    let fixed_below = addresses.iter().any(|a| a.dynamic.is_none() && a.offset < code_end);
-    if fixed_below { lowest } else { lowest.max(code_end & !3) }
+    let fixed_below = addresses
+        .iter()
+        .any(|a| a.dynamic.is_none() && a.offset < code_end);
+    if fixed_below {
+        lowest
+    } else {
+        lowest.max(code_end & !3)
+    }
 }
 
 impl<'a> Lower<'a> {
@@ -754,7 +764,11 @@ impl<'a> Lower<'a> {
                     }))
                     .filter(|a| a.param == CODE)
                     .collect();
-                let lowest = addresses.iter().map(|a| a.offset & !3).min().ok_or("a code table")?;
+                let lowest = addresses
+                    .iter()
+                    .map(|a| a.offset & !3)
+                    .min()
+                    .ok_or("a code table")?;
                 let first = code_table_start(self.x.p, &addresses, lowest);
                 let code = &self.x.native.code;
                 let words: Vec<u32> = code
@@ -2217,13 +2231,14 @@ impl<'a> Lower<'a> {
         let sign = self.s.m.bin(c, op, ia, ib);
         let signed = self.as_float(sign);
         let r = self.s.m.select(c, zeros, signed, r);
-        // A NaN operand gives the other operand; if both are NaN, keep a
-        // NaN (RDNA2 ISA). DXIL FMax/FMin has this semantics, but keep it
-        // explicit so a driver quirk cannot turn a NaN into a black pixel.
+        // A NaN operand gives the other operand; if both are NaN, keep the
+        // first operand's NaN (RDNA2 ISA; semantics_tests::min_max). DXIL
+        // FMax/FMin has this semantics, but keep it explicit so a driver
+        // quirk cannot turn a NaN into a black pixel.
         let a_nan = self.s.m.cmp(c, pred::UNO, a, a);
         let b_nan = self.s.m.cmp(c, pred::UNO, b, b);
-        let r = self.s.m.select(c, b_nan, a, r);
-        self.s.m.select(c, a_nan, b, r)
+        let r = self.s.m.select(c, a_nan, b, r);
+        self.s.m.select(c, b_nan, a, r)
     }
 
     fn fmad(&mut self, a: V, b: V, c: V) -> V {
@@ -11024,7 +11039,9 @@ impl<'a> Lower<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Lowered, Numeric, Parts, buffer_format, code_table_start, half_shift, lower, packed_half};
+    use super::{
+        Lowered, Numeric, Parts, buffer_format, code_table_start, half_shift, lower, packed_half,
+    };
     use crate::native::{
         ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
     };
@@ -11202,16 +11219,11 @@ mod tests {
             (0x0B, 1 << 8, 0, "abs"),
             (0x0B, 0, 1 << 29, "neg"),
         ] {
-            let vop1 = lower_valu(&[0x7E00_0000 | op << 9 | 0x101])
-                .unwrap()
-                .dxil;
+            let vop1 = lower_valu(&[0x7E00_0000 | op << 9 | 0x101]).unwrap().dxil;
             let vop3 = |first: u32, second: u32| {
-                lower_valu(&[
-                    0xD400_0000 | (0x180 + op) << 16 | first,
-                    0x101 | second,
-                ])
-                .unwrap()
-                .dxil
+                lower_valu(&[0xD400_0000 | (0x180 + op) << 16 | first, 0x101 | second])
+                    .unwrap()
+                    .dxil
             };
             assert_eq!(vop1, vop3(0, 0), "VOP1/VOP3 control for op {op:#x}");
             assert_ne!(
@@ -11996,7 +12008,7 @@ mod tests {
         // matching the compare after the join so s6 is live.
         let mut negated = [
             0xF490_0180,
-            0,           // s_memtime s[6:7]
+            0, // s_memtime s[6:7]
             0xD581_0001,
             0x2000_00F2, // v_mov_b32_e64 v1, -(1.0)
             0xBF06_8000, // s_cmp_eq_u32 s0, 0
