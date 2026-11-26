@@ -2956,8 +2956,8 @@ impl Meter {
 
 impl Host {
     /// Shows `texture`, which is in `state` (a host state) and stays in it,
-    /// as frame `frame` (saved if captures are on). `None` if nothing was
-    /// shown; else, in diagnostics builds, whether the frame was black.
+    /// as frame `frame` (saved if captures are on). Diagnostics builds report
+    /// whether the probe sampled a black frame, or `None` without a sample.
     pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
@@ -3044,7 +3044,7 @@ impl Host {
             let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
             p.meter.frame(p.hwnd);
             #[cfg(feature = "diagnostics")]
-            return Some(probe.is_some_and(|b| crate::capture::black(&b)));
+            return probe.as_ref().map(crate::capture::black);
             #[cfg(not(feature = "diagnostics"))]
             Some(false)
         }
@@ -3575,5 +3575,65 @@ mod withholding {
             drop(copy);
             crate::watch::tests::free(p);
         }
+    }
+}
+
+#[cfg(all(test, feature = "diagnostics"))]
+mod present_black_probe_tests {
+    use super::*;
+
+    #[test]
+    fn an_unprobed_present_has_no_black_frame_sample() {
+        let Some(host) = host() else {
+            eprintln!("skipping black-frame probe: no D3D12 device");
+            return;
+        };
+        let mut frames = Vec::new();
+        for (format, color) in [
+            (DXGI_FORMAT_R8G8B8A8_UNORM, [0.0, 0.0, 0.0, 1.0]),
+            (DXGI_FORMAT_R16G16B16A16_FLOAT, [0.25, 0.5, 0.75, 1.0]),
+            (DXGI_FORMAT_R8G8B8A8_UNORM, [0.0, 0.0, 0.0, 1.0]),
+            (DXGI_FORMAT_R8G8B8A8_UNORM, [0.25, 0.5, 0.75, 1.0]),
+        ] {
+            let list = host.new_list().unwrap();
+            let mut texture = None;
+            // SAFETY: a live device, a valid render target and an open list.
+            let texture = unsafe {
+                host.device
+                    .CreateCommittedResource(
+                        &D3D12_HEAP_PROPERTIES {
+                            Type: D3D12_HEAP_TYPE_DEFAULT,
+                            ..Default::default()
+                        },
+                        D3D12_HEAP_FLAG_NONE,
+                        &D3D12_RESOURCE_DESC {
+                            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                            Width: 16,
+                            Height: 16,
+                            DepthOrArraySize: 1,
+                            MipLevels: 1,
+                            Format: format,
+                            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                            Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                            ..Default::default()
+                        },
+                        D3D12_RESOURCE_STATE_RENDER_TARGET,
+                        None,
+                        &mut texture,
+                    )
+                    .unwrap();
+                let texture = texture.unwrap();
+                list.list.ClearRenderTargetView(host.rtv(&texture, None), &color, None);
+                texture
+            };
+            list.close();
+            host.execute(&[&list]);
+            let state = D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32;
+            frames.push(host.present(&texture, state, 1));
+            // The presenter handled the texture, including the unprobed FP16 frame.
+            let presentation = host.presenter.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(presentation.presenter.as_ref().unwrap().format, format);
+        }
+        assert_eq!(frames, [Some(true), None, Some(true), Some(false)]);
     }
 }
