@@ -22,7 +22,7 @@
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, Once, OnceLock};
 use std::time::{Duration, Instant};
 
 use super::Shader;
@@ -32,7 +32,7 @@ use super::host::{GraphicsState, HostPipeline};
 pub(crate) struct Pending {
     shaders: Vec<Arc<Shader>>,
     pub(crate) graphics: Option<Box<GraphicsState>>,
-    queued: AtomicBool,
+    queued: Once,
     /// Whether it went into the queue of pipelines a draw waits for, to its
     /// head (`hurry`), and whether a worker took it (it may be in both
     /// queues, and twice in the first).
@@ -78,7 +78,7 @@ impl Pending {
             key,
             shaders,
             graphics,
-            queued: AtomicBool::new(false),
+            queued: Once::new(),
             now: AtomicBool::new(false),
             first: AtomicBool::new(false),
             taken: AtomicBool::new(false),
@@ -218,7 +218,7 @@ pub(crate) fn being_made(p: &Pending) -> bool {
 /// Queues `p` for the workers: once, and once more ahead of the early
 /// starts if a draw waits for it (`now`) while it is still queued.
 fn start(p: &Arc<Pending>, now: bool) {
-    if let Some(now) = enqueue(p, now) {
+    if let Some(now) = enqueue(p, now, count_waiting) {
         queue(p.clone(), if now { Place::Now } else { Place::Early });
     }
 }
@@ -238,17 +238,23 @@ pub(crate) fn hurry(p: &Arc<Pending>) {
 /// taken by a worker, and not put there before.
 fn hurried(p: &Pending) -> bool {
     p.made.get().is_none()
-        && p.queued.load(Ordering::Relaxed)
+        && p.queued.is_completed()
         && !p.taken.load(Ordering::Relaxed)
         && !p.first.swap(true, Ordering::Relaxed)
 }
 
+fn count_waiting() {
+    PEAK.fetch_max(WAITING.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Relaxed);
+}
+
 /// Which queue `p` goes into now (true: the one draws wait for), if any.
-fn enqueue(p: &Pending, now: bool) -> Option<bool> {
-    let first = !p.queued.swap(true, Ordering::Relaxed);
-    if first {
-        PEAK.fetch_max(WAITING.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Relaxed);
-    }
+fn enqueue(p: &Pending, now: bool, note_waiting: impl FnOnce()) -> Option<bool> {
+    let mut first = false;
+    // A draw can promote the entry as soon as this completes. Count it first.
+    p.queued.call_once(|| {
+        note_waiting();
+        first = true;
+    });
     let ahead = now && !p.now.swap(true, Ordering::Relaxed);
     (first || ahead && !p.taken.load(Ordering::Relaxed)).then_some(ahead)
 }
@@ -567,29 +573,102 @@ mod tests {
             #[cfg(feature = "diagnostics")]
             &[],
         );
-        assert_eq!(enqueue(&p, false), Some(false));
-        assert_eq!(enqueue(&p, false), None);
-        assert_eq!(enqueue(&p, true), Some(true));
-        assert_eq!(enqueue(&p, true), None);
+        assert_eq!(enqueue(&p, false, || {}), Some(false));
+        assert_eq!(enqueue(&p, false, || {}), None);
+        assert_eq!(enqueue(&p, true, || {}), Some(true));
+        assert_eq!(enqueue(&p, true, || {}), None);
         let q = Pending::new(
             Vec::new(),
             None,
             #[cfg(feature = "diagnostics")]
             &[],
         );
-        assert_eq!(enqueue(&q, false), Some(false));
+        assert_eq!(enqueue(&q, false, || {}), Some(false));
         q.taken.store(true, Ordering::Relaxed);
-        assert_eq!(enqueue(&q, true), None);
+        assert_eq!(enqueue(&q, true, || {}), None);
         let r = Pending::new(
             Vec::new(),
             None,
             #[cfg(feature = "diagnostics")]
             &[],
         );
-        assert_eq!(enqueue(&r, true), Some(true));
-        assert_eq!(enqueue(&r, false), None);
-        // Counted as waiting by `enqueue`, never handed to a worker.
-        WAITING.fetch_sub(3, Ordering::Relaxed);
+        assert_eq!(enqueue(&r, true, || {}), Some(true));
+        assert_eq!(enqueue(&r, false, || {}), None);
+    }
+
+    #[test]
+    fn an_urgent_enqueue_cannot_overtake_the_first_queue_count() {
+        let pending = Pending::new(
+            Vec::new(),
+            None,
+            #[cfg(feature = "diagnostics")]
+            &[],
+        );
+        let waiting = AtomicU64::new(0);
+        let pending = &pending;
+        let waiting = &waiting;
+        std::thread::scope(|threads| {
+            let (count_started, counting) = std::sync::mpsc::channel();
+            let (resume_count, resume) = std::sync::mpsc::channel();
+            let early = threads.spawn(move || {
+                enqueue(pending, false, || {
+                    count_started.send(()).unwrap();
+                    resume.recv().unwrap();
+                    waiting.fetch_add(1, Ordering::Relaxed);
+                })
+            });
+            counting.recv().unwrap();
+
+            let (urgent_started, attempting) = std::sync::mpsc::channel();
+            let (completed, consumed) = std::sync::mpsc::channel();
+            threads.spawn(move || {
+                urgent_started.send(()).unwrap();
+                assert_eq!(enqueue(pending, true, || panic!("counted twice")), Some(true));
+                // An available worker can take and finish the promoted entry now.
+                completed.send(waiting.fetch_sub(1, Ordering::Relaxed)).unwrap();
+            });
+            attempting.recv().unwrap();
+
+            let before_count = consumed.recv_timeout(Duration::from_secs(1));
+            resume_count.send(()).unwrap();
+            assert_eq!(early.join().unwrap(), Some(false));
+            let previous = before_count
+                .or_else(|_| consumed.recv_timeout(Duration::from_secs(10)))
+                .expect("promoted pipeline finished");
+            assert_eq!(previous, 1, "a worker finished before the pipeline was counted");
+            assert_eq!(waiting.load(Ordering::Relaxed), 0);
+        });
+    }
+
+    #[test]
+    fn a_presented_draw_cannot_be_hurried_before_its_queue_count() {
+        let pending = Pending::new(
+            Vec::new(),
+            Some(Box::default()),
+            #[cfg(feature = "diagnostics")]
+            &[],
+        );
+        let pending = &pending;
+        let waiting = &AtomicU64::new(0);
+        let hurried_early = std::thread::scope(|threads| {
+            let (count_started, counting) = std::sync::mpsc::channel();
+            let (resume_count, resume) = std::sync::mpsc::channel();
+            let early = threads.spawn(move || {
+                enqueue(pending, false, || {
+                    count_started.send(()).unwrap();
+                    resume.recv().unwrap();
+                    waiting.fetch_add(1, Ordering::Relaxed);
+                })
+            });
+            counting.recv().unwrap();
+            let admitted = hurried(pending);
+            resume_count.send(()).unwrap();
+            assert_eq!(early.join().unwrap(), Some(false));
+            admitted
+        });
+        assert!(!hurried_early, "presentation admitted an uncounted pipeline");
+        assert_eq!(waiting.load(Ordering::Relaxed), 1);
+        assert!(hurried(pending), "counted pipeline can now be hurried");
     }
 
     /// The pipeline of a draw into a presented image goes before the
@@ -610,7 +689,7 @@ mod tests {
         place(&mut queues, a.clone(), Place::Now);
         place(&mut queues, b.clone(), Place::Now);
         for p in [&a, &b, &last] {
-            p.queued.store(true, Ordering::Relaxed);
+            p.queued.call_once(|| {});
         }
         assert!(hurried(&last));
         place(&mut queues, last.clone(), Place::First);
@@ -667,7 +746,7 @@ mod tests {
             &[],
         ));
         assert!(ready(&p).is_none());
-        assert!(p.queued.load(Ordering::Relaxed));
+        assert!(p.queued.is_completed());
         let started = Instant::now();
         while p.made.get().is_none() && started.elapsed() < Duration::from_secs(10) {
             std::thread::yield_now();
@@ -692,8 +771,8 @@ mod tests {
         early(&warm);
         assert_eq!(
             (
-                cold.queued.load(Ordering::Relaxed),
-                warm.queued.load(Ordering::Relaxed)
+                cold.queued.is_completed(),
+                warm.queued.is_completed()
             ),
             (false, false)
         );
