@@ -16,7 +16,7 @@ use crate::dxbc::{Container, FourCC};
 
 pub struct Host {
     pub device: ID3D12Device,
-    pub max_wave_lanes: Option<u32>,
+    pub wave_lanes: Option<(u32, u32)>,
     warp: bool,
 }
 
@@ -155,7 +155,7 @@ fn hardware_adapter(factory: &IDXGIFactory4) -> windows::core::Result<IDXGIAdapt
     ))
 }
 
-fn wave_lanes_from_device(device: &ID3D12Device) -> Option<u32> {
+fn wave_lanes_from_device(device: &ID3D12Device) -> Option<(u32, u32)> {
     // SAFETY: plain D3D12 feature support query with a valid out pointer.
     unsafe {
         let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
@@ -167,8 +167,9 @@ fn wave_lanes_from_device(device: &ID3D12Device) -> Option<u32> {
             )
             .is_ok()
             && options.WaveOps.as_bool()
-            && options.WaveLaneCountMax != 0;
-        has_wave_lanes.then_some(options.WaveLaneCountMax)
+            && options.WaveLaneCountMin != 0
+            && options.WaveLaneCountMin <= options.WaveLaneCountMax;
+        has_wave_lanes.then_some((options.WaveLaneCountMin, options.WaveLaneCountMax))
     }
 }
 
@@ -197,16 +198,16 @@ impl Host {
                 .as_ref()
                 .map(|d| Host {
                     device: d.0.clone(),
-                    max_wave_lanes: wave_lanes_from_device(&d.0),
+                    wave_lanes: wave_lanes_from_device(&d.0),
                     warp: true,
                 })
                 .map_err(Clone::clone);
         }
         let device = create_device(false)?;
-        let max_wave_lanes = wave_lanes_from_device(&device);
+        let wave_lanes = wave_lanes_from_device(&device);
         Ok(Host {
             device,
-            max_wave_lanes,
+            wave_lanes,
             warp: false,
         })
     }
@@ -215,10 +216,10 @@ impl Host {
     /// serialised as WARP's is when the device runs on a software adapter.
     pub fn from_device(device: ID3D12Device) -> Self {
         let warp = on_software_adapter(&device);
-        let max_wave_lanes = wave_lanes_from_device(&device);
+        let wave_lanes = wave_lanes_from_device(&device);
         Host {
             device,
-            max_wave_lanes,
+            wave_lanes,
             warp,
         }
     }
@@ -379,11 +380,11 @@ impl Host {
         &self,
         cs: &HostShader,
     ) -> Result<(ID3D12RootSignature, ID3D12PipelineState), String> {
-        if let (Some(required), Some(max)) = (cs.required_wave_size(), self.max_wave_lanes)
-            && required > max
+        if let (Some(required), Some((min, max))) = (cs.required_wave_size(), self.wave_lanes)
+            && !(min..=max).contains(&required)
         {
             return Err(format!(
-                "compute shader requires wave{required}, but the host supports up to wave{max}"
+                "compute shader requires wave{required}, but the host supports {min}..={max} lanes"
             ));
         }
         let root = self
@@ -2116,29 +2117,70 @@ mod wave_precheck_tests {
     use super::*;
     use crate::HwStage;
 
+    fn compute_shader(dxil: Vec<u8>) -> HostShader {
+        HostShader {
+            stage: HwStage::Cs,
+            dxil,
+            user_data: Vec::new(),
+            samplers: Vec::new(),
+            static_samplers: Vec::new(),
+            root_cbvs: Vec::new(),
+            root_srvs: Vec::new(),
+            root_uavs: Vec::new(),
+            memory: false,
+            memory_writes: false,
+            view_addresses: false,
+            heap: false,
+            heap_writes: false,
+            view_marks: false,
+        }
+    }
+
+    #[test]
+    #[ignore = "requires app-local WARP with fixed wave-size support"]
+    fn offline_compute_pipeline_uses_the_lower_wave_limit() {
+        use crate::emit::{bitcode::Term, shader::Shader};
+        let mut device = Host::new(true).expect("WARP device");
+        println!("native WARP wave lane range {:?}", device.wave_lanes);
+        let compile = |wave_size| {
+            let mut shader = Shader::new(false);
+            shader.threads = Some([64, 1, 1]);
+            shader.wave_size = wave_size;
+            shader.m.terminate(shader.entry, Term::Ret);
+            compute_shader(shader.finish())
+        };
+        let wave32 = compile(Some(32));
+        let wave64 = compile(Some(64));
+        let unsized_shader = compile(None);
+        assert!(device.compute_pipeline(&wave32).is_ok(), "native fixed Wave32");
+        assert!(device.compute_pipeline(&wave64).is_ok(), "native fixed Wave64");
+
+        device.wave_lanes = Some((32, 32));
+        assert!(device.compute_pipeline(&wave32).is_ok());
+        assert_eq!(
+            device.compute_pipeline(&wave64).unwrap_err(),
+            "compute shader requires wave64, but the host supports 32..=32 lanes",
+        );
+
+        // A Wave64-only adapter. WARP underneath accepts the Wave32 shader,
+        // so only the precheck can reject it at the correct stage here.
+        device.wave_lanes = Some((64, 64));
+        assert!(device.compute_pipeline(&wave64).is_ok());
+        assert!(device.compute_pipeline(&unsized_shader).is_ok());
+        assert_eq!(
+            device.compute_pipeline(&wave32).unwrap_err(),
+            "compute shader requires wave32, but the host supports 64..=64 lanes",
+        );
+    }
+
     #[test]
     #[ignore = "requires two DXC-built compute shaders and a 32-lane host"]
     fn offline_compute_pipeline_classifies_fixed_wave_size() {
         let device = Host::new(false).expect("D3D12 host");
-        assert_eq!(device.max_wave_lanes, Some(32));
+        assert_eq!(device.wave_lanes, Some((32, 32)));
         for (width, var) in [(32, "WAVE32_FIXTURE"), (64, "WAVE64_FIXTURE")] {
             let path = std::env::var_os(var).expect("fixture path");
-            let cs = HostShader {
-                stage: HwStage::Cs,
-                dxil: std::fs::read(path).expect("fixture bytecode"),
-                user_data: Vec::new(),
-                samplers: Vec::new(),
-                static_samplers: Vec::new(),
-                root_cbvs: Vec::new(),
-                root_srvs: Vec::new(),
-                root_uavs: Vec::new(),
-                memory: false,
-                memory_writes: false,
-                view_addresses: false,
-                heap: false,
-                heap_writes: false,
-                view_marks: false,
-            };
+            let cs = compute_shader(std::fs::read(path).expect("fixture bytecode"));
             assert_eq!(cs.required_wave_size(), Some(width));
             let result = device.compute_pipeline(&cs);
             if width == 32 {
@@ -2146,7 +2188,7 @@ mod wave_precheck_tests {
             } else {
                 assert_eq!(
                     result.unwrap_err(),
-                    "compute shader requires wave64, but the host supports up to wave32"
+                    "compute shader requires wave64, but the host supports 32..=32 lanes"
                 );
             }
         }
