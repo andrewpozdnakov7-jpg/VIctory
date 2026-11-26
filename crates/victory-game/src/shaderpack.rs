@@ -383,13 +383,17 @@ mod tests {
 
     /// A pack with one graphics entry (PS, VS) and one compute entry.
     fn pack_bytes() -> Vec<u8> {
+        pack_with_raster(b"packet".to_vec(), 4)
+    }
+
+    fn pack_with_raster(packet: Vec<u8>, raster_hash: u64) -> Vec<u8> {
         let nop = |h: u32| [0xD580_0000 | (h & 0xFFFF), 0x03FF_0000, h];
         let mut code0 = Vec::new();
         le(&mut code0, &nop(0x1234));
         le(&mut code0, &nop(0x5678));
         le(&mut code0, &[0xBF81_0000]);
         let programs = [code0, vec![1; 8], vec![2; 12]];
-        let blobs = [b"packet".to_vec(), metadata(), b"ps meta".to_vec(), vec![3; 28], vec![4; 20]];
+        let blobs = [packet, metadata(), b"ps meta".to_vec(), vec![3; 28], vec![4; 20]];
         let mut out = MAGIC.to_vec();
         out.extend(b"0x00000001".iter().chain(&[0; 22]));
         out.extend(b"1.2.3".iter().chain(&[0; 31]));
@@ -400,7 +404,7 @@ mod tests {
         // Graphics: key, packet 0, metadata 1, five hashes, PS and VS.
         out.extend(0x1111_u64.to_le_bytes());
         le(&mut out, &[0, 1]);
-        for h in 1..=5_u64 {
+        for h in [1u64, 2, 3, raster_hash, 5] {
             out.extend(h.to_le_bytes());
         }
         le(&mut out, &[0, 2, 1, NONE]);
@@ -426,6 +430,46 @@ mod tests {
         }
         out.resize(base + 0x300, 0);
         out
+    }
+
+    #[test]
+    fn names_rasterisers_from_vertex_and_mesh_packs() {
+        use crate::cityhash::city64;
+        use crate::pipelines::Named;
+
+        let mut found = Vec::new();
+        for (kind, base, clip, mode, front, tail) in [
+            (4, 0x74, 0, 1, [3, 2, 1, 252], [1, 1, 0, 0]),
+            (7, 0xc8, 3 << 26, 6, [3, 3, 0, 252], [0, 0, 1, 3]),
+        ] {
+            let mut packet = vec![0; base + 0x28];
+            packet[4] = kind;
+            let clamp = 0.375f32;
+            let slope = 1.3125f32;
+            le(
+                &mut packet,
+                &[clip, mode, 0, 0, clamp.to_bits(), (16.0 * slope).to_bits(), (-4.0f32).to_bits()],
+            );
+            packet.resize(base + 0x44 + 14 * 4, 0);
+
+            let mut desc = [0; 16];
+            desc[..4].copy_from_slice(&front);
+            desc[4..8].copy_from_slice(&clamp.to_le_bytes());
+            desc[8..12].copy_from_slice(&slope.to_le_bytes());
+            desc[12..].copy_from_slice(&tail);
+            let hash = city64(&desc);
+            let file = pack_with_raster(packet.clone(), hash);
+            let named = Named::find(&Pack::parse(&file).unwrap(), &[]);
+            found.push((named.source.get(&hash).copied(), named.raster.get(&hash) == Some(&desc)));
+
+            // A valid register image must not name a description with a different clamp.
+            desc[4..8].copy_from_slice(&0.625f32.to_le_bytes());
+            let unmatched = city64(&desc);
+            let file = pack_with_raster(packet, unmatched);
+            let named = Named::find(&Pack::parse(&file).unwrap(), &[]);
+            assert!(!named.raster.contains_key(&unmatched));
+        }
+        assert_eq!(found, [(Some("registers"), true); 2], "vertex and mesh rasteriser sources");
     }
 
     #[test]
