@@ -73,13 +73,11 @@ fn is_translation(dir: &Path) -> bool {
     ours && dir.is_dir() && library_in(dir)
 }
 
-/// Whether `dir` holds a library: [`LIBRARY_FILE`], or its first shard where
-/// the library is split (`#1653` puts one file per shard, `host-pipelines.NN.bin`,
-/// in the same directory). Both are checked so that the two changes read the
-/// same directories whichever of them lands first - the names are written out
-/// because `shard_file` does not exist without the split.
+/// Whether `dir` holds a library: its first shard, or the single file a
+/// directory written before the split has (`host-pipelines.bin`). Both are
+/// read so a library made by either build is pruned as this crate's own.
 fn library_in(dir: &Path) -> bool {
-    dir.join(LIBRARY_FILE).is_file() || dir.join("host-pipelines.00.bin").is_file()
+    dir.join(shard_file(0)).is_file() || dir.join("host-pipelines.bin").is_file()
 }
 
 /// How many translations keep a library: the one in use and the previous
