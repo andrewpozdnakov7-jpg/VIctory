@@ -107,8 +107,7 @@ pub(crate) enum C {
     /// The title's calls into its command lists that did work, the time
     /// they took, and the time they waited for the list's own locks before
     /// doing any (`list::with_state`): the recording side of a frame, which
-    /// nothing else on this line times. A call that costs far more than its
-    /// instructions is one waiting on the submission's locks.
+    /// nothing else on this line times.
     Calls,
     CallUs,
     CallWaitUs,

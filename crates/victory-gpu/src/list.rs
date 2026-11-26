@@ -135,9 +135,7 @@ const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
 ///
 /// Diagnosed: how many of the title's calls did work, how long they took,
 /// and how long they waited for the list's own locks first. Nothing else on
-/// the frame line times recording, so a call that costs far more than its
-/// instructions can only be read as time waiting on a submission — this
-/// separates the two.
+/// the frame line times recording.
 #[cfg(windows)]
 pub(crate) fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
     #[cfg(feature = "diagnostics")]
@@ -145,8 +143,6 @@ pub(crate) fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut
     let Some(list) = host_list(this) else { return };
     // SAFETY: the title passes one of our lists.
     let state = unsafe { &(*this.cast::<List>()).state };
-    #[cfg(feature = "diagnostics")]
-    let waiting = started.elapsed().as_micros() as u64;
     let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
     #[cfg(feature = "diagnostics")]
     let handler = std::time::Instant::now();
@@ -154,8 +150,10 @@ pub(crate) fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut
     #[cfg(feature = "diagnostics")]
     {
         use crate::copystat::{C, add};
+        let elapsed = handler.elapsed().as_micros() as u64;
+        let waiting = handler.duration_since(started).as_micros() as u64;
         add(C::Calls, 1);
-        add(C::CallUs, handler.elapsed().as_micros() as u64);
+        add(C::CallUs, elapsed);
         add(C::CallWaitUs, waiting);
     }
 }
