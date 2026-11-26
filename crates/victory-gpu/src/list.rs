@@ -1978,16 +1978,20 @@ mod tests {
         }
     }
 
+    /// The view builder returns the guest clear's resource argument (null for a placed view).
     #[cfg(windows)]
-    #[test]
-    fn a_raw_buffer_clear_keeps_words_outside_an_odd_offset_view() {
+    fn clear_raw_words<const N: usize>(
+        initial: [u32; N],
+        rects: &[windows::Win32::Foundation::RECT],
+        make_view: impl FnOnce(This, u64) -> This,
+    ) -> Option<[u32; N]> {
         use windows::Win32::Foundation::RECT;
         use windows::Win32::Graphics::Direct3D12::ID3D12DescriptorHeap;
         use windows::core::Interface;
 
         let Some(host) = crate::host::host() else {
             eprintln!("no host GPU; skipped");
-            return;
+            return None;
         };
         let null = std::ptr::null();
         let mut allocator = null;
@@ -2000,25 +2004,40 @@ mod tests {
             crate::descriptor::create_heap(null, desc.as_ptr().cast(), &iid, &mut heap),
             S_OK
         );
-        assert_eq!(create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator), S_OK);
-        assert_eq!(create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list), S_OK);
-        let heap_slot = if has_newer_table(list) { newer_slot(0x100 / 8) * 8 } else { 0x100 };
+        assert_eq!(
+            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
+        assert_eq!(
+            create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list),
+            S_OK
+        );
+        let heap_slot = if has_newer_table(list) {
+            newer_slot(0x100 / 8) * 8
+        } else {
+            0x100
+        };
         slot::<extern "system" fn(This, u32, *const This)>(list, heap_slot)(list, 1, &heap);
 
-        let buffer = crate::resource::test_buffer(128);
+        let buffer = crate::resource::test_buffer(std::mem::size_of_val(&initial) as u64);
         let (data, _) = crate::resource::buffer_bytes(buffer).unwrap();
-        let words = data.cast::<[u32; 8]>();
-        let initial = [101, 102, 103, 104, 105, 106, 107, 108];
-        // SAFETY: the new buffer has room for eight DWORDs.
+        let words = data.cast::<[u32; N]>();
+        // SAFETY: the buffer was sized for these words.
         unsafe { words.write(initial) };
         let handle = crate::descriptor::heap(heap).start;
-        // RAW R32_TYPELESS buffer view, first DWORD 1, four DWORDs.
-        let view = [39, 1, 1, 0, 4, 0, 0, 0, 1, 0];
-        crate::descriptor::create_uav(null, buffer, null, &view, handle);
+        let resource = make_view(buffer, handle);
         let clear = [23u32, 31, 37, 41];
         slot::<extern "system" fn(This, u64, u64, This, *const [u32; 4], u32, *const RECT)>(
             list, 0x1a8,
-        )(list, handle, handle, buffer, &clear, 0, null.cast());
+        )(
+            list,
+            handle,
+            handle,
+            resource,
+            &clear,
+            rects.len() as u32,
+            rects.as_ptr(),
+        );
         let native = host_list(list).unwrap();
         assert_eq!(close(list), S_OK);
         host.execute(&[native]);
@@ -2027,7 +2046,58 @@ mod tests {
         for object in [list, allocator, heap, buffer] {
             slot::<extern "system" fn(This) -> u32>(object, 0x10)(object);
         }
-        assert_eq!(readback, [101, 23, 23, 23, 23, 106, 107, 108]);
+        Some(readback)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_raw_buffer_clear_keeps_words_outside_an_odd_offset_view() {
+        let initial = [101, 102, 103, 104, 105, 106, 107, 108];
+        let result = clear_raw_words(initial, &[], |buffer, handle| {
+            // RAW R32_TYPELESS buffer view, first DWORD 1, four DWORDs.
+            let view = [39, 1, 1, 0, 4, 0, 0, 0, 1, 0];
+            let null = std::ptr::null();
+            crate::descriptor::create_uav(null, buffer, null, &view, handle);
+            buffer
+        });
+        if let Some(readback) = result {
+            assert_eq!(readback, [101, 23, 23, 23, 23, 106, 107, 108]);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn placed_raw_clears_write_back_only_the_requested_words() {
+        use windows::Win32::Foundation::RECT;
+
+        let initial: [u32; 10] = std::array::from_fn(|i| 101 + i as u32);
+        let rect = RECT {
+            left: 1,
+            top: 0,
+            right: 3,
+            bottom: 1,
+        };
+        // The first three views need an aligned host copy. The fourth can
+        // use the backing buffer directly. All four clear their middle words.
+        for first in 1..=4 {
+            let result = clear_raw_words(initial, &[rect], |buffer, handle| {
+                let (data, len) = crate::resource::buffer_bytes(buffer).unwrap();
+                let address = data as u64;
+                let mut resource = [0; 14];
+                (resource[0], resource[4]) = (1, len as u32);
+                let mut view = [0; 16];
+                // R32_TYPELESS, BUFFER, FirstElement, NumElements, RAW.
+                (view[0], view[1], view[2], view[4], view[8]) = (39, 1, first as u32, 4, 1);
+                (view[10], view[11]) = (address as u32, (address >> 32) as u32);
+                let null = std::ptr::null();
+                crate::descriptor::create_placed_uav(null, &resource, &view, handle);
+                null
+            });
+            let Some(readback) = result else { return };
+            let mut expected = initial;
+            expected[first + 1..first + 3].fill(23);
+            assert_eq!(readback, expected, "placed RAW UAV at DWORD {first}");
+        }
     }
 
     #[test]
