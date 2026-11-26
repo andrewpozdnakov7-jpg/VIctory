@@ -1697,6 +1697,89 @@ pub(crate) mod tests {
         }
     }
 
+    /// Two declared ranges of one copy partly overlap: the first is valid,
+    /// the second comes from a list that read title memory with no copy
+    /// (withheld). Only the overlapping part may stay withheld (#1976,
+    /// #1986, #1998), and the page-selective copy of #3089 keeps that.
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn withheld_partial_range_overlap_keeps_valid_prefix() {
+        const CHILD: &str = "VICTORY_TEST_PARTIAL_RANGE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .env(CHILD, "1")
+                .env("VICTORY_D3D12_WARP", "1")
+                .args([
+                    "--exact",
+                    "shadow::tests::withheld_partial_range_overlap_keeps_valid_prefix",
+                    "--nocapture",
+                ])
+                .output()
+                .unwrap();
+            print!("{}", String::from_utf8_lossy(&output.stdout));
+            eprint!("{}", String::from_utf8_lossy(&output.stderr));
+            assert!(output.status.success(), "WARP fixture failed");
+            return;
+        }
+
+        let Some(host) = host() else {
+            eprintln!("WARP unavailable; skipped");
+            return;
+        };
+        let p = crate::watch::tests::pool(1);
+        let len = PAGE;
+        unsafe {
+            for i in 0..(PAGE / 4) {
+                ((p + i * 4) as *mut u32).write(0x10);
+            }
+        }
+        register(p, p as u64, len as u64);
+        let copy = find(p as u64, len as u64).unwrap();
+
+        let (input, data) = host.shared_buffer(16).unwrap();
+        // SAFETY: the input mapping holds four dwords.
+        unsafe { data.cast::<[u32; 4]>().write([0xaa, 0xbb, 0, 0]) };
+
+        // Valid range: bytes 0..128.
+        let a = host.new_list().unwrap();
+        let _memory_a = a.writer_uses_memory(true);
+        copy.refresh(&a, p as u64, 128);
+        copy.gpu_writes(&a, p as u64, 128, true);
+        // SAFETY: live buffers, a fitting offset, and an open copy list.
+        unsafe { a.list.CopyBufferRegion(&copy.buffer, 0, &input, 0, 4) };
+
+        // Withheld range: bytes 64..192, overlapping the valid one.
+        let b = host.new_list().unwrap();
+        b.defer_missed(|| true);
+        let _memory_b = b.writer_uses_memory(true);
+        copy.refresh(&b, (p + 64) as u64, 128);
+        copy.gpu_writes(&b, (p + 64) as u64, 128, true);
+        // SAFETY: as above.
+        unsafe { b.list.CopyBufferRegion(&copy.buffer, 64, &input, 4, 4) };
+
+        a.close();
+        b.close();
+        host.execute(&[&a, &b]);
+
+        // SAFETY: the submission finished and the title backing is live.
+        let (prefix, overlap) = unsafe {
+            (
+                ((p) as *const u32).read(),
+                ((p + 64) as *const u32).read(),
+            )
+        };
+        println!("prefix={prefix:#x} overlap={overlap:#x}");
+        assert_eq!(
+            prefix, 0xaa,
+            "the valid prefix outside the withheld part went back"
+        );
+        assert_eq!(overlap, 0x10, "withheld bytes reached title memory");
+
+        unregister(p, p as u64);
+        drop(copy);
+        crate::watch::tests::free(p);
+    }
+
     /// What a frame withheld leaves every host copy of its memory at the
     /// frame's end (run textures9's shape): in frame N a program using title
     /// memory writes a record into the copies and the frame misses, so it
