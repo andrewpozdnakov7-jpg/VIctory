@@ -800,7 +800,7 @@ struct Resource {
 #[cfg(windows)]
 pub(crate) struct HostTexture {
     pub(crate) texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
-    pub(crate) state: std::sync::atomic::AtomicU32,
+    pub(crate) states: crate::host::TextureStates,
     /// Formats views may take besides the texture's own family: the host
     /// took them as castable formats when it made the texture.
     pub(crate) castable: Vec<u32>,
@@ -844,7 +844,7 @@ impl HostTexture {
         TEXTURE_BYTES.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
         HostTexture {
             texture,
-            state: state.into(),
+            states: crate::host::TextureStates::new(state),
             castable,
             host_written: false.into(),
             staging: std::sync::Mutex::new(None),
@@ -1057,18 +1057,6 @@ pub(crate) mod life {
         }
         format!(" [{name}: {}]", text.join("; "))
     }
-}
-
-/// Moves the host texture to `wanted` (a host texture state); the host
-/// resource and the state it leaves, if that is a change.
-#[cfg(windows)]
-pub(crate) fn host_transition(this: This, wanted: u32) -> Option<(*mut c_void, u32)> {
-    use windows::core::Interface;
-    let host = resource(this).host()?;
-    let before = host
-        .state
-        .swap(wanted, std::sync::atomic::Ordering::Relaxed);
-    (before != wanted).then(|| (host.texture.as_raw(), before))
 }
 
 /// The host GPU's copy of a title resource, if it has one (made on first
@@ -2543,6 +2531,7 @@ mod tests {
         let desc = ResourceDesc {
             flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0 as u32,
             sample_count: 4,
+            depth_or_array_size: 2,
             ..texture(4, 4, DXGI_FORMAT_R8G8B8A8_UNORM.0 as u32, 1)
         };
         let null = std::ptr::null();
@@ -2553,22 +2542,29 @@ mod tests {
         );
         let target = host_copy(resource).expect("host 4x render target");
         // SAFETY: the reference keeps the texture alive during the query.
-        assert_eq!(unsafe { target.texture.GetDesc() }.SampleDesc.Count, 4);
-        let state = D3D12_RESOURCE_STATES(target.state.load(std::sync::atomic::Ordering::Relaxed) as i32);
-        let render = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        let actual = unsafe { target.texture.GetDesc() };
+        assert_eq!(actual.SampleDesc.Count, 4);
+        assert_eq!(actual.DepthOrArraySize, 2);
+        let render = D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32;
+        let copy_source = D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32;
+        let check_states = || assert_eq!([target.state(0), target.state(1)], [render, copy_source]);
         let clear = |color: [f32; 4], note: bool| {
             let list = host.new_list().unwrap();
-            let rtv = host.rtv(&target.texture, None);
-            // SAFETY: a live render target and an open list, with both transitions paired.
-            unsafe {
-                if state != render {
-                    list.list.ResourceBarrier(&[crate::host::transition(&target.texture, state, render)]);
-                }
-                list.list.ClearRenderTargetView(rtv, &color, None);
-                if state != render {
-                    list.list.ResourceBarrier(&[crate::host::transition(&target.texture, render, state)]);
-                }
-            }
+            let view = D3D12_RENDER_TARGET_VIEW_DESC {
+                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                ViewDimension: D3D12_RTV_DIMENSION_TEXTURE2DMSARRAY,
+                Anonymous: D3D12_RENDER_TARGET_VIEW_DESC_0 {
+                    Texture2DMSArray: D3D12_TEX2DMS_ARRAY_RTV {
+                        FirstArraySlice: 0,
+                        ArraySize: 1,
+                    },
+                },
+            };
+            let rtv = host.rtv(&target.texture, Some(&view));
+            crate::list::ensure_copy_state(&list, &target, 0, render);
+            crate::list::ensure_copy_state(&list, &target, 1, copy_source);
+            // SAFETY: slice zero is a live render target on this list.
+            unsafe { list.list.ClearRenderTargetView(rtv, &color, None) };
             if note {
                 crate::capture::note_test_target(&list, resource);
             }
@@ -2579,9 +2575,11 @@ mod tests {
         crate::capture::with_test_capture(dir.path(), || {
             // The first clear is recorded and dumped by the submission.
             clear([0.0, 1.0, 0.0, 1.0], true);
+            check_states();
             // The present dump reads the same target after the second clear.
             clear([1.0, 0.0, 0.0, 1.0], false);
             crate::capture::dump_targets(crate::queue::presented() + 1);
+            check_states();
         });
         assert_eq!(slot::<Release>(resource, 0x10)(resource), 0);
 
@@ -2952,6 +2950,17 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn buffer_data_reaches_the_host_texture() {
+        check_texture_copy(false);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn texture_copy_keeps_array_slice_states_separate() {
+        check_texture_copy(true);
+    }
+
+    #[cfg(windows)]
+    fn check_texture_copy(array_copy: bool) {
         use windows::Win32::Graphics::Direct3D12::*;
         let Some(host) = crate::host::host() else {
             return; // no host GPU here
@@ -2959,15 +2968,24 @@ mod tests {
         let null = std::ptr::null();
         let iid = &RESOURCE_IIDS[0];
         const COPY_DEST: u32 = 0x400;
+        const COPY_SOURCE: u32 = 0x800;
         let (mut image, mut source) = (null, null);
-        let rgba = texture(4, 4, 28, 1);
+        let mut rgba = texture(4, 4, 28, 1);
+        let initial = if array_copy {
+            rgba.depth_or_array_size = 3; // One slice remains untouched by the copies.
+            // Keep the fixture GPU-owned so a title-memory upload cannot touch every slice.
+            rgba.flags |= 1; // ALLOW_RENDER_TARGET
+            0
+        } else {
+            COPY_DEST
+        };
         assert_eq!(
             create_committed(
                 null,
                 &PROPERTIES,
                 0,
                 &rgba,
-                COPY_DEST,
+                initial,
                 null.cast(),
                 iid,
                 &mut image
@@ -3012,7 +3030,7 @@ mod tests {
             0x4185,
             [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55],
         );
-        let (mut queue, mut allocator, mut list) = (null, null, null);
+        let (mut queue, mut allocator) = (null, null);
         let queue_desc = [0u32; 4];
         assert_eq!(
             crate::queue::create(null, queue_desc.as_ptr().cast(), &queue_iid, &mut queue),
@@ -3022,12 +3040,17 @@ mod tests {
             crate::list::create_allocator(null, 0, &allocator_iid, &mut allocator),
             S_OK
         );
-        assert_eq!(
-            crate::list::create_list(null, 0, 0, allocator, null, &list_iid, &mut list),
-            S_OK
-        );
+        let new_list = || {
+            let mut list = null;
+            assert_eq!(
+                crate::list::create_list(null, 0, 0, allocator, null, &list_iid, &mut list),
+                S_OK
+            );
+            list
+        };
 
         #[repr(C)]
+        #[derive(Clone, Copy)]
         struct Location {
             resource: This,
             kind: u32,
@@ -3053,9 +3076,66 @@ mod tests {
         };
         type Copy =
             extern "system" fn(This, *const Location, u32, u32, u32, *const Location, *const u8);
-        slot::<Copy>(list, 0x80)(list, &to, 0, 0, 0, &from, null.cast());
-        slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list);
-        slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(queue, 1, &list);
+        type Close = extern "system" fn(This) -> HRESULT;
+        type Execute = extern "system" fn(This, u32, *const This);
+        let upload = new_list();
+        slot::<Copy>(upload, 0x80)(upload, &to, 0, 0, 0, &from, null.cast());
+        assert_eq!(slot::<Close>(upload, 0x48)(upload), S_OK);
+
+        let copy = host_copy(image).unwrap();
+        // The upload list holds the texture until it is reset.
+        assert!(std::sync::Arc::strong_count(&copy) > 2);
+        let copied_subresource = u32::from(array_copy);
+        let copy_list = array_copy.then(|| {
+            // An explicit title barrier for slice 0, then a copy to slice 1.
+            // This list is recorded before the upload list is submitted.
+            #[repr(C)]
+            struct TransitionBarrier {
+                kind: u32,
+                flags: u32,
+                resource: This,
+                subresource: u32,
+                before: u32,
+                after: u32,
+                padding: u32,
+            }
+            let barrier = TransitionBarrier {
+                kind: 0,
+                flags: 0,
+                resource: image,
+                subresource: 0,
+                before: COPY_DEST,
+                after: COPY_SOURCE,
+                padding: 0,
+            };
+            let list = new_list();
+            type Barrier = extern "system" fn(This, u32, *const TransitionBarrier) -> u32;
+            slot::<Barrier>(list, 0xd0)(list, 1, &barrier);
+            let recorded = crate::list::host_list(list).unwrap();
+            assert_eq!(recorded.recorded_state(&copy, 0), Some(COPY_SOURCE));
+            assert_eq!(recorded.recorded_state(&copy, 1), None);
+
+            let slice_one = Location {
+                footprint: PlacedFootprint {
+                    offset: u64::from(copied_subresource),
+                    ..rows
+                },
+                ..to
+            };
+            slot::<Copy>(list, 0x80)(list, &slice_one, 0, 0, 0, &to, null.cast());
+            assert_eq!(recorded.recorded_state(&copy, 0), Some(COPY_SOURCE));
+            assert_eq!(recorded.recorded_state(&copy, 1), Some(COPY_DEST));
+            assert_eq!(recorded.recorded_state(&copy, 2), None);
+            assert_eq!(slot::<Close>(list, 0x48)(list), S_OK);
+            list
+        });
+        let lists = [upload, copy_list.unwrap_or(null)];
+        let execute = slot::<Execute>(queue, 0x50);
+        execute(queue, 1 + u32::from(array_copy), lists.as_ptr());
+        let mixed_states = || [0, 1, 2].map(|i| copy.state(i));
+        if array_copy {
+            assert_eq!(mixed_states(), [COPY_SOURCE, COPY_DEST, 0]);
+        }
 
         // Read the host texture back into a readback buffer.
         let readback_heap = D3D12_HEAP_PROPERTIES {
@@ -3090,11 +3170,7 @@ mod tests {
                 .unwrap();
         }
         let readback = readback.unwrap();
-        let host_image = host_resource(image).unwrap();
         let back = host.new_list().unwrap();
-        let (_, before) = host_transition(image, 0x800).unwrap();
-        // The upload list holds the texture until it is reset.
-        assert!(std::sync::Arc::strong_count(&host_copy(image).unwrap()) > 2);
         use windows::core::Interface;
         let out_to = Location {
             resource: readback.as_raw().cast_const().cast(),
@@ -3102,28 +3178,26 @@ mod tests {
             footprint: rows,
         };
         let out_from = Location {
-            resource: host_image.as_raw().cast_const().cast(),
+            resource: copy.texture.as_raw().cast_const().cast(),
             kind: 0,
-            footprint: to.footprint,
+            footprint: PlacedFootprint {
+                offset: u64::from(copied_subresource),
+                ..rows
+            },
         };
-        // SAFETY: an open list, live resources, locations in the host layout.
-        unsafe {
-            back.list.ResourceBarrier(&[crate::host::transition(
-                &host_image,
-                D3D12_RESOURCE_STATES(before as i32),
-                D3D12_RESOURCE_STATE_COPY_SOURCE,
-            )]);
-            back.list.CopyTextureRegion(
-                (&raw const out_to).cast(),
-                0,
-                0,
-                0,
-                (&raw const out_from).cast(),
-                None,
-            );
-        }
-        back.close();
-        host.execute(&[&back]);
+        host.execute_texture_read(&back, &copy, copied_subresource, D3D12_RESOURCE_STATE_COPY_SOURCE, |list| {
+            // SAFETY: an open list, live resources, locations in the host layout.
+            unsafe {
+                list.CopyTextureRegion(
+                    (&raw const out_to).cast(),
+                    0,
+                    0,
+                    0,
+                    (&raw const out_from).cast(),
+                    None,
+                );
+            }
+        });
         let mut mapped = std::ptr::null_mut();
         // SAFETY: the copy finished (execute waits); the buffer is 1024 bytes.
         let read = unsafe {
@@ -3142,6 +3216,53 @@ mod tests {
         for row in 0..4 {
             let at = row * 256;
             assert_eq!(read[at..at + 16], bytes[at..at + 16], "row {row}");
+        }
+        // SAFETY: we are done reading the mapping.
+        unsafe { readback.Unmap(0, None) };
+
+        if let Some(list) = copy_list {
+            assert_eq!(mixed_states(), [COPY_SOURCE, COPY_DEST, 0]);
+            // Reconcile a whole-texture first use with mixed committed states,
+            // then record a whole-texture transition from mixed inline states.
+            let whole = host.new_list().unwrap();
+            crate::list::ensure_state(&whole, image, COPY_SOURCE);
+            crate::list::ensure_subresource_state(&whole, image, 1, COPY_DEST);
+            crate::list::ensure_state(&whole, image, COPY_DEST);
+            whole.close();
+            host.execute(&[&whole]);
+            assert_eq!(mixed_states(), [COPY_DEST; 3]);
+
+            // The title readback also transitions just the selected slice.
+            let mut destination = null;
+            assert_eq!(
+                create_committed(
+                    null, &PROPERTIES, 0, &buffer(1024), 0, null.cast(), iid, &mut destination,
+                ),
+                S_OK
+            );
+            let (data, _) = buffer_bytes(destination).unwrap();
+            // SAFETY: the title buffer holds 1024 bytes.
+            unsafe { data.write_bytes(0xcd, 1024) };
+            let dst = Location { resource: destination, ..from };
+            let src = Location { resource: image, ..out_from };
+            let read = new_list();
+            slot::<Copy>(read, 0x80)(read, &dst, 0, 0, 0, &src, null.cast());
+            assert_eq!(slot::<Close>(read, 0x48)(read), S_OK);
+            execute(queue, 1, &read);
+            assert_eq!(mixed_states(), [COPY_DEST, COPY_SOURCE, COPY_DEST]);
+            // SAFETY: submission and readback finished; the title buffer is live.
+            let returned = unsafe { std::slice::from_raw_parts(data, 1024) };
+            for row in 0..4 {
+                let at = row * 256;
+                assert_eq!(returned[at..at + 16], bytes[at..at + 16], "title row {row}");
+                assert!(returned[at + 16..at + 256].iter().all(|&byte| byte == 0xcd));
+            }
+            slot::<Release>(read, 0x10)(read);
+            slot::<Release>(destination, 0x10)(destination);
+            slot::<Release>(list, 0x10)(list);
+        }
+        for object in [upload, allocator, queue, image, source] {
+            slot::<Release>(object, 0x10)(object);
         }
     }
 

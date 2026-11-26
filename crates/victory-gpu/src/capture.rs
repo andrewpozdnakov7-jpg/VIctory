@@ -424,7 +424,6 @@ pub(crate) fn dump_targets(frame: u64) {
 }
 
 fn dump_target_images(frame: u64, targets: &Targets) {
-    use std::sync::atomic::Ordering::Relaxed;
     let Some(host) = crate::host::host() else { return };
     for (i, (resource, copy, by)) in targets.iter().enumerate() {
         let texture = &copy.texture;
@@ -433,10 +432,8 @@ fn dump_target_images(frame: u64, targets: &Targets) {
         if d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER {
             continue;
         }
-        // Every submission has run; the dump's list moves it there and back.
-        let state = copy.state.load(Relaxed);
         let target = (i, *resource as crate::object::This, by.as_str());
-        dump_one(host, texture, state, &format!("frame-{frame}"), target, &d);
+        dump_one(host, copy, &format!("frame-{frame}"), target, &d);
     }
 }
 
@@ -444,7 +441,6 @@ fn dump_target_images(frame: u64, targets: &Targets) {
 /// rendered to or wrote, as `frame-<n>-s<sub>-<i>-...` (what each holds
 /// then, to follow a frame pass by pass).
 pub(crate) fn dump_submission(sub: u64, targets: &[(usize, String)]) {
-    use std::sync::atomic::Ordering::Relaxed;
     let Some(host) = crate::host::host() else { return };
     let frame = crate::queue::presented() + 1;
     peek(&format!("frame-{frame}-s{sub:04}"));
@@ -458,9 +454,8 @@ pub(crate) fn dump_submission(sub: u64, targets: &[(usize, String)]) {
         if d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER {
             continue;
         }
-        let state = copy.state.load(Relaxed);
         let target = (i, *resource as crate::object::This, by.as_str());
-        dump_one(host, texture, state, &format!("frame-{frame}-s{sub:04}"), target, &d);
+        dump_one(host, &copy, &format!("frame-{frame}-s{sub:04}"), target, &d);
         if d.SampleDesc.Count > 1 {
             continue;
         }
@@ -471,7 +466,7 @@ pub(crate) fn dump_submission(sub: u64, targets: &[(usize, String)]) {
             let pd = unsafe { plane.texture.GetDesc() };
             let by = format!("{by}-twin{p}");
             let target = (i, *resource as crate::object::This, by.as_str());
-            dump_one(host, &plane.texture, plane.state.load(Relaxed), &format!("frame-{frame}-s{sub:04}"), target, &pd);
+            dump_one(host, plane, &format!("frame-{frame}-s{sub:04}"), target, &pd);
         }
     }
 }
@@ -656,8 +651,7 @@ fn resolve_destination(
 
 fn dump_one(
     host: &crate::host::Host,
-    texture: &ID3D12Resource,
-    state: u32,
+    copy: &crate::resource::HostTexture,
     prefix: &str,
     (i, resource, by): (usize, crate::object::This, &str),
     d: &D3D12_RESOURCE_DESC,
@@ -669,36 +663,30 @@ fn dump_one(
         None
     };
     let Ok(list) = host.new_list() else { return };
-    let state = D3D12_RESOURCE_STATES(crate::host::legal_state(texture, state) as i32);
-    let copy = D3D12_RESOURCE_STATE_COPY_SOURCE;
-    let source = if resolved.is_some() { D3D12_RESOURCE_STATE_RESOLVE_SOURCE } else { copy };
-    // SAFETY: an open list and live textures. The resolved texture is kept
-    // through execution, and the source goes back to its original state.
-    let read = unsafe {
-        if state != source {
-            list.list
-                .ResourceBarrier(&[crate::host::transition(texture, state, source)]);
-        }
-        let read_texture = if let Some(target) = &resolved {
-            list.list.ResolveSubresource(target, 0, texture, 0, d.Format);
-            list.list.ResourceBarrier(&[crate::host::transition(
-                target,
-                D3D12_RESOURCE_STATE_RESOLVE_DEST,
-                copy,
-            )]);
+    let copy_source = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    let source_state = if resolved.is_some() {
+        D3D12_RESOURCE_STATE_RESOLVE_SOURCE
+    } else {
+        copy_source
+    };
+    let read = host.execute_texture_read(&list, copy, 0, source_state, |list| {
+        let texture = if let Some(target) = &resolved {
+            // SAFETY: the list is open, and both textures live through execution.
+            unsafe {
+                list.ResolveSubresource(target, 0, &copy.texture, 0, d.Format);
+                list.ResourceBarrier(&[crate::host::transition_subresource(
+                    target,
+                    0,
+                    D3D12_RESOURCE_STATE_RESOLVE_DEST,
+                    copy_source,
+                )]);
+            }
             target
         } else {
-            texture
+            &copy.texture
         };
-        let read = read_back(&host.device, &list.list, read_texture);
-        if state != source {
-            list.list
-                .ResourceBarrier(&[crate::host::transition(texture, source, state)]);
-        }
-        read
-    };
-    list.close();
-    host.execute(&[&list]);
+        read_back(&host.device, list, texture)
+    });
     let Some((buffer, footprint)) = read else { return };
     let f = footprint.Footprint;
     let mut data = std::ptr::null_mut();
