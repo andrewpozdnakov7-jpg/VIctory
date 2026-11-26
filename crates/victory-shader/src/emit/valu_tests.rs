@@ -788,18 +788,20 @@ fn f16_max_and_min_order_negative_zero_below_positive_zero() {
 }
 
 /// RDNA2 max/min with a NaN operand return the other operand; if both are
-/// NaN, keep a NaN (measured on hardware; DXIL FMax/FMin has the same
-/// semantics, but keep it explicit so driver quirks cannot turn NaNs into
-/// black pixels).
+/// NaN, keep a NaN. For 3-operand forms the NaN is ignored and the result is
+/// min/max of the remaining operands (measured on RDNA2/WARP; DXIL FMax/FMin
+/// has the same semantics, but keep it explicit so driver quirks cannot turn
+/// NaNs into black pixels).
 #[test]
 fn max_and_min_treat_a_nan_as_the_other_operand() {
     let nan = f32::NAN.to_bits();
     let a = 1.0f32.to_bits();
     let b = 2.0f32.to_bits();
+    // (inputs, 2-op want, max3 want, min3 want)
     let cases = [
-        ([nan, a, b, 0], a, a),
-        ([a, nan, b, 0], a, a),
-        ([nan, nan, b, 0], nan, nan),
+        ([nan, a, b, 0], a, b, a),
+        ([a, nan, b, 0], a, b, a),
+        ([nan, nan, b, 0], nan, b, b),
     ];
     let ops = [
         ("v_max_f32", 0x110u16),
@@ -813,10 +815,10 @@ fn max_and_min_treat_a_nan_as_the_other_operand() {
             &shader,
             &cases.iter().map(|c| c.0).collect::<Vec<_>>(),
             |backend, i, inp, got| {
-                let want = if name.contains("max") {
-                    cases[i].1
-                } else {
-                    cases[i].2
+                let want = match name {
+                    "v_max_f32" | "v_min_f32" => cases[i].1,
+                    "v_max3_f32" => cases[i].2,
+                    _ => cases[i].3,
                 };
                 if want == nan {
                     assert!(
@@ -836,10 +838,11 @@ fn f16_max_and_min_treat_a_nan_as_the_other_operand() {
     let nan = 0x7E00u32;
     let a = 0x3C00u32; // 1.0
     let b = 0x4000u32; // 2.0
+    // (inputs, 2-op want, max3 want, min3 want)
     let cases = [
-        ([nan, a, b, 0], a, a),
-        ([a, nan, b, 0], a, a),
-        ([nan, nan, b, 0], nan, nan),
+        ([nan, a, b, 0], a, b, a),
+        ([a, nan, b, 0], a, b, a),
+        ([nan, nan, b, 0], nan, b, b),
     ];
     let ops = [
         ("v_max_f16", 0x139u16),
@@ -853,10 +856,10 @@ fn f16_max_and_min_treat_a_nan_as_the_other_operand() {
             &shader,
             &cases.iter().map(|c| c.0).collect::<Vec<_>>(),
             |backend, i, inp, got| {
-                let want = if name.contains("max") {
-                    cases[i].1
-                } else {
-                    cases[i].2
+                let want = match name {
+                    "v_max_f16" | "v_min_f16" => cases[i].1,
+                    "v_max3_f16" => cases[i].2,
+                    _ => cases[i].3,
                 };
                 let got = got & 0xFFFF;
                 if want == nan {
