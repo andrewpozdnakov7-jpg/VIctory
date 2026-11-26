@@ -2083,6 +2083,115 @@ mod tests {
     use windows::Win32::Graphics::Direct3D::ID3DBlob;
     use windows::core::s;
 
+    /// A flagged root signature needs both heaps even when the guest does
+    /// not bind either of them. Read from the fallback view through D3D12.
+    #[test]
+    fn fallback_heaps_are_bound_before_indexed_compute_roots() {
+        let Some(host) = crate::host::host() else { return };
+        let shader = b"
+ByteAddressBuffer input : register(t0);
+RWByteAddressBuffer output : register(u0);
+[numthreads(1,1,1)]
+void main() { output.Store(0, input.Load(0)); }
+";
+        let range = D3D12_DESCRIPTOR_RANGE {
+            RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+            NumDescriptors: 1,
+            ..Default::default()
+        };
+        let params = [
+            D3D12_ROOT_PARAMETER {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+                Anonymous: D3D12_ROOT_PARAMETER_0 {
+                    DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE {
+                        NumDescriptorRanges: 1,
+                        pDescriptorRanges: &range,
+                    },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            },
+            D3D12_ROOT_PARAMETER {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_UAV,
+                Anonymous: D3D12_ROOT_PARAMETER_0 {
+                    Descriptor: D3D12_ROOT_DESCRIPTOR::default(),
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            },
+        ];
+        let root_desc = D3D12_ROOT_SIGNATURE_DESC {
+            Flags: D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED
+                | D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED,
+            NumParameters: params.len() as u32,
+            pParameters: params.as_ptr(),
+            ..Default::default()
+        };
+        let mut code = None;
+        let mut signature = None;
+        // SAFETY: the shader source and root parameters outlive every call.
+        let (root, pso) = unsafe {
+            D3DCompile(
+                shader.as_ptr().cast(), shader.len(), s!("heap probe"),
+                None, None, s!("main"), s!("cs_5_1"), 0, 0, &mut code, None,
+            ).unwrap();
+            D3D12SerializeRootSignature(
+                &root_desc, D3D_ROOT_SIGNATURE_VERSION_1, &mut signature, None,
+            ).unwrap();
+            let signature = signature.unwrap();
+            let bytes = std::slice::from_raw_parts(
+                signature.GetBufferPointer().cast::<u8>(), signature.GetBufferSize(),
+            );
+            let root: ID3D12RootSignature = host.device.CreateRootSignature(0, bytes).unwrap();
+            let code = code.unwrap();
+            let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(&root),
+                CS: D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: code.GetBufferPointer(),
+                    BytecodeLength: code.GetBufferSize(),
+                },
+                ..Default::default()
+            };
+            let pso: ID3D12PipelineState = host.device.CreateComputePipelineState(&desc).unwrap();
+            (root, pso)
+        };
+        let memory = crate::memory::heap().unwrap();
+        let slot = memory.dynamic(1).unwrap();
+        let (input, src) = host.shared_buffer(4).unwrap();
+        let (output, dst) = host.shared_buffer(4).unwrap();
+        const VALUE: u32 = 0x1234_abcd;
+        // SAFETY: this test owns the four mapped bytes.
+        unsafe { src.cast::<u32>().write(VALUE) };
+        memory.raw_view_at(slot, Some(&input), 0, 4, false);
+
+        let mut observed = [[0; 2]; 2];
+        for (needs_memory_heap, round) in [false, true].into_iter().zip(&mut observed) {
+            let mut state = State::default();
+            for (after_cut, value) in [false, true].into_iter().zip(round) {
+                let list = host.new_list().unwrap();
+                if after_cut {
+                    state.cut(&list);
+                }
+                state.bind_heaps(&list, needs_memory_heap);
+                // SAFETY: an open list and live shader resources. The
+                // previous submission has completed before touching dst.
+                unsafe {
+                    dst.cast::<u32>().write(0xcafe_0000);
+                    list.list.SetComputeRootSignature(&root);
+                    list.list.SetPipelineState(&pso);
+                    list.list.SetComputeRootDescriptorTable(0, memory.gpu(slot));
+                    list.list.SetComputeRootUnorderedAccessView(1, output.GetGPUVirtualAddress());
+                    list.list.Dispatch(1, 1, 1);
+                }
+                list.close();
+                host.execute(&[&list]);
+                // SAFETY: the submitted GPU write has completed.
+                *value = unsafe { dst.cast::<u32>().read() };
+            }
+        }
+        memory.raw_view_at(slot, None, 0, 4, false);
+        memory.release(slot, 1);
+        assert_eq!(observed, [[VALUE; 2]; 2], "fallback view before and after a list cut");
+    }
+
     /// Reads 16 dwords 64 bytes apart from `offset` past the root view
     /// (heap index in the table) as the translated shaders do: the root
     /// address's offset in the view plus their own.
