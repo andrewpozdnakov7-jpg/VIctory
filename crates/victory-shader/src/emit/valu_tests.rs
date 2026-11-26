@@ -239,7 +239,7 @@ fn run_cases(
 fn scalar_quad_masks_pack_nibbles_and_set_scc() {
     let pack_words = |opcode: u32| {
         [
-            0xBE90_0000 | opcode << 8,   // s_quadmask s16, s0 (pairs for b64)
+            0xBE90_0000 | opcode << 8, // s_quadmask s16, s0 (pairs for b64)
             sop2(0x0a, 18, 129, 128),  // s_cselect_b32 s18, 1, 0
             sop2(0x1e, 18, 18, 144),   // s_lshl_b32 s18, s18, 16
             sop2(0x10, 16, 16, 18),    // s_or_b32 s16, s16, s18
@@ -275,12 +275,12 @@ fn is_f16_nan(bits: u16) -> bool {
 #[test]
 fn a_branch_to_fallthrough_keeps_both_values_at_a_join() {
     let shader = build_valu_cs(&[
-        0xBF06_0100,            // s_cmp_eq_u32 s0, s1
-        0xBF85_0002,            // s_cbranch_scc1 -> the s2 = 1 path
-        s_mov_b32(2, 128),      // s2 = 0
-        0xBF82_0002,            // s_branch -> the join
-        s_mov_b32(2, 129),      // s2 = 1
-        0xBF85_0000,            // s_cbranch_scc1 -> the following instruction
+        0xBF06_0100,             // s_cmp_eq_u32 s0, s1
+        0xBF85_0002,             // s_cbranch_scc1 -> the s2 = 1 path
+        s_mov_b32(2, 128),       // s2 = 0
+        0xBF82_0002,             // s_branch -> the join
+        s_mov_b32(2, 129),       // s2 = 1
+        0xBF85_0000,             // s_cbranch_scc1 -> the following instruction
         vop1(0x001, 0, sgpr(2)), // join: v0 = s2
     ]);
     run_cases(
@@ -543,7 +543,9 @@ fn normalized_codes(bits: u32) -> Vec<u32> {
     if bits <= 10 {
         return (0..1 << bits).collect();
     }
-    let edges = [1, 2, 3, 255, 256, 257, 261, 265, 269, 511, 512, 1000, 0x7FFF, 0x8000, 0x8001, 0xFFFE];
+    let edges = [
+        1, 2, 3, 255, 256, 257, 261, 265, 269, 511, 512, 1000, 0x7FFF, 0x8000, 0x8001, 0xFFFE,
+    ];
     (0..=0xFFFF).step_by(257).chain(edges).collect()
 }
 
@@ -557,9 +559,19 @@ fn normalized_buffer_formats_load_correctly_rounded_quotients() {
     let x = 0;
     // (format, bits, signed): 8_UNORM, 16_UNORM, 8_SNORM, 16_SNORM,
     // 2_10_10_10_UNORM and _SNORM.
-    for (format, bits, signed) in [(1u8, 8u32, false), (7, 16, false), (2, 8, true), (8, 16, true), (50, 10, false), (51, 10, true)] {
+    for (format, bits, signed) in [
+        (1u8, 8u32, false),
+        (7, 16, false),
+        (2, 8, true),
+        (8, 16, true),
+        (50, 10, false),
+        (51, 10, true),
+    ] {
         let shader = tbuffer_load_of_v1(x, format);
-        let cases: Vec<[u32; 4]> = normalized_codes(bits).iter().map(|&a| [a, 0, 0, 0]).collect();
+        let cases: Vec<[u32; 4]> = normalized_codes(bits)
+            .iter()
+            .map(|&a| [a, 0, 0, 0])
+            .collect();
         run_cases(&shader, &cases, |backend, _, [a, ..], got| {
             let want = if signed {
                 let top = (1i32 << (bits - 1)) - 1;
@@ -569,7 +581,10 @@ fn normalized_buffer_formats_load_correctly_rounded_quotients() {
                 (a as f32 / ((1u32 << bits) - 1) as f32).to_bits()
             };
             let sign = if signed { "signed" } else { "unsigned" };
-            assert_eq!(got, want, "{backend}: {bits}-bit {sign} normalized {a:#x} loads as {got:#010x}, want {want:#010x}");
+            assert_eq!(
+                got, want,
+                "{backend}: {bits}-bit {sign} normalized {a:#x} loads as {got:#010x}, want {want:#010x}"
+            );
         });
     }
 }
@@ -589,7 +604,10 @@ fn normalized_codes_truncate_back_to_themselves() {
         body.extend([0x07 << 25 | 0xFF, scale]);
         body.push(vop1(0x07, 0, vgpr(0)));
         let shader = build_valu_cs(&body);
-        let cases: Vec<[u32; 4]> = normalized_codes(bits).iter().map(|&a| [a, 0, 0, 0]).collect();
+        let cases: Vec<[u32; 4]> = normalized_codes(bits)
+            .iter()
+            .map(|&a| [a, 0, 0, 0])
+            .collect();
         run_cases(&shader, &cases, |backend, _, [a, ..], got| {
             assert_eq!(got, a, "{backend}: {bits}-bit code {a} comes back as {got}");
         });
@@ -766,6 +784,91 @@ fn f16_max_and_min_order_negative_zero_below_positive_zero() {
             // The f16 result is the low half of v0.
             assert_eq!(got & 0xFFFF, want, "{backend}: {name} {inp:x?}");
         });
+    }
+}
+
+/// RDNA2 max/min with a NaN operand return the other operand; if both are
+/// NaN, keep a NaN (measured on hardware; DXIL FMax/FMin has the same
+/// semantics, but keep it explicit so driver quirks cannot turn NaNs into
+/// black pixels).
+#[test]
+fn max_and_min_treat_a_nan_as_the_other_operand() {
+    let nan = f32::NAN.to_bits();
+    let a = 1.0f32.to_bits();
+    let b = 2.0f32.to_bits();
+    let cases = [
+        ([nan, a, b, 0], a, a),
+        ([a, nan, b, 0], a, a),
+        ([nan, nan, b, 0], nan, nan),
+    ];
+    let ops = [
+        ("v_max_f32", 0x110u16),
+        ("v_min_f32", 0x10F),
+        ("v_max3_f32", 0x154),
+        ("v_min3_f32", 0x151),
+    ];
+    for (name, op) in ops {
+        let shader = build_valu_cs(&vop3(op, 0, vgpr(1), vgpr(2), vgpr(3)));
+        run_cases(
+            &shader,
+            &cases.iter().map(|c| c.0).collect::<Vec<_>>(),
+            |backend, i, inp, got| {
+                let want = if name.contains("max") {
+                    cases[i].1
+                } else {
+                    cases[i].2
+                };
+                if want == nan {
+                    assert!(
+                        f32::from_bits(got).is_nan(),
+                        "{backend}: {name} {inp:x?} = {got:#010x}"
+                    );
+                } else {
+                    assert_eq!(got, want, "{backend}: {name} {inp:x?}");
+                }
+            },
+        );
+    }
+}
+
+#[test]
+fn f16_max_and_min_treat_a_nan_as_the_other_operand() {
+    let nan = 0x7E00u32;
+    let a = 0x3C00u32; // 1.0
+    let b = 0x4000u32; // 2.0
+    let cases = [
+        ([nan, a, b, 0], a, a),
+        ([a, nan, b, 0], a, a),
+        ([nan, nan, b, 0], nan, nan),
+    ];
+    let ops = [
+        ("v_max_f16", 0x139u16),
+        ("v_min_f16", 0x13A),
+        ("v_max3_f16", 0x354),
+        ("v_min3_f16", 0x351),
+    ];
+    for (name, op) in ops {
+        let shader = build_valu_cs(&vop3(op, 0, vgpr(1), vgpr(2), vgpr(3)));
+        run_cases(
+            &shader,
+            &cases.iter().map(|c| c.0).collect::<Vec<_>>(),
+            |backend, i, inp, got| {
+                let want = if name.contains("max") {
+                    cases[i].1
+                } else {
+                    cases[i].2
+                };
+                let got = got & 0xFFFF;
+                if want == nan {
+                    assert!(
+                        is_f16_nan(got as u16),
+                        "{backend}: {name} {inp:x?} = {got:#06x}"
+                    );
+                } else {
+                    assert_eq!(got, want, "{backend}: {name} {inp:x?}");
+                }
+            },
+        );
     }
 }
 
@@ -972,12 +1075,19 @@ fn v_cvt_off_f32_i4_uses_the_signed_low_nibble() {
 
     let mut cases: Vec<u32> = (0..16).collect();
     // Bits above the low nibble are ignored.
-    cases.extend([0xABCD_EF05, 0xFFFF_FFF8, 0x1234_5670, 0x8000_000F, 0x0000_00F7]);
+    cases.extend([
+        0xABCD_EF05,
+        0xFFFF_FFF8,
+        0x1234_5670,
+        0x8000_000F,
+        0x0000_00F7,
+    ]);
     let inputs: Vec<[u32; 4]> = cases.iter().map(|&x| [x, 0, 0, 0]).collect();
     run_cases(&shader, &inputs, |backend, i, inp, got| {
         let want = nibble(cases[i]).to_bits();
         assert_eq!(
-            got, want,
+            got,
+            want,
             "{backend}: v_cvt_off_f32_i4({:#010x}) = {got:#010x} ({:?}), want {want:#010x}",
             inp[0],
             f32::from_bits(got),
