@@ -1735,7 +1735,7 @@ pub(crate) fn owned(this: This) -> Option<Owned> {
 // The creation methods' own arguments, passed on.
 #[allow(clippy::too_many_arguments)]
 fn hand_out_resource(
-    desc: ResourceDesc,
+    mut desc: ResourceDesc,
     heap: HeapProperties,
     heap_flags: u32,
     backing: Backing,
@@ -1744,6 +1744,9 @@ fn hand_out_resource(
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
+    if desc.dimension != BUFFER && desc.mip_levels == 0 {
+        desc.mip_levels = mip_count(&desc) as u16;
+    }
     #[cfg(not(windows))]
     let _ = (state, clear);
     let resource = Box::new(Resource {
@@ -2366,6 +2369,70 @@ mod tests {
             layout: 0,
             ..buffer(0)
         }
+    }
+
+    /// Compare the title's GetDesc result with the native D3D12 result
+    /// when the same resource is created with automatic mip levels.
+    #[cfg(windows)]
+    #[test]
+    fn automatic_mip_counts_match_native_d3d12_getdesc() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_SAMPLE_DESC};
+
+        let Some(host) = crate::host::host() else {
+            eprintln!("no native D3D12 device; skipped");
+            return;
+        };
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let native_count = |desc: ResourceDesc| {
+            let input = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION(desc.dimension as i32),
+                Width: desc.width,
+                Height: desc.height,
+                DepthOrArraySize: desc.depth_or_array_size,
+                MipLevels: desc.mip_levels,
+                Format: DXGI_FORMAT(desc.format as i32),
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT(desc.layout as i32),
+                ..Default::default()
+            };
+            let mut native: Option<ID3D12Resource> = None;
+            // SAFETY: these are valid descriptions of small ordinary
+            // committed resources and the output slot is ours.
+            unsafe {
+                host.device.CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &input,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    None,
+                    &mut native,
+                ).unwrap();
+                native.unwrap().GetDesc().MipLevels
+            }
+        };
+        let guest_count = |desc: ResourceDesc| {
+            let null = std::ptr::null();
+            let mut object = null;
+            assert_eq!(create_committed(null, &PROPERTIES, 0, &desc, 0, null.cast(), &RESOURCE_IIDS[0], &mut object), S_OK);
+            let mut result = desc;
+            slot::<extern "system" fn(This, *mut ResourceDesc)>(object, 0x50)(object, &mut result);
+            assert_eq!(slot::<Release>(object, 0x10)(object), 0);
+            result.mip_levels
+        };
+        let square = texture(4, 4, 28, 0);
+        let line = ResourceDesc { dimension: 2, width: 16, height: 1, ..square };
+        let array = ResourceDesc { depth_or_array_size: 6, ..square };
+        let volume = ResourceDesc { dimension: 4, width: 16, height: 8, depth_or_array_size: 32, ..square };
+        let explicit = texture(4, 4, 28, 2);
+        let cases = [line, square, array, volume, explicit, buffer(256)];
+        let native = cases.map(native_count);
+        let guest = cases.map(guest_count);
+        assert_eq!(native, [5, 3, 3, 6, 2, 1]);
+        assert_eq!(guest, native);
     }
 
     fn heap(size: u64) -> This {
@@ -3238,5 +3305,97 @@ mod tests {
         // The resource keeps the heap alive.
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 1);
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
+    }
+
+    #[test]
+    fn auto_size_textures_normalize_mip_levels_in_get_desc() {
+        let null = std::ptr::null();
+        let get_desc = |desc: &ResourceDesc| -> ResourceDesc {
+            let mut res = null;
+            let hr = create_committed(
+                null,
+                &PROPERTIES,
+                0,
+                desc,
+                0,
+                null.cast(),
+                &RESOURCE_IIDS[0],
+                &mut res,
+            );
+            assert_eq!(hr, S_OK);
+            let mut out = std::mem::MaybeUninit::<ResourceDesc>::uninit();
+            slot::<extern "system" fn(This, *mut ResourceDesc)>(res, 0x50)(res, out.as_mut_ptr());
+            assert_eq!(slot::<Release>(res, 0x10)(res), 0);
+            // SAFETY: initialized by resource_desc.
+            unsafe { out.assume_init() }
+        };
+
+        // 4x4 2D texture with auto mips (0) -> 3 mips (4x4, 2x2, 1x1)
+        let t2d = ResourceDesc {
+            dimension: 3,
+            width: 4,
+            height: 4,
+            depth_or_array_size: 1,
+            mip_levels: 0,
+            format: 28, // DXGI_FORMAT_R8G8B8A8_UNORM
+            layout: 0,
+            ..buffer(0)
+        };
+        assert_eq!(get_desc(&t2d).mip_levels, 3);
+
+        // 2D texture array (e.g. 6 slices) with auto mips (0) -> array size does not inflate mips
+        let t2d_array = ResourceDesc {
+            dimension: 3,
+            width: 4,
+            height: 4,
+            depth_or_array_size: 6,
+            mip_levels: 0,
+            format: 28,
+            layout: 0,
+            ..buffer(0)
+        };
+        assert_eq!(get_desc(&t2d_array).mip_levels, 3);
+
+        // Explicit 2-mip control -> stays 2
+        let t2d_explicit = ResourceDesc {
+            dimension: 3,
+            width: 4,
+            height: 4,
+            depth_or_array_size: 1,
+            mip_levels: 2,
+            format: 28,
+            layout: 0,
+            ..buffer(0)
+        };
+        assert_eq!(get_desc(&t2d_explicit).mip_levels, 2);
+
+        // 1D texture with auto mips (0) -> 256 gives 9 mips
+        let t1d = ResourceDesc {
+            dimension: 2,
+            width: 256,
+            height: 1,
+            depth_or_array_size: 1,
+            mip_levels: 0,
+            format: 28,
+            layout: 0,
+            ..buffer(0)
+        };
+        assert_eq!(get_desc(&t1d).mip_levels, 9);
+
+        // 3D volume texture with auto mips (0) -> 16x8x32 gives 6 mips (max dimension 32)
+        let t3d = ResourceDesc {
+            dimension: 4,
+            width: 16,
+            height: 8,
+            depth_or_array_size: 32,
+            mip_levels: 0,
+            format: 28,
+            layout: 0,
+            ..buffer(0)
+        };
+        assert_eq!(get_desc(&t3d).mip_levels, 6);
+
+        // Ordinary buffer -> stays 1 mip
+        assert_eq!(get_desc(&buffer(256)).mip_levels, 1);
     }
 }
