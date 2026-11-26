@@ -2305,12 +2305,13 @@ mod tests {
         use windows::Win32::Foundation::RECT;
         use windows::Win32::Graphics::Direct3D12::{
             D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RTV_DIMENSION_TEXTURE2D,
+            D3D12_RTV_DIMENSION_TEXTURE2DARRAY,
         };
         use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM;
 
         const TEST: &str = "resource::tests::capture_uses_the_bound_render_target_mip";
         const CHILD: &str = "VICTORY_TEST_BOUND_MIP_CAPTURE";
-        const UNAVAILABLE: &str = "WARP unavailable for bound-mip capture";
+        const UNAVAILABLE: &str = "D3D12 adapter unavailable for bound-mip capture";
         if std::env::var_os(CHILD).is_some() {
             let Some(host) = crate::host::host() else {
                 println!("{UNAVAILABLE}");
@@ -2330,6 +2331,12 @@ mod tests {
             let actual = host_resource(resource).expect("a host texture with both mips");
             // SAFETY: the reference holds a live texture.
             assert_eq!(unsafe { actual.GetDesc() }.MipLevels, 2);
+            let mut array = null;
+            let array_desc = ResourceDesc { depth_or_array_size: 4, ..desc };
+            assert_eq!(
+                create_committed(null, &PROPERTIES, 0, &array_desc, 0, null.cast(), &RESOURCE_IIDS[0], &mut array),
+                S_OK,
+            );
 
             let mut allocator = null;
             let mut guest = null;
@@ -2350,10 +2357,30 @@ mod tests {
                 bind(guest, 1, &handle, 0, null.cast());
                 clear(guest, handle, &color, 0, null.cast());
             }
+            let mut array_descriptors = [[0u64; 14]; 4];
+            for (desc_words, (mip, slice, color)) in array_descriptors.iter_mut().zip([
+                (0, 0, [1.0, 0.0, 1.0, 1.0]),
+                (1, 0, [1.0, 1.0, 0.0, 1.0]),
+                (0, 1, [0.0, 0.0, 1.0, 1.0]),
+                (1, 1, [0.0, 1.0, 1.0, 1.0]),
+            ]) {
+                let handle = desc_words.as_mut_ptr() as u64;
+                let view = [format, D3D12_RTV_DIMENSION_TEXTURE2DARRAY.0 as u32, mip, slice, 1, 0];
+                crate::descriptor::create_rtv(null, array, &view, handle);
+                bind(guest, 1, &handle, 0, null.cast());
+                clear(guest, handle, &color, 0, null.cast());
+            }
+            // A layered view spans two other slices. It has no single selected slice.
+            let mut layered = [0u64; 14];
+            let handle = layered.as_mut_ptr() as u64;
+            let view = [format, D3D12_RTV_DIMENSION_TEXTURE2DARRAY.0 as u32, 1, 2, 2, 0];
+            crate::descriptor::create_rtv(null, array, &view, handle);
+            bind(guest, 1, &handle, 0, null.cast());
+            clear(guest, handle, &[1.0, 1.0, 1.0, 1.0], 0, null.cast());
             list.close();
             host.execute(&[list]);
             crate::capture::dump_targets(1);
-            for o in [guest, allocator, resource] {
+            for o in [guest, allocator, resource, array] {
                 assert_eq!(slot::<Release>(o, 0x10)(o), 0);
             }
             return;
@@ -2363,8 +2390,8 @@ mod tests {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", TEST, "--nocapture"])
             .env(CHILD, "1")
-            .env("VICTORY_D3D12_WARP", "1")
-            .env("VICTORY_D3D12_DEBUG", "0")
+            .env("VICTORY_D3D12_WARP", std::env::var_os("VICTORY_D3D12_WARP").unwrap_or_else(|| "1".into()))
+            .env("VICTORY_D3D12_DEBUG", std::env::var_os("VICTORY_D3D12_DEBUG").unwrap_or_else(|| "0".into()))
             .env("VICTORY_CAPTURE", dir.path())
             .env("VICTORY_CAPTURE_FRAMES", "1")
             .env("VICTORY_DUMP_TARGETS", "1")
@@ -2389,21 +2416,28 @@ mod tests {
             let size_in_name = if word(16) == 2 { "-4x4-f28-mip1" } else { "-8x8-f28" };
             assert!(name.contains(size_in_name), "target filename should include {size_in_name}");
             let rgb = miniz_oxide::inflate::decompress_to_vec_zlib(&png[41..41 + word(33) as usize]).unwrap();
-            actual.push((name.starts_with("frame-1-s"), word(16), word(20), rgb));
+            let slice = name.contains("-slice1");
+            println!("{name}: {:?}", &rgb[1..4]);
+            actual.push((name.starts_with("frame-1-s"), slice, word(16), word(20), rgb));
         }
         let row = |size, pixel: [u8; 3]| [vec![0], pixel.repeat(size)].concat().repeat(size);
-        let red = row(4, [255, 0, 0]);
-        let green = row(2, [0, 255, 0]);
-        let mut expected = vec![
-            (false, 4, 4, red.clone()),
-            (true, 4, 4, red),
-            (false, 2, 2, green.clone()),
-            (true, 2, 2, green),
-        ];
+        let mut expected = Vec::new();
+        for submission in [false, true] {
+            for (slice, size, pixel) in [
+                (false, 4, [255, 0, 0]),
+                (false, 2, [0, 255, 0]),
+                (false, 4, [255, 0, 255]),
+                (false, 2, [255, 255, 0]),
+                (true, 4, [0, 0, 255]),
+                (true, 2, [0, 255, 255]),
+            ] {
+                expected.push((submission, slice, size, size, row(size as usize, pixel)));
+            }
+        }
         actual.sort_unstable();
         expected.sort_unstable();
         println!("bound-mip capture produced {} PNGs", actual.len());
-        assert_eq!(actual, expected, "both named RTV mip slices at submission and at present");
+        assert_eq!(actual, expected, "each bound RTV subresource at submission and at present");
     }
 
     #[test]
