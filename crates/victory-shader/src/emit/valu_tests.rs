@@ -1631,6 +1631,48 @@ fn gradient_samples_of_16_bits() {
     assert!(ran > 0, "no SM 6.6 device");
 }
 
+#[test]
+fn resinfo_a16_reads_the_low_mip_half() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false).or_else(|_| Host::new(true)) else {
+        eprintln!("no SM 6.6 adapter; skipped");
+        return;
+    };
+    let texels = [[0.0; 4]; 42];
+    let views = [View::Mipped(8, 4, 3, &texels), View::RawUav(2)];
+    let used = [(4, ResourceType::Srv, 0, 8), (4, ResourceType::Uav, 8, 4)];
+    let mut observed = Vec::new();
+    for (a16, mip) in [(false, 1), (true, 2), (true, 0x1234_0001), (true, 0x5678_0002)] {
+        // s[8:15] is the texture at heap slot 0; s[20:23] is the output at slot 1.
+        let mut words = vec![
+            s_mov_b32(5, 0x80),
+            0xf40c_0202, 0xfa00_0000, // s_load_dwordx8 s[8:15], s[4:5], 0
+            0xf408_0502, 0xfa00_0020, // s_load_dwordx4 s[20:23], s[4:5], 0x20
+            vop1(1, 0, 255), mip, // v0 holds the mip operand
+            0xf038_0308, 0x0002_1400 | (a16 as u32) << 30, // image_get_resinfo width/height
+        ];
+        words.extend(buffer_store_dword(20, 20, 0));
+        words.extend(buffer_store_dword(21, 20, 4));
+        words.push(S_ENDPGM);
+        let shader = lower_cs32(&words, &used, true);
+        let (root, pso) = host.compute_pipeline(&shader).unwrap();
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(user_data_cs32(&shader, 0)))],
+                    views: &views,
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap();
+        observed.push([out[0][0], out[0][1]]);
+    }
+    assert_eq!(observed, [[4, 2], [2, 1], [4, 2], [2, 1]]);
+}
+
 /// MIMG `image_atomic_<op> vdata, v[vaddr:vaddr+1], s[srsrc:srsrc+7]
 /// dmask dim:2D unorm` (glc returns the old value).
 const fn image_atomic(op: u32, vdata: u8, vaddr: u8, srsrc: u8, dmask: u32, glc: bool) -> [u32; 2] {
