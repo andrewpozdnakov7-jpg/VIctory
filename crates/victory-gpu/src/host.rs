@@ -130,6 +130,7 @@ impl CpuViews {
 
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
+    pub(crate) depth_bounds_supported: bool,
     queue: ID3D12CommandQueue,
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
@@ -275,6 +276,15 @@ fn create() -> windows::core::Result<Host> {
             crate::tdr::log();
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS2::default();
+        let depth_bounds_supported = device
+            .CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS2,
+                (&raw mut options).cast(),
+                size_of_val(&options) as u32,
+            )
+            .is_ok()
+            && options.DepthBoundsTestSupported.as_bool();
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();
@@ -301,6 +311,7 @@ fn create() -> windows::core::Result<Host> {
         }
         Ok(Host {
             device,
+            depth_bounds_supported,
             queue,
             fence,
             submitted: Mutex::new(0),
@@ -923,6 +934,7 @@ pub(crate) mod tests {
 pub(crate) struct HostList {
     allocator: ID3D12CommandAllocator,
     pub(crate) list: ID3D12GraphicsCommandList,
+    pub(crate) depth_bounds: Option<ID3D12GraphicsCommandList1>,
     /// Work for submission time, in recorded order.
     deferred: Mutex<Deferred>,
     /// Upload memory for data the list's draws make (expanded vertices),
@@ -981,6 +993,11 @@ pub(crate) struct HostList {
 unsafe impl Send for HostList {}
 // SAFETY: as above.
 unsafe impl Sync for HostList {}
+
+pub(crate) fn warn_depth_bounds() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| tracing::warn!("the host GPU has no depth bounds test; depth bounds are ignored"));
+}
 
 /// Timestamps per list (diagnostics); commands past them are not timed.
 #[cfg(feature = "diagnostics")]
@@ -1259,6 +1276,7 @@ impl Host {
             name(&list, || list_name(id));
             Ok(HostList {
                 allocator,
+                depth_bounds: self.depth_bounds_supported.then(|| list.cast()).transpose()?,
                 list,
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
@@ -1748,11 +1766,26 @@ impl Host {
     }
 
     /// A host render target view of `resource`, valid until it is recorded.
+    /// `None` when the resource does not take one (it was made without the
+    /// render target use, as `resource::host_desc` leaves the uses its
+    /// format cannot take away): the view then reads null, a clear of it is
+    /// dropped — not a device removal.
     pub(crate) fn rtv(
         &self,
         resource: &ID3D12Resource,
         desc: Option<&D3D12_RENDER_TARGET_VIEW_DESC>,
     ) -> Option<CpuView<'_>> {
+        // SAFETY: a live resource.
+        if unsafe { resource.GetDesc() }
+            .Flags
+            .0
+            & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0
+            == 0
+        {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| tracing::warn!("a render target view of a texture the host made without the render target use: dropped"));
+            return None;
+        }
         let view = self.rtvs.take(&self.device)?;
         // SAFETY: the requested slot is reserved and the resource is live.
         unsafe {
@@ -1767,12 +1800,24 @@ impl Host {
         self.cpu_views.take(&self.device)
     }
 
-    /// A host depth view held until its command is recorded.
+    /// A host depth view of `resource`, valid until it is recorded. `None`
+    /// when the resource does not take one (as [`Self::rtv`]).
     pub(crate) fn dsv(
         &self,
         resource: &ID3D12Resource,
         desc: Option<&D3D12_DEPTH_STENCIL_VIEW_DESC>,
     ) -> Option<CpuView<'_>> {
+        // SAFETY: a live resource.
+        if unsafe { resource.GetDesc() }
+            .Flags
+            .0
+            & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0
+            == 0
+        {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| tracing::warn!("a depth view of a texture the host made without the depth use: dropped"));
+            return None;
+        }
         let view = self.dsvs.take(&self.device)?;
         // SAFETY: the requested slot is reserved and the resource is live.
         unsafe {

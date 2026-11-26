@@ -1021,6 +1021,9 @@ extern "system" fn clear_rtv(
             // SAFETY: the title passes `count` rectangles, laid out as the host's.
             unsafe { std::slice::from_raw_parts(rects.cast(), count as usize) }
         });
+        // A target the host texture does not take (its format's uses:
+        // `resource::host_desc`) is not cleared: its view reads null, and
+        // making it would be an invalid call.
         const RENDER_TARGET: u32 = 0x4;
         let Some(rtv) = host.rtv(&texture, record.desc().as_ref()) else {
             return;
@@ -1072,6 +1075,9 @@ extern "system" fn clear_dsv(
         });
         const DEPTH_WRITE: u32 = 0x10;
         ensure_state(list, record.resource, DEPTH_WRITE);
+        // A texture the host made without the depth use (its format's uses:
+        // `resource::host_desc`) is not cleared: its view reads null, and
+        // making it would be an invalid call.
         let Some(dsv) = host.dsv(&texture, record.depth_desc().as_ref()) else {
             return;
         };
@@ -1326,6 +1332,13 @@ pub(crate) static UPLOADS: [std::sync::atomic::AtomicU64; 2] =
 /// the pipeline; depth bounds, depth order and shading rate hints): any
 /// arguments, nothing returned.
 extern "system" fn ignored_state(_: This) {}
+
+extern "system" fn depth_bounds(this: This, min: f32, max: f32) {
+    #[cfg(windows)]
+    with_state(this, |list, s| s.set_depth_bounds(list, min, max));
+    #[cfg(not(windows))]
+    let _ = (this, min, max);
+}
 
 /// The title's draw state (decision 0007, step 3), kept for its draws or
 /// set on the host list at once. Without a host GPU these do nothing.
@@ -1776,7 +1789,7 @@ const METHODS: [(usize, *const ()); 52] = [
     (52, clear_rtv as *const ()),                 // 0x1a0
     (59, execute_indirect as *const ()),          // 0x1d8 indirect
     (60, copy_memory as *const ()),               // 0x1e0
-    (68, ignored_state as *const ()),             // 0x220 depth bounds
+    (68, depth_bounds as *const ()),              // 0x220
     (69, write32 as *const ()),                   // 0x228
     (70, write64 as *const ()),                   // 0x230
     (71, wait32 as *const ()),                    // 0x238 (newer 0x248)
@@ -1851,6 +1864,14 @@ const fn list_table(newer: bool) -> [*const (); 160] {
 /// titles add.
 static LIST_FUNCTIONS: Table<160> = Table(list_table(false));
 static NEWER_LIST_FUNCTIONS: Table<160> = Table(list_table(true));
+
+#[cfg(all(test, windows))]
+pub(crate) fn has_newer_table(list: This) -> bool {
+    // SAFETY: one of our lists; its first field is the table. The device
+    // tests can switch layouts, so use this list's table.
+    let table = unsafe { *list.cast::<*const *const ()>() };
+    table == NEWER_LIST_FUNCTIONS.0.as_ptr()
+}
 
 #[cfg(test)]
 mod tests {
