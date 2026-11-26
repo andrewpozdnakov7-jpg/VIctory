@@ -26,6 +26,39 @@ use std::time::{Duration, Instant};
 use super::Shader;
 use super::host::{GraphicsState, HostPipeline};
 
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub(crate) struct TargetKey {
+    pub(crate) rt_formats: [i32; 8],
+    pub(crate) num_render_targets: u32,
+    pub(crate) dsv_format: i32,
+}
+
+#[cfg(windows)]
+type TargetVariant = (TargetKey, Box<OnceLock<Option<HostPipeline>>>);
+
+#[cfg(windows)]
+impl TargetKey {
+    pub(crate) fn from_formats(
+        targets: &windows::Win32::Graphics::Direct3D12::D3D12_RT_FORMAT_ARRAY,
+        dsv_format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT,
+    ) -> Self {
+        let mut rt_formats = [0i32; 8];
+        let num_render_targets = targets.NumRenderTargets.min(8);
+        for (dst, src) in rt_formats[..num_render_targets as usize]
+            .iter_mut()
+            .zip(&targets.RTFormats[..num_render_targets as usize])
+        {
+            *dst = src.0;
+        }
+        TargetKey {
+            rt_formats,
+            num_render_targets,
+            dsv_format: dsv_format.0,
+        }
+    }
+}
+
 /// What a host pipeline is made from, and the host pipeline once made.
 pub(crate) struct Pending {
     shaders: Vec<Arc<Shader>>,
@@ -36,6 +69,8 @@ pub(crate) struct Pending {
     now: AtomicBool,
     taken: AtomicBool,
     made: OnceLock<Option<HostPipeline>>,
+    #[cfg(windows)]
+    variants: Mutex<Vec<TargetVariant>>,
     #[cfg(feature = "diagnostics")]
     pub(super) skipped_shader: Option<String>,
     /// What identifies it across runs (shader containers and state), and
@@ -78,6 +113,8 @@ impl Pending {
             now: AtomicBool::new(false),
             taken: AtomicBool::new(false),
             made,
+            #[cfg(windows)]
+            variants: Mutex::new(Vec::new()),
             #[cfg(feature = "diagnostics")]
             skipped_shader,
             used: AtomicBool::new(false),
@@ -103,6 +140,42 @@ impl Pending {
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
+    }
+
+    #[cfg(windows)]
+    fn target_variants_enabled() -> bool {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var_os("VICTORY_TARGET_VARIANTS").as_deref() != Some(std::ffi::OsStr::new("0")))
+    }
+
+    #[cfg(windows)]
+    fn variant_cell(&self, key: TargetKey) -> Option<&OnceLock<Option<HostPipeline>>> {
+        let mut variants = self.variants.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(i) = variants.iter().position(|(k, _)| *k == key) {
+            let ptr = &*variants[i].1 as *const OnceLock<Option<HostPipeline>>;
+            // SAFETY: boxed OnceLocks are never removed or moved out of the vector.
+            return Some(unsafe { &*ptr });
+        }
+        variants.push((key, Box::new(OnceLock::new())));
+        let ptr = &*variants.last().expect("just pushed").1 as *const OnceLock<Option<HostPipeline>>;
+        // SAFETY: boxed OnceLocks are never removed or moved out of the vector.
+        Some(unsafe { &*ptr })
+    }
+
+    #[cfg(windows)]
+    fn make_variant(&self, key: TargetKey) -> Option<&HostPipeline> {
+        let cell = self.variant_cell(key)?;
+        cell.get_or_init(|| {
+            let Some(g) = self.graphics.as_deref() else {
+                return self.made.get().cloned().flatten();
+            };
+            let mut state = g.clone_for_variant();
+            state.apply_target_formats(key);
+            if state.matches_target_key(&TargetKey::from_formats(&g.targets, g.depth_format)) {
+                return self.made.get().cloned().flatten();
+            }
+            HostPipeline::new(&self.shaders, Some(&state))
+        }).as_ref()
     }
 }
 
@@ -188,21 +261,49 @@ pub(crate) fn waiting() -> u64 {
     WAITING.load(Ordering::Relaxed)
 }
 
-/// The host pipeline if it is made (or is made within the frame's budget);
-/// queues it on first use.
-pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
-    // Listed for an early start in later runs from its first use, made or
-    // not: one a run never got made is the one it should start early.
+fn mark_used(p: &Pending) {
     if !p.used.swap(true, Ordering::Relaxed) {
         super::library::note_used(&p.key);
         #[cfg(feature = "diagnostics")]
         log("used", &p.key, String::new);
     }
+}
+
+/// The host pipeline if it is made (or is made within the frame's budget);
+/// queues it on first use.
+pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
+    mark_used(p);
     if p.made.get().is_none() {
         start(p, true);
         wait(p, crate::frame::current());
     }
     p.made.get()?.as_ref()
+}
+
+#[cfg(windows)]
+pub(crate) fn ready_for_targets<'a>(
+    p: &'a Arc<Pending>,
+    targets: &windows::Win32::Graphics::Direct3D12::D3D12_RT_FORMAT_ARRAY,
+    dsv_format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT,
+) -> Option<&'a HostPipeline> {
+    mark_used(p);
+    if p.made.get().is_none() {
+        start(p, true);
+        wait(p, crate::frame::current());
+    }
+    let base = p.made.get()?.as_ref()?;
+    let Some(g) = p.graphics.as_deref() else {
+        return Some(base);
+    };
+    if !Pending::target_variants_enabled() {
+        return Some(base);
+    }
+    let want = TargetKey::from_formats(targets, dsv_format);
+    let have = TargetKey::from_formats(&g.targets, g.depth_format);
+    if want == have {
+        return Some(base);
+    }
+    p.make_variant(want)
 }
 
 /// Queues `p` for the workers: once, and once more ahead of the early

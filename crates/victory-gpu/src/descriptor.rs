@@ -360,6 +360,17 @@ impl RtvRecord {
         self.host_desc(TEXTURE_2D)
     }
 
+    /// The view format as the host sees it.
+    #[cfg(windows)]
+    pub(crate) fn format(&self) -> windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT {
+        let raw = if self.described != 0 {
+            self.desc[0]
+        } else {
+            crate::resource::view_format(self.resource).unwrap_or(0)
+        };
+        windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(crate::resource::pc_format(raw) as i32)
+    }
+
     /// The description words as a host type, the format as the host has it.
     /// Without one, a typeless host copy gets a 2D view (`dimension`) in
     /// the title's format, which the host needs spelled out.

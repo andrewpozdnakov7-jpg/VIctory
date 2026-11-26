@@ -5,7 +5,7 @@
 //! user data, root views for the title's root views, static samplers for
 //! the immediate samplers, and directly indexed heaps.
 
-use std::ffi::{CStr, CString};
+use std::ffi::{CStr, CString, OsStr};
 use std::sync::Arc;
 
 use victory_shader::emit::{MEMORY_SPACE, ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
@@ -31,7 +31,7 @@ pub(crate) struct GraphicsState {
     strip_cut: D3D12_INDEX_BUFFER_STRIP_CUT_VALUE,
     pub(crate) topology: D3D12_PRIMITIVE_TOPOLOGY_TYPE,
     pub(crate) targets: D3D12_RT_FORMAT_ARRAY,
-    depth_format: DXGI_FORMAT,
+    pub(crate) depth_format: DXGI_FORMAT,
     samples: DXGI_SAMPLE_DESC,
 }
 
@@ -119,6 +119,74 @@ fn integer_format(f: DXGI_FORMAT) -> bool {
     )
 }
 
+/// Whether `VICTORY_ROOT_SRV_DIRECT` turns root SRVs and UAVs back into raw
+/// root GPU addresses. Only `1` opts out; unset, `0` and other values keep
+/// the bounded tables.
+fn root_view_direct(value: Option<&OsStr>) -> bool {
+    value.is_some_and(|v| v == "1")
+}
+
+/// The process-wide opt-out, read once.
+pub(crate) fn root_srv_direct() -> bool {
+    static DIRECT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DIRECT.get_or_init(|| {
+        root_view_direct(std::env::var_os("VICTORY_ROOT_SRV_DIRECT").as_deref())
+    })
+}
+
+/// The one descriptor of a root SRV/UAV's table: it names exactly the host
+/// resource range the title's root view leads to, so reads past it give 0.
+fn root_view_range(
+    kind: D3D12_DESCRIPTOR_RANGE_TYPE,
+    register: u32,
+    space: u32,
+) -> D3D12_DESCRIPTOR_RANGE1 {
+    D3D12_DESCRIPTOR_RANGE1 {
+        RangeType: kind,
+        NumDescriptors: 1,
+        BaseShaderRegister: register,
+        RegisterSpace: space,
+        Flags: D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE
+            | D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE,
+        OffsetInDescriptorsFromTableStart: 0,
+    }
+}
+
+/// A root SRV/UAV parameter: a bounded table unless the opt-out asks for the
+/// old raw root address. Root CBVs pass `None` and stay as they were.
+fn root_view_parameter(
+    kind: D3D12_ROOT_PARAMETER_TYPE,
+    register: u32,
+    space: u32,
+    visibility: D3D12_SHADER_VISIBILITY,
+    table: Option<&D3D12_DESCRIPTOR_RANGE1>,
+) -> D3D12_ROOT_PARAMETER1 {
+    if let Some(range) = table {
+        D3D12_ROOT_PARAMETER1 {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+            Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE1 {
+                    NumDescriptorRanges: 1,
+                    pDescriptorRanges: range,
+                },
+            },
+            ShaderVisibility: visibility,
+        }
+    } else {
+        D3D12_ROOT_PARAMETER1 {
+            ParameterType: kind,
+            Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                    ShaderRegister: register,
+                    RegisterSpace: space,
+                    Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
+                },
+            },
+            ShaderVisibility: visibility,
+        }
+    }
+}
+
 /// The title's blend state as the host takes it: blending off on integer
 /// render targets. The console ignores blending there, and titles leave it
 /// on (the world sets it on an `R8_UINT` target), but D3D12 does not allow
@@ -151,6 +219,47 @@ fn host_blend(blend: &D3D12_BLEND_DESC, targets: &D3D12_RT_FORMAT_ARRAY) -> D3D1
 }
 
 impl GraphicsState {
+    pub(crate) fn clone_for_variant(&self) -> Self {
+        let names = self.names.clone();
+        let inputs = self
+            .inputs
+            .iter()
+            .zip(&names)
+            .map(|(e, name)| D3D12_INPUT_ELEMENT_DESC {
+                SemanticName: PCSTR(name.as_ptr().cast()),
+                ..*e
+            })
+            .collect();
+        GraphicsState {
+            blend: self.blend,
+            sample_mask: self.sample_mask,
+            rasterizer: self.rasterizer,
+            depth: self.depth,
+            depth_bounds: self.depth_bounds,
+            inputs,
+            names,
+            strip_cut: self.strip_cut,
+            topology: self.topology,
+            targets: self.targets,
+            depth_format: self.depth_format,
+            samples: self.samples,
+        }
+    }
+
+    pub(crate) fn apply_target_formats(&mut self, key: super::make::TargetKey) {
+        self.targets.NumRenderTargets = key.num_render_targets.min(8);
+        self.targets.RTFormats = key.rt_formats.map(DXGI_FORMAT);
+        self.depth_format = DXGI_FORMAT(key.dsv_format);
+    }
+
+    pub(crate) fn matches_target_key(&self, key: &super::make::TargetKey) -> bool {
+        self.target_key() == *key
+    }
+
+    pub(crate) fn target_key(&self) -> super::make::TargetKey {
+        super::make::TargetKey::from_formats(&self.targets, self.depth_format)
+    }
+
     /// Takes in one subobject of a stream: its type, then its data at +4
     /// (+8 for those holding pointers).
     ///
@@ -336,6 +445,7 @@ const RECTANGLES: i32 = 19;
 const QUADS: i32 = 32;
 
 /// One stage of a host pipeline and where its bindings go.
+#[derive(Clone)]
 pub(crate) struct Stage {
     pub(crate) shader: Arc<Shader>,
     /// The root parameter of its user data, and its size in dwords.
@@ -360,6 +470,7 @@ impl Stage {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct HostPipeline {
     /// A compute pipeline (else graphics).
     pub(crate) compute: bool,
@@ -461,6 +572,10 @@ impl HostPipeline {
 
         // The root signature the translated shaders' bindings define.
         let mut params: Vec<D3D12_ROOT_PARAMETER1> = Vec::new();
+        // One range per title root view, kept at a stable address while the
+        // signature is serialized (the parameters point at them).
+        let mut ranges: Vec<Box<D3D12_DESCRIPTOR_RANGE1>> = Vec::new();
+        let direct = root_srv_direct();
         let mut samplers = Vec::new();
         let mut bound = Vec::new();
         for &(shader, visibility) in &stages {
@@ -509,17 +624,35 @@ impl HostPipeline {
             ] {
                 for &slot in slots {
                     out.push((slot, params.len() as u32));
-                    params.push(D3D12_ROOT_PARAMETER1 {
-                        ParameterType: kind,
-                        Anonymous: D3D12_ROOT_PARAMETER1_0 {
-                            Descriptor: D3D12_ROOT_DESCRIPTOR1 {
-                                ShaderRegister: u32::from(slot),
-                                RegisterSpace: ROOT_CBV_SPACE,
-                                Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
-                            },
-                        },
-                        ShaderVisibility: visibility,
-                    });
+                    let register = u32::from(slot);
+                    let table = match kind {
+                        D3D12_ROOT_PARAMETER_TYPE_SRV if !direct => {
+                            let range = Box::new(root_view_range(
+                                D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+                                register,
+                                ROOT_CBV_SPACE,
+                            ));
+                            ranges.push(range);
+                            Some(&**ranges.last().expect("a range just pushed"))
+                        }
+                        D3D12_ROOT_PARAMETER_TYPE_UAV if !direct => {
+                            let range = Box::new(root_view_range(
+                                D3D12_DESCRIPTOR_RANGE_TYPE_UAV,
+                                register,
+                                ROOT_CBV_SPACE,
+                            ));
+                            ranges.push(range);
+                            Some(&**ranges.last().expect("a range just pushed"))
+                        }
+                        _ => None,
+                    };
+                    params.push(root_view_parameter(
+                        kind,
+                        register,
+                        ROOT_CBV_SPACE,
+                        visibility,
+                        table,
+                    ));
                 }
             }
             for (used, kind, register, out) in [
@@ -984,6 +1117,7 @@ mod tests {
         t.RTFormats[1] = DXGI_FORMAT_R8_UINT;
         assert_eq!(host_blend(&blending(false), &t), blending(false));
     }
+
     fn element(format: DXGI_FORMAT, offset: u32) -> D3D12_INPUT_ELEMENT_DESC {
         D3D12_INPUT_ELEMENT_DESC {
             SemanticName: PCSTR(c"TEXCOORD".as_ptr().cast()),
@@ -1002,6 +1136,42 @@ mod tests {
             ..GraphicsState::default()
         };
         state.elements().iter().map(|e| e.offset).collect()
+    }
+
+    #[test]
+    fn integer_blend_disable_covers_signed_and_unsigned_formats() {
+        let formats = [
+            DXGI_FORMAT_R32_UINT,
+            DXGI_FORMAT_R32_SINT,
+            DXGI_FORMAT_R16G16_UINT,
+            DXGI_FORMAT_R16G16_SINT,
+            DXGI_FORMAT_R8G8B8A8_UINT,
+            DXGI_FORMAT_R8G8B8A8_SINT,
+        ];
+        for format in formats {
+            assert!(integer_format(format));
+            let host = host_blend(&blending(false), &targets(&[format]));
+            assert!(!host.RenderTarget[0].BlendEnable.as_bool());
+        }
+    }
+
+    #[test]
+    fn target_variant_key_changes_with_bound_formats() {
+        let g = GraphicsState {
+            targets: targets(&[DXGI_FORMAT_R8G8B8A8_UNORM]),
+            depth_format: DXGI_FORMAT_D32_FLOAT,
+            ..GraphicsState::default()
+        };
+        let base = g.target_key();
+        let mut variant = g.clone_for_variant();
+        variant.apply_target_formats(crate::pipeline::make::TargetKey::from_formats(
+            &targets(&[DXGI_FORMAT_R16G16B16A16_FLOAT]),
+            DXGI_FORMAT_D24_UNORM_S8_UINT,
+        ));
+        let changed = variant.target_key();
+        assert_ne!(base, changed);
+        assert_eq!(variant.targets.RTFormats[0], DXGI_FORMAT_R16G16B16A16_FLOAT);
+        assert_eq!(variant.depth_format, DXGI_FORMAT_D24_UNORM_S8_UINT);
     }
 
     /// An appended element after one of 1 or 2 bytes started right after
@@ -1041,5 +1211,81 @@ mod tests {
             element(DXGI_FORMAT_R32_FLOAT, D3D12_APPEND_ALIGNED_ELEMENT),
         ];
         let _ = offsets(&inputs);
+    }
+
+    /// A root SRV/UAV is a table of exactly one descriptor at the shader's
+    /// register: reads past the host copy's range return 0 instead of
+    /// reaching unmapped host memory.
+    #[test]
+    fn root_srvs_and_uavs_are_bounded_one_descriptor_tables() {
+        for (kind, range_kind) in [
+            (D3D12_ROOT_PARAMETER_TYPE_SRV, D3D12_DESCRIPTOR_RANGE_TYPE_SRV),
+            (D3D12_ROOT_PARAMETER_TYPE_UAV, D3D12_DESCRIPTOR_RANGE_TYPE_UAV),
+        ] {
+            let range = root_view_range(range_kind, 7, ROOT_CBV_SPACE);
+            let param = root_view_parameter(
+                kind,
+                7,
+                ROOT_CBV_SPACE,
+                D3D12_SHADER_VISIBILITY_MESH,
+                Some(&range),
+            );
+            assert_eq!(param.ParameterType, D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE);
+            assert_eq!(param.ShaderVisibility, D3D12_SHADER_VISIBILITY_MESH);
+            // SAFETY: the parameter holds the range it was made with, still
+            // alive here.
+            unsafe {
+                let table = &param.Anonymous.DescriptorTable;
+                assert_eq!(table.NumDescriptorRanges, 1);
+                assert_eq!(&*table.pDescriptorRanges, &range);
+            }
+            assert_eq!(range.RangeType, range_kind);
+            assert_eq!(range.NumDescriptors, 1);
+            assert_eq!(range.BaseShaderRegister, 7);
+            assert_eq!(range.RegisterSpace, ROOT_CBV_SPACE);
+            assert_eq!(range.OffsetInDescriptorsFromTableStart, 0);
+            assert_eq!(
+                range.Flags,
+                D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE
+                    | D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE
+            );
+        }
+    }
+
+    /// `VICTORY_ROOT_SRV_DIRECT=1` puts the raw root GPU address back;
+    /// root CBVs keep theirs either way.
+    #[test]
+    fn root_srv_direct_opt_out_keeps_raw_addresses() {
+        for kind in [D3D12_ROOT_PARAMETER_TYPE_SRV, D3D12_ROOT_PARAMETER_TYPE_UAV] {
+            let param = root_view_parameter(
+                kind,
+                9,
+                ROOT_CBV_SPACE,
+                D3D12_SHADER_VISIBILITY_ALL,
+                None,
+            );
+            assert_eq!(param.ParameterType, kind);
+            // SAFETY: the union holds the descriptor set above.
+            unsafe {
+                let descriptor = &param.Anonymous.Descriptor;
+                assert_eq!(descriptor.ShaderRegister, 9);
+                assert_eq!(descriptor.RegisterSpace, ROOT_CBV_SPACE);
+                assert_eq!(
+                    descriptor.Flags,
+                    D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE
+                );
+            }
+        }
+    }
+
+    /// Only `=1` opts out: an unset, `0` or mistyped value keeps the bounded
+    /// tables.
+    #[test]
+    fn root_srv_direct_only_for_one() {
+        assert!(!root_view_direct(None));
+        assert!(!root_view_direct(Some(OsStr::new("0"))));
+        assert!(!root_view_direct(Some(OsStr::new("true"))));
+        assert!(!root_view_direct(Some(OsStr::new("01"))));
+        assert!(root_view_direct(Some(OsStr::new("1"))));
     }
 }

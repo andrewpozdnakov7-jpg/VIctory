@@ -688,7 +688,7 @@ impl HostHeap {
     }
 
     /// A heap sync of slots `first..last`, whose records are at `start` +
-    /// index × `step`: [`HostHeap::mirror`] of each slot whose record
+    /// index Ã— `step`: [`HostHeap::mirror`] of each slot whose record
     /// differs from what the slot holds, the rest passed by as `mirror`
     /// would, with one lock of each kind for them all instead of two per slot
     /// (a world frame looks at ~700,000 slots, run perf3: ~75 ms).

@@ -256,6 +256,18 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
     make::ready(&pipeline(this).host)
 }
 
+#[cfg(windows)]
+pub(crate) fn host_pipeline_for_targets<'a>(
+    this: This,
+    targets: &windows::Win32::Graphics::Direct3D12::D3D12_RT_FORMAT_ARRAY,
+    dsv_format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT,
+) -> Option<&'a host::HostPipeline> {
+    if this.is_null() {
+        return None;
+    }
+    make::ready_for_targets(&pipeline(this).host, targets, dsv_format)
+}
+
 /// Host pipelines queued and not made yet.
 #[cfg(windows)]
 pub(crate) fn making() -> u64 {
