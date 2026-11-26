@@ -888,6 +888,13 @@ pub(crate) fn forget_read(slot: u32) {
     READS.lock().unwrap_or_else(|e| e.into_inner()).1.push(slot);
 }
 
+/// Whether heap slot `slot`'s next read is to be marked again
+/// ([`forget_read`]).
+#[cfg(test)]
+pub(crate) fn forgotten(slot: u32) -> bool {
+    READS.lock().unwrap_or_else(|e| e.into_inner()).1.contains(&slot)
+}
+
 /// After a submission: every page its shaders marked as written through
 /// views goes back ([`Shadow::copy_back_marked`]), but for pages in
 /// `withheld` (ranges of copies that lists whose writes stay out of title

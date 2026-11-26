@@ -585,6 +585,11 @@ impl HostHeap {
         self.view_addresses_with(|size| host()?.upload_buffer(size))
     }
 
+    #[cfg(test)]
+    pub(crate) fn refuse_view_address_table_for_test(&self) -> bool {
+        self.view_addresses_with(|_| None).is_none()
+    }
+
     fn view_addresses_with(
         &self,
         allocate: impl FnOnce(u64) -> Option<(ID3D12Resource, *mut u8)>,
@@ -676,7 +681,7 @@ impl HostHeap {
     /// The four dwords entered for slot `index` in the view addresses; none
     /// for a slot past the buffer (tests).
     #[cfg(test)]
-    fn words_at(&self, index: u32) -> Option<[u32; 4]> {
+    pub(crate) fn words_at(&self, index: u32) -> Option<[u32; 4]> {
         let (buffer, data, _) = self.addresses.get()?;
         // SAFETY: a live buffer.
         if 16 * u64::from(index) + 16 > unsafe { buffer.GetDesc() }.Width {
@@ -860,6 +865,7 @@ impl HostHeap {
             // memory) is made without the slot lock, which title threads
             // binding and writing views wait on (run evict5).
             drop(made);
+            let _ = crate::resource::take_refused_for_memory();
             prepare(&view);
             made = self.made.lock().unwrap_or_else(|e| e.into_inner());
             // The title may have written another record there meanwhile (and
@@ -889,6 +895,13 @@ impl HostHeap {
             self.set_mark(index, mark);
             if kept.is_none() && !self.sampler {
                 null_for(&view, self.cpu(index));
+                // Its texture is asked for again once the host may have
+                // room (`resource::Resource::host`): the slot's next read is
+                // marked again, or a slot shaders only read through the heap
+                // stayed null (its one read mark went on this null view).
+                if !later && crate::resource::take_refused_for_memory() {
+                    crate::shadow::forget_read(index);
+                }
             }
             if !self.sampler {
                 self.viewed.set(index, Some(&view), kept.is_some());
