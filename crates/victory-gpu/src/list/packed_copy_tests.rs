@@ -13,7 +13,7 @@ fn create(call: impl FnOnce(*mut This) -> HRESULT) -> IUnknown {
     unsafe { IUnknown::from_raw(object.cast_mut().cast()) }
 }
 
-fn check_packed_copy(format: u32, red: u16) {
+fn check_packed_copy(format: u32, red: u16, mip: u16) {
     let Some(host) = crate::host::host() else {
         eprintln!("skipping packed footprint copy (no D3D12 device)");
         return;
@@ -38,10 +38,10 @@ fn check_packed_copy(format: u32, red: u16) {
     };
     let desc = D3D12_RESOURCE_DESC {
         Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
-        Width: 7,
-        Height: 4,
+        Width: 7 << mip,
+        Height: 4 << mip,
         DepthOrArraySize: 1,
-        MipLevels: 1,
+        MipLevels: mip + 1,
         Format: DXGI_FORMAT(format as i32),
         SampleDesc: DXGI_SAMPLE_DESC {
             Count: 1,
@@ -66,6 +66,7 @@ fn check_packed_copy(format: u32, red: u16) {
     let native = crate::resource::host_resource(texture).expect("writable packed texture");
     // SAFETY: the live host resource and device can be queried before recording a draw.
     let host_desc = unsafe { native.GetDesc() };
+    eprintln!("guest format {format}, host format {}, mip {mip}", host_desc.Format.0);
     let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
         Format: host_desc.Format,
         ..Default::default()
@@ -128,7 +129,7 @@ fn check_packed_copy(format: u32, red: u16) {
         resource: texture,
         kind: 0,
         footprint: PlacedFootprint {
-            offset: 0,
+            offset: u64::from(mip),
             ..footprint
         },
     };
@@ -136,7 +137,19 @@ fn check_packed_copy(format: u32, red: u16) {
 
     // A render-target write checks the channel order independently of the upload conversion.
     ensure_state(list, texture, D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32);
-    let view = host.rtv(&native, None);
+    let view = host.rtv(
+        &native,
+        Some(&D3D12_RENDER_TARGET_VIEW_DESC {
+            Format: host_desc.Format,
+            ViewDimension: D3D12_RTV_DIMENSION_TEXTURE2D,
+            Anonymous: D3D12_RENDER_TARGET_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_RTV {
+                    MipSlice: u32::from(mip),
+                    PlaneSlice: 0,
+                },
+            },
+        }),
+    );
     let pixel = RECT {
         left: 3,
         top: 2,
@@ -184,10 +197,16 @@ fn check_packed_copy(format: u32, red: u16) {
 
 #[test]
 fn b5g5r5a1_partial_copy_preserves_guest_texels_and_padding() {
-    check_packed_copy(86, 0x7c00);
+    check_packed_copy(86, 0x7c00, 0);
 }
 
 #[test]
 fn b4g4r4a4_partial_copy_preserves_guest_texels_and_padding() {
-    check_packed_copy(115, 0x0f00);
+    check_packed_copy(115, 0x0f00, 0);
+}
+
+#[test]
+fn packed_partial_copy_preserves_guest_bytes_in_a_nonzero_mip() {
+    check_packed_copy(86, 0x7c00, 1);
+    check_packed_copy(115, 0x0f00, 1);
 }
