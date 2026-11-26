@@ -331,10 +331,19 @@ static BUFFERS: std::sync::Mutex<Vec<(usize, Vec<u8>, String)>> = std::sync::Mut
 /// command of `list`, whose submission dumps it again when the frame is
 /// listed).
 pub(crate) fn note_target(list: &crate::host::HostList, resource: crate::object::This) {
+    note_write(list, resource, true);
+}
+
+/// Clears write a texture directly, without the bound pipeline.
+pub(crate) fn note_clear(list: &crate::host::HostList, resource: crate::object::This) {
+    note_write(list, resource, false);
+}
+
+fn note_write(list: &crate::host::HostList, resource: crate::object::This, by_pipeline: bool) {
     if resource.is_null() || !dump_on() {
         return;
     }
-    let by = WRITER.with(|w| w.borrow().clone());
+    let by = if by_pipeline { WRITER.with(|w| w.borrow().clone()) } else { String::new() };
     // Lists are recorded ahead of the frame that submits them.
     list.note_target(resource as usize, &by);
     if !listed(crate::queue::presented() + 1) {
@@ -357,12 +366,15 @@ pub(crate) fn note_target(list: &crate::host::HostList, resource: crate::object:
             return;
         }
     }
-    let mut targets = TARGETS.lock().unwrap_or_else(|e| e.into_inner());
-    if !targets.iter().any(|(r, _, _)| *r == resource as usize)
-        && let Some(copy) = crate::resource::host_copy(resource)
-    {
-        targets.push((resource as usize, copy, by));
-    }
+    with_targets(|targets| {
+        if let Some((_, _, writer)) = targets.iter_mut().find(|(r, _, _)| *r == resource as usize) {
+            if writer.is_empty() {
+                *writer = by;
+            }
+        } else if let Some(copy) = crate::resource::host_copy(resource) {
+            targets.push((resource as usize, copy, by));
+        }
+    });
 }
 
 /// Whether textures wait to be dumped at this present.

@@ -1437,9 +1437,7 @@ impl Host {
             let mut targets: Vec<(usize, String)> = Vec::new();
             for r in runs {
                 for t in r.targets.lock().unwrap_or_else(|e| e.into_inner()).iter() {
-                    if !targets.iter().any(|x| x.0 == t.0) {
-                        targets.push(t.clone());
-                    }
+                    record_capture_target(&mut targets, t.0, &t.1);
                 }
             }
             crate::capture::dump_submission(sub, &targets);
@@ -1658,6 +1656,17 @@ impl Host {
                 .CreateDepthStencilView(resource, desc.map(|d| d as *const _), handle);
             handle
         }
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+fn record_capture_target(targets: &mut Vec<(usize, String)>, resource: usize, by: &str) {
+    if let Some((_, writer)) = targets.iter_mut().find(|(r, _)| *r == resource) {
+        if writer.is_empty() {
+            by.clone_into(writer);
+        }
+    } else {
+        targets.push((resource, by.to_owned()));
     }
 }
 
@@ -2032,9 +2041,7 @@ impl HostList {
     #[cfg(feature = "diagnostics")]
     pub(crate) fn note_target(&self, resource: usize, by: &str) {
         let mut targets = self.targets.lock().unwrap_or_else(|e| e.into_inner());
-        if !targets.iter().any(|t| t.0 == resource) {
-            targets.push((resource, by.to_owned()));
-        }
+        record_capture_target(&mut targets, resource, by);
     }
 
     /// Notes a pipeline the list binds.
