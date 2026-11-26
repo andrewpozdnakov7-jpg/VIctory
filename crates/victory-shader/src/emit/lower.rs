@@ -1496,11 +1496,41 @@ impl<'a> Lower<'a> {
             Input::GroupId(c) => return self.compute_id("groupId.i32", 94, c),
             Input::GroupInfo => return Val::Missing("the thread-group info SGPR"),
             Input::MeshGroup => {
-                let Val::I32(g) = self.compute_id("groupId.i32", 94, 0) else {
-                    unreachable!()
+                // Use an unoccupied dword in the stage's root constants.
+                // A descriptor can also use its second dword for a view offset.
+                let index = (0..64).find(|&index| {
+                    self.x.native.layout.iter().all(|p| {
+                        let start = u32::from(p.user_data);
+                        let len = if p.root == RootType::Descriptor { p.sgprs.max(2) } else { p.sgprs };
+                        index < start || index - start >= len
+                    })
+                });
+                let Some(index) = index else {
+                    return Val::Missing("a mesh group without room for its grid size");
                 };
-                let n = self.s.m.i32(self.x.mesh_stride);
-                return Val::I32(self.s.m.bin(self.s.entry, Bin::Mul, g, n));
+                let grid = self.user_at(UserData {
+                    index,
+                    slot: super::DIRECT_MESH_GRID_SLOT,
+                    root: RootType::Constants,
+                    dword: 0,
+                });
+                let [x, y, z] = [0, 1, 2].map(|axis| {
+                    let Val::I32(id) = self.compute_id("groupId.i32", 94, axis) else { unreachable!() };
+                    id
+                });
+                let c = self.s.entry;
+                let m = &mut self.s.m;
+                let (mask, shift) = (m.i32(0xffff), m.i32(16));
+                let width = m.bin(c, Bin::And, grid, mask);
+                let height = m.bin(c, Bin::LShr, grid, shift);
+                // Direct dispatch uses X fastest. A zero grid keeps the
+                // existing X-only scalar for indirect dispatches.
+                let zy = m.bin(c, Bin::Mul, z, height);
+                let yz = m.bin(c, Bin::Add, y, zy);
+                let yz = m.bin(c, Bin::Mul, yz, width);
+                let group = m.bin(c, Bin::Add, x, yz);
+                let stride = m.i32(self.x.mesh_stride);
+                return Val::I32(m.bin(c, Bin::Mul, group, stride));
             }
             Input::MergedWaveInfo => {
                 // shortcut: only the wave index (bits 24-27) is set; the

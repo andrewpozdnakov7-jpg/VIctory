@@ -930,6 +930,200 @@ mod tests {
     use super::*;
 
     #[test]
+    fn direct_mesh_visits_each_translated_group_index() {
+        use crate::object::{S_OK, This, guid, slot};
+        use victory_shader::native::{MeshIo, StageIo};
+        use victory_shader::{
+            Container, FourCC, HwStage, NativeProgram, Part, ResourceType, RootParam, RootType,
+            UsedResource, emit, io, ir, resource, structure,
+        };
+
+        const STRIDE: usize = 6;
+        const COUNTERS: usize = 24 * STRIDE;
+
+        let Some(host) = host().filter(|host| host.mesh_shaders()) else {
+            eprintln!("mesh shaders unavailable; skipped");
+            return;
+        };
+        let words = [
+            0xbe8d_0380u32, // s_mov_b32 s13, 0
+            0xf408_0206,
+            0xfa00_0000, // s_load_dwordx4 s[8:11], s[12:13], 0
+            0x7e00_0505, // v_readfirstlane_b32 s0, v5 (mesh group)
+            0x7e00_0200, // v_mov_b32 v0, s0
+            0x3400_0082, // v_lshlrev_b32 v0, 2, v0 (dword to byte)
+            0x7e02_0281, // v_mov_b32 v1, 1
+            0xe0c8_1000,
+            0x8002_0100, // buffer_atomic_add v1, v0, s[8:11], 0 offen
+            0xbf81_0000, // s_endpgm
+        ];
+        let native = NativeProgram {
+            stage: HwStage::Ms,
+            wave64: false,
+            vgprs: 6,
+            layout: vec![RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 4,
+                slot: 1,
+            }],
+            used: vec![UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 4,
+                slot: 1,
+            }],
+            io: StageIo::Ms(MeshIo {
+                outputs: vec![],
+                clip_cntl: 0,
+                threads: STRIDE as u32,
+                max_vertices: 3,
+                max_primitives: 1,
+                topology: 2,
+                lds_bytes: 0,
+            }),
+            code: words.into_iter().flat_map(u32::to_le_bytes).collect(),
+        };
+        // An original 2D group has six threads, flattened by lowering.
+        let mut psv0 = [0u8; 52];
+        psv0[..4].copy_from_slice(&48u32.to_le_bytes());
+        for (i, threads) in [2u32, 3, 1].into_iter().enumerate() {
+            psv0[40 + 4 * i..44 + 4 * i].copy_from_slice(&threads.to_le_bytes());
+        }
+        let container = Container {
+            digest: [0; 16],
+            version: (1, 0),
+            parts: vec![Part {
+                fourcc: FourCC::PSV0,
+                offset: 0,
+                data: &psv0,
+            }],
+        };
+        let program = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let structured = structure::structure(&program).unwrap();
+        let resources =
+            resource::track(&program, &native.layout, native.stage, Some(&structured)).unwrap();
+        let shader_io = io::raise(&program, &native).unwrap();
+        assert!(
+            shader_io
+                .inputs
+                .iter()
+                .any(|&(_, input)| input == io::Input::MeshGroup)
+        );
+        let shader = emit::emit(
+            &container,
+            &native,
+            &program,
+            &structured,
+            &shader_io,
+            &resources,
+        )
+        .unwrap();
+        let shader = Shader::for_test(
+            "mesh",
+            Translated {
+                host: shader,
+                used: native.used,
+            },
+        );
+
+        let null = std::ptr::null();
+        let mut graphics = GraphicsState {
+            topology: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+            ..Default::default()
+        };
+        graphics.depth.DepthEnable = false.into();
+        let mut pipeline = null;
+        assert_eq!(
+            crate::pipeline::hand_out(
+                vec![shader],
+                Some(Box::new(graphics)),
+                &crate::pipeline::PIPELINE_IIDS[0],
+                &mut pipeline,
+            ),
+            S_OK
+        );
+        let mut counts = Vec::new();
+        for [x, y, z] in [[3, 2, 4], [2, 3, 4], [3, 1, 1], [3, 0, 4]] {
+            let mut heap = null;
+            let desc: [u32; 8] = [0, 1, 1, 0, 0, 0, 0, 0];
+            let iid = ID3D12DescriptorHeap::IID;
+            let iid = guid(iid.data1, iid.data2, iid.data3, iid.data4);
+            assert_eq!(
+                crate::descriptor::create_heap(null, desc.as_ptr().cast(), &iid, &mut heap),
+                S_OK
+            );
+            let handle = crate::descriptor::heap(heap).start;
+            let output = crate::resource::test_buffer((COUNTERS * size_of::<u32>()) as u64);
+            let (out, _) = crate::resource::buffer_bytes(output).unwrap();
+            // SAFETY: the new committed buffer has space for COUNTERS dwords.
+            unsafe { out.cast::<[u32; COUNTERS]>().write([0; COUNTERS]) };
+            let raw_uav = [39, 1, 0, 0, COUNTERS as u32, 0, 0, 0, 1, 0];
+            crate::descriptor::create_uav(null, output, null, &raw_uav, handle);
+            let allocator_iid = guid(
+                0x6102dee4,
+                0xaf59,
+                0x4b09,
+                [0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24],
+            );
+            let list_iid = guid(
+                0x5b160d0f,
+                0xac1b,
+                0x4185,
+                [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55],
+            );
+            let (mut alloc, mut list) = (null, null);
+            assert_eq!(
+                crate::list::create_allocator(null, 0, &allocator_iid, &mut alloc),
+                S_OK
+            );
+            assert_eq!(
+                crate::list::create_list(null, 0, 0, alloc, null, &list_iid, &mut list),
+                S_OK
+            );
+            let table_slot = |offset| crate::list::slot_offset_for_test(list, offset);
+            slot::<extern "system" fn(This, u32, *const This)>(list, table_slot(0x100))(
+                list, 1, &heap,
+            );
+            slot::<extern "system" fn(This, This)>(list, 0xc8)(list, pipeline);
+            slot::<extern "system" fn(This, u32, u64)>(list, table_slot(0x120))(list, 1, handle);
+            slot::<extern "system" fn(This, u32, u32, u32)>(list, table_slot(0x3f8))(list, x, y, z);
+            let native = crate::list::host_list(list).unwrap();
+            assert_eq!(
+                slot::<extern "system" fn(This) -> i32>(list, 0x48)(list),
+                S_OK
+            );
+            host.execute(&[native]);
+            // SAFETY: the synchronous submission completed and the buffer is live.
+            let observed = unsafe { out.cast::<[u32; COUNTERS]>().read() };
+            for object in [list, alloc, output, heap] {
+                slot::<extern "system" fn(This) -> u32>(object, 0x10)(object);
+            }
+            let nonzero: Vec<_> =
+                observed.iter().copied().enumerate().filter(|&(_, n)| n != 0).collect();
+            println!("grid {x}x{y}x{z} nonzero counters: {nonzero:?}");
+            let mut expected = [0; COUNTERS];
+            for group in 0..(x * y * z) as usize {
+                expected[group * STRIDE] = STRIDE as u32;
+            }
+            counts.push(([x, y, z], observed, expected));
+        }
+        slot::<extern "system" fn(This) -> u32>(pipeline, 0x10)(pipeline);
+        for (grid, observed, expected) in counts {
+            assert_eq!(
+                observed, expected,
+                "translated mesh group counts for {grid:?}"
+            );
+        }
+    }
+
+    #[test]
     fn direct_mesh_dispatch_uses_all_group_counts() {
         use crate::object::{S_OK, This, guid, slot};
         use victory_shader::native::{MeshIo, StageIo};

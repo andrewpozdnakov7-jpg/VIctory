@@ -352,12 +352,17 @@ pub const ROOT_UAV_VIEW: u32 = 3;
 /// names.
 pub const ROOT_VIEW_OFFSET: u32 = 4;
 
+/// A host-filled user-data slot, outside the guest root parameter range.
+/// Its value packs the direct mesh grid's X and Y counts into two u16s.
+pub const DIRECT_MESH_GRID_SLOT: u8 = u8::MAX;
+
 /// One dword of user data and the root parameter that fills it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UserData {
     /// Dword in the user-data buffer (the console's user-data index).
     pub index: u32,
     /// Root parameter index in the title's root signature.
+    /// Or [DIRECT_MESH_GRID_SLOT] for a host-filled mesh grid.
     pub slot: u8,
     /// `Constants`, `Table` or `Descriptor` (see the module notes for the
     /// value).
