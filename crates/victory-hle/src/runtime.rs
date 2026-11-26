@@ -138,10 +138,64 @@ fn field_text(rest: &str) -> String {
     out.trim().to_owned()
 }
 
+/// One predefined entity or XML 1.0 character reference, without `&` / `;`.
+fn reference(text: &str) -> Option<char> {
+    match text {
+        "lt" => return Some('<'),
+        "gt" => return Some('>'),
+        "quot" => return Some('"'),
+        "apos" => return Some('\''),
+        "amp" => return Some('&'),
+        _ => {}
+    }
+    let number = text.strip_prefix('#')?;
+    let (digits, radix) = number
+        .strip_prefix('x')
+        .map_or((number, 10), |hex| (hex, 16));
+    if digits.is_empty()
+        || !digits.bytes().all(|b| {
+            if radix == 16 {
+                b.is_ascii_hexdigit()
+            } else {
+                b.is_ascii_digit()
+            }
+        })
+    {
+        return None;
+    }
+    let value = u32::from_str_radix(digits, radix).ok()?;
+    // XML's Char production excludes NUL, most controls and U+FFFE/U+FFFF,
+    // as well as surrogate code points and values beyond Unicode.
+    match value {
+        0x9 | 0xa | 0xd | 0x20..=0xd7ff | 0xe000..=0xfffd | 0x10000..=0x10ffff => {
+            char::from_u32(value)
+        }
+        _ => None,
+    }
+}
+
+/// Decode only references in the input, never the text they produce.
+fn decode_references(text: &str) -> String {
+    let mut parts = text.split('&');
+    let mut out = parts.next().unwrap_or_default().to_owned();
+    for part in parts {
+        if let Some((name, tail)) = part.split_once(';')
+            && let Some(ch) = reference(name)
+        {
+            out.push(ch);
+            out.push_str(tail);
+        } else {
+            out.push('&');
+            out.push_str(part);
+        }
+    }
+    out
+}
+
 /// Each element of an XML text as its path from the root (`Game/TitleId`)
-/// and its trimmed text up to the first child, the predefined entities
-/// decoded; comments, CDATA sections, declarations and attributes are
-/// skipped.
+/// and its trimmed text up to the first child, with predefined entities and
+/// character references decoded; comments, CDATA sections, declarations and
+/// attributes are skipped.
 fn elements(text: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
     let mut path: Vec<&str> = Vec::new();
@@ -174,10 +228,7 @@ fn elements(text: &str) -> Vec<(String, String)> {
             .next()
             .unwrap_or("");
         path.push(name);
-        let body = field_text(rest);
-        let body = [("&lt;", "<"), ("&gt;", ">"), ("&quot;", "\""), ("&apos;", "'"), ("&amp;", "&")]
-            .iter()
-            .fold(body, |b, (entity, c)| b.replace(entity, c));
+        let body = decode_references(&field_text(rest)).trim().to_owned();
         out.push((path.join("/"), body));
         if closed {
             path.pop();
@@ -285,5 +336,80 @@ mod tests {
         assert_eq!(t.id, 0x639A_A8DD);
         assert_eq!(t.store_id, "9&C");
         assert_eq!(t.storage_bytes, 1024 << 20);
+    }
+
+    #[test]
+    fn numeric_references_preserve_manifest_fields() {
+        let plain = Title::from_manifest(
+            "<Game><TitleId>0012ABCD</TitleId><StoreId>store&amp;Ω🙂</StoreId>\
+             <PersistentLocalStorage><SizeMB>2</SizeMB></PersistentLocalStorage></Game>",
+        );
+        let encoded = Title::from_manifest(
+            "<Game><TitleId>&#32;&#48;&#x30;12ABCD&#x20;</TitleId>\
+             <StoreId>store&#38;&#x3A9;&#128578;</StoreId>\
+             <PersistentLocalStorage><SizeMB>&#x9;&#50;<!-- quota -->&#10;</SizeMB>\
+             </PersistentLocalStorage></Game>",
+        );
+        assert_eq!(plain.id, 0x0012_ABCD);
+        assert_eq!(plain.storage_bytes, 2 << 20);
+        assert_eq!(encoded, plain);
+    }
+
+    #[test]
+    fn manifest_references_are_decoded_once() {
+        let title = Title::from_manifest(
+            "<Game><StoreId>&amp;#65; &#38;lt; &#x26;amp; &#60;child&#62; \
+             &lt;&gt;&amp;&quot;&apos;</StoreId></Game>",
+        );
+        assert_eq!(title.store_id, "&#65; &lt; &amp; <child> <>&\"'");
+    }
+
+    #[test]
+    fn invalid_manifest_references_stay_literal() {
+        for reference in [
+            "&#;",
+            "&#x;",
+            "&#X41;",
+            "&#+65;",
+            "&#x+41;",
+            "&#-1;",
+            "&# 65;",
+            "&#x1_0;",
+            "&#0;",
+            "&#1;",
+            "&#xD800;",
+            "&#xDFFF;",
+            "&#xFFFE;",
+            "&#xFFFF;",
+            "&#x110000;",
+            "&#4294967296;",
+            "&#99999999999999999999;",
+            "&#65",
+            "&unknown;",
+            "&;",
+            "&",
+        ] {
+            let manifest = format!("<Game><StoreId>before{reference}after&amp;</StoreId></Game>");
+            assert_eq!(
+                Title::from_manifest(&manifest).store_id,
+                format!("before{reference}after&"),
+                "{reference}"
+            );
+        }
+    }
+
+    #[test]
+    fn xml_character_reference_boundaries() {
+        for value in [
+            0x9, 0xa, 0xd, 0x20, 0xd7ff, 0xe000, 0xfffd, 0x10000, 0x10ffff,
+        ] {
+            let manifest = format!("<Game><StoreId>x&#{value};&#x{value:X};y</StoreId></Game>");
+            let ch = char::from_u32(value).unwrap();
+            assert_eq!(
+                Title::from_manifest(&manifest).store_id,
+                format!("x{ch}{ch}y"),
+                "U+{value:04X}"
+            );
+        }
     }
 }
