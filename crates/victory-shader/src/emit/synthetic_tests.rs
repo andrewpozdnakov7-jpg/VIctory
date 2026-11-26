@@ -429,6 +429,71 @@ fn run_permute_cs(wave64: bool, body: &[u32], want: &[u32]) {
 }
 
 #[test]
+#[ignore = "requires app-local WARP supporting SM 6.6 and fixed wave sizes"]
+fn console_wave64_readlane_can_read_either_half() {
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let host = Host::new(true).expect("SM 6.6 WARP host");
+    let mut validator = validator::Validator::load(validator::Validator::default_path().as_deref())
+        .expect("DXIL validator");
+    let views = [
+        View::Texture(1, 1, &[[0.0; 4]]),
+        View::Buffer {
+            data: &[0; 4],
+            stride: Stride::Structured(16),
+        },
+        View::RawUav(64),
+    ];
+
+    let mut counts = Vec::new();
+    for lane in [8u32, 40] {
+        let shader = build_wave(
+            &[
+                0xBE84_0300, // s_mov_b32 s4, s0
+                0xBE85_0380, // s_mov_b32 s5, 0
+                0xF408_0A02,
+                0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+                0xD760_000C, // v_readlane_b32 s12, v0, lane
+                ((128 + lane) << 9) | 256,
+                0x7E06_020C, // v_mov_b32 v3, s12
+                0x3420_0082, // v_lshlrev_b32 v16, 2, v0
+                0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+                0xE070_1000,
+                0x800A_0310, // buffer_store_dword v3, v16, s[40:43], 0 offen
+                0xBF81_0000, // s_endpgm
+            ],
+            true,
+        )
+        .expect("lower one 64-lane console wave");
+        validator.validate(&mut shader.dxil.clone()).expect("valid DXIL");
+        let (root, pso) = host.compute_pipeline(&shader).expect("native compute pipeline");
+        let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        let results = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &views,
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .expect("dispatch and readback");
+        let read = &results[0];
+        assert_eq!(read.len(), 64);
+        let correct = read.iter().filter(|&&value| value == lane).count();
+        println!(
+            "lane {lane}: lower first {}, upper first {}, correct {correct}/64",
+            read[0], read[32],
+        );
+        counts.push(correct);
+    }
+    assert_eq!(counts, [64, 64]);
+}
+
+#[test]
 fn permutes_mask_high_address_bits_and_divergent_branches() {
     // High byte-address bits (0x100) and sub-dword bits (+3) are ignored, so
     // only bits 6:2 select the source lane. Lanes 16..31 skip the permute via
