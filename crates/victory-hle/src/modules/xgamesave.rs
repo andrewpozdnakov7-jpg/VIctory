@@ -8,7 +8,7 @@
 //! from the previous version), flushed to disk, and one directory rename
 //! commits it (`v<N>`); the highest committed version is the container.
 //! A crash leaves the old version or the new one, never a mix; leftovers
-//! are removed on sight. Deleting a container renames it away first.
+//! are cleaned up when possible. Deleting a container renames it away first.
 //!
 //! Names are exact: a version's `manifest` holds the container's name, its
 //! display name and the blob names (blob `i` is the file `i`), so case,
@@ -202,8 +202,8 @@ fn load(dir: &Path) -> std::io::Result<Option<(String, String, Vec<String>)>> {
     Ok(Some((name, display, blobs)))
 }
 
-/// The container's newest readable committed version, if any. Removes what
-/// a crash left: unfinished versions, and versions older than that one.
+/// The container's newest readable committed version, if any. Tries to
+/// remove unfinished versions and versions older than that one.
 /// An unreadable newer folder (a stray, or a broken manifest) is neither
 /// taken nor removed, and never costs the version below it.
 fn current(dir: &Path) -> std::io::Result<Option<Version>> {
@@ -213,7 +213,10 @@ fn current(dir: &Path) -> std::io::Result<Option<Version>> {
         let file = entry.file_name();
         let file = file.to_string_lossy();
         if file.ends_with(".new") {
-            std::fs::remove_dir_all(entry.path())?;
+            let staged = entry.path();
+            if let Err(e) = std::fs::remove_dir_all(&staged) {
+                tracing::warn!(dir = %staged.display(), %e, "could not remove unfinished save version");
+            }
         } else if let Some(n) = version_number(&file) {
             highest = highest.max(n);
             if entry.file_type().is_ok_and(|t| t.is_dir()) {
@@ -231,7 +234,10 @@ fn current(dir: &Path) -> std::io::Result<Option<Version>> {
             continue;
         };
         for old in &committed[at + 1..] {
-            std::fs::remove_dir_all(dir.join(format!("v{old}")))?;
+            let old = dir.join(format!("v{old}"));
+            if let Err(e) = std::fs::remove_dir_all(&old) {
+                tracing::warn!(dir = %old.display(), %e, "could not remove old save version");
+            }
         }
         return Ok(Some(Version {
             dir: version,
@@ -270,19 +276,31 @@ enum Source<'a> {
     Kept(PathBuf),
 }
 
-/// Writes version `number` of the container in `dir` and commits it.
+/// Writes and commits the first available version at or above `number`.
 fn commit(
     dir: &Path,
-    number: u64,
+    mut number: u64,
     name: &str,
     display: &str,
     blobs: &[(&str, Source<'_>)],
 ) -> std::io::Result<()> {
-    let staged = dir.join(format!("v{number}.new"));
-    if staged.exists() {
-        std::fs::remove_dir_all(&staged)?;
-    }
-    std::fs::create_dir_all(&staged)?;
+    std::fs::create_dir_all(dir)?;
+    let (staged, version) = loop {
+        let version = dir.join(format!("v{number}"));
+        let staged = dir.join(format!("v{number}.new"));
+        if !version.try_exists()? {
+            match std::fs::create_dir(&staged) {
+                Ok(()) => break (staged, version),
+                // A previous update may have left a staging directory that
+                // current() could not remove. Leave it for the next cleanup.
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(e),
+            }
+        }
+        number = number
+            .checked_add(1)
+            .ok_or_else(|| std::io::Error::other("save version numbers exhausted"))?;
+    };
     let write = |path: PathBuf, data: &[u8]| -> std::io::Result<()> {
         let mut file = std::fs::File::create(path)?;
         file.write_all(data)?;
@@ -302,7 +320,7 @@ fn commit(
     let names: Vec<&str> = blobs.iter().map(|(n, _)| *n).collect();
     write(staged.join(MANIFEST), &manifest(name, display, &names))?;
     step();
-    std::fs::rename(&staged, dir.join(format!("v{number}")))?;
+    std::fs::rename(&staged, version)?;
     step();
     Ok(())
 }
@@ -547,7 +565,12 @@ impl Update {
         }
         let display = self.display.as_deref();
         let display = display.or(current.as_ref().map(|v| v.display.as_str()));
-        let number = current.as_ref().map_or(1, |v| v.highest + 1);
+        let Some(number) = current
+            .as_ref()
+            .map_or(Some(1), |v| v.highest.checked_add(1))
+        else {
+            return NO_ACCESS;
+        };
         if let Err(e) = commit(&self.dir, number, &self.name, display.unwrap_or(""), &blobs) {
             return io_error(&self.dir, &e);
         }
@@ -1149,6 +1172,80 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn a_locked_old_version_does_not_block_reads_or_updates() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let slot = container_dir(root, "Slot");
+        assert_eq!(update(root, "one", &[("a", Some("old a"))]), S_OK);
+        // Leave v1 behind as if the process stopped just after committing v2.
+        commit(&slot, 2, "Slot", "two", &[("a", Source::Data(b"new a"))]).unwrap();
+        let old = slot.join("v1");
+        let locked = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(old.join("0"))
+            .unwrap();
+
+        assert_eq!(
+            state(root),
+            Some(("two".into(), vec![("a".into(), "new a".into())]))
+        );
+        assert!(old.is_dir());
+
+        assert_eq!(update(root, "three", &[("a", Some("newest a"))]), S_OK);
+        let latest = Some(("three".into(), vec![("a".into(), "newest a".into())]));
+        assert_eq!(state(root), latest);
+        assert!(slot.join("v3").is_dir());
+        assert!(old.is_dir());
+
+        drop(locked);
+        assert_eq!(state(root), latest);
+        assert!(!old.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_locked_unfinished_version_does_not_block_reads_or_updates() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let slot = container_dir(root, "Slot");
+        assert_eq!(
+            update(root, "one", &[("a", Some("old a")), ("b", Some("old b"))]),
+            S_OK
+        );
+        let staged = slot.join("v2.new");
+        std::fs::create_dir(&staged).unwrap();
+        let blob = staged.join("0");
+        std::fs::write(&blob, b"unfinished").unwrap();
+        let locked = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(blob)
+            .unwrap();
+
+        assert_eq!(state(root), old_state());
+        assert!(staged.is_dir());
+
+        assert_eq!(update(root, "two", &[("a", Some("new a"))]), S_OK);
+        let latest = Some((
+            "two".into(),
+            vec![("a".into(), "new a".into()), ("b".into(), "old b".into())],
+        ));
+        assert_eq!(state(root), latest);
+        assert!(slot.join("v3").is_dir());
+        assert!(staged.is_dir());
+
+        drop(locked);
+        assert_eq!(state(root), latest);
+        assert!(!staged.exists());
+    }
+
     /// A kept blob that cannot be hard-linked (NTFS allows 1024 links to a
     /// file) is copied into the new version with its exact bytes.
     #[cfg(windows)]
@@ -1317,6 +1414,76 @@ mod tests {
             let v = current_named(&c.dir, "Player").unwrap().unwrap();
             assert_eq!(v.display, "Chapter 1", "{locked}");
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_locked_first_staging_dir_does_not_block_complete_migration() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let saves = tempfile::tempdir().unwrap();
+        let root = saves
+            .path()
+            .join(format!("{:016X}", xuser::XUID))
+            .join("scid");
+        let old = root.join("Slot");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join(".display"), b"Legacy display").unwrap();
+        std::fs::write(old.join("a"), b"legacy a").unwrap();
+        std::fs::write(old.join("b"), b"legacy b").unwrap();
+
+        let slot = container_dir(&root, "Slot");
+        let staging = slot.join("v1.new");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(staging.join("0"), b"unfinished").unwrap();
+        let deny_share = |path| {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(0)
+                .open(path)
+                .unwrap()
+        };
+        let staged_blob = deny_share(staging.join("0"));
+        let old_blob = deny_share(old.join("b"));
+
+        let _provider = Provider::open(saves.path(), Some("scid")).unwrap();
+        assert!(old.is_dir());
+        assert!(current_named(&slot, "Slot").unwrap().is_none());
+
+        drop(old_blob);
+        let provider = Provider::open(saves.path(), Some("scid")).unwrap();
+        assert!(!old.exists(), "readable legacy save should migrate");
+        assert!(
+            staging.is_dir(),
+            "unwritable staging directory is left for later"
+        );
+        assert!(slot.join("v2").is_dir());
+        assert_eq!(
+            state(&provider.root),
+            Some((
+                "Legacy display".into(),
+                vec![
+                    ("a".into(), "legacy a".into()),
+                    ("b".into(), "legacy b".into())
+                ]
+            ))
+        );
+
+        assert_eq!(
+            update(&provider.root, "Updated display", &[("a", Some("new a"))]),
+            S_OK
+        );
+        let latest = Some((
+            "Updated display".into(),
+            vec![
+                ("a".into(), "new a".into()),
+                ("b".into(), "legacy b".into()),
+            ],
+        ));
+        assert_eq!(state(&provider.root), latest);
+        drop(staged_blob);
+        assert_eq!(state(&provider.root), latest);
+        assert!(!staging.exists());
     }
 
     /// An empty configuration id names none. As a folder name it would be
