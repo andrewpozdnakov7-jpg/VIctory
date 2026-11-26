@@ -408,42 +408,30 @@ pub(crate) fn save(now: bool) {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
     let (Some(dir), Some(libraries)) = (DIR.get(), libraries()) else { return };
-    {
-        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
-        if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
-            return;
+    // Serialize saves through publication and acknowledgement. A periodic
+    // save can skip a busy writer. A shutdown save waits and takes a new snapshot.
+    let mut last = if now {
+        LAST.lock().unwrap_or_else(|e| e.into_inner())
+    } else {
+        match LAST.try_lock() {
+            Ok(last) => last,
+            Err(std::sync::TryLockError::WouldBlock) => return,
+            Err(std::sync::TryLockError::Poisoned(last)) => last.into_inner(),
         }
-        *last = Some(std::time::Instant::now());
+    };
+    if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
+        return;
     }
+    *last = Some(std::time::Instant::now());
     let _ = std::fs::create_dir_all(dir);
     let early_changed = USED_CHANGED.swap(false, Ordering::Relaxed);
     let mut files = 0;
     let mut bytes = 0;
     for (at, shared) in libraries.iter().enumerate() {
-        if !shared.state.lock().unwrap_or_else(|e| e.into_inner()).dirty() {
-            continue;
+        if let Some(size) = save_shard(dir, at, shared, write_atomically) {
+            files += 1;
+            bytes += size;
         }
-        // Serialised under the lock (a store into the shard must not land in
-        // a blob that is already taken), written without it.
-        let Some((blob, prebuilt)) = serialise(shared) else {
-            continue;
-        };
-        let written = write_atomically(&dir.join(shard_file(at)), &blob).and_then(|()| match &prebuilt {
-            Some(list) => write_atomically(&dir.join(prebuilt_file(at)), list.as_bytes()),
-            None => Ok(()),
-        });
-        if let Err(e) = written {
-            // Left dirty: the next save writes it.
-            tracing::warn!(error = %e, shard = at, "a host pipeline library shard not saved");
-            continue;
-        }
-        {
-            let mut l = shared.state.lock().unwrap_or_else(|e| e.into_inner());
-            l.added = 0;
-            l.prebuilt_changed = false;
-        }
-        files += 1;
-        bytes += blob.len();
     }
     let used = used().as_ref().map(Used::list).unwrap_or_default();
     if (early_changed || now)
@@ -471,10 +459,43 @@ pub(crate) fn save(now: bool) {
     );
 }
 
+fn save_shard(
+    dir: &std::path::Path,
+    at: usize,
+    shared: &Shared,
+    write: impl Fn(&std::path::Path, &[u8]) -> std::io::Result<()>,
+) -> Option<usize> {
+    // Take a snapshot with the state locked, then release it for file I/O.
+    let ShardSnapshot { blob, prebuilt, added, prebuilt_count } = serialise(shared)?;
+    let written = write(&dir.join(shard_file(at)), &blob).and_then(|()| match &prebuilt {
+        Some(list) => write(&dir.join(prebuilt_file(at)), list.as_bytes()),
+        None => Ok(()),
+    });
+    if let Err(e) = written {
+        tracing::warn!(error = %e, shard = at, "a host pipeline library shard not saved");
+        return None;
+    }
+    // Acknowledge the snapshot only after both files have been published.
+    let mut l = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+    l.added -= added;
+    l.prebuilt_changed = l.prebuilt.len() != prebuilt_count;
+    Some(blob.len())
+}
+
+struct ShardSnapshot {
+    blob: Vec<u8>,
+    prebuilt: Option<String>,
+    added: u64,
+    prebuilt_count: usize,
+}
+
 /// `shared`'s library as bytes with the pre-build's list for them: `None` if
 /// the host cannot serialise it now (it stays dirty for the next save).
-fn serialise(shared: &Shared) -> Option<(Vec<u8>, Option<String>)> {
+fn serialise(shared: &Shared) -> Option<ShardSnapshot> {
     let l = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+    if !l.dirty() {
+        return None;
+    }
     // SAFETY: a plain size query on a live library.
     let size = unsafe { l.library.GetSerializedSize() };
     let Some(mut bytes) = zeroed(size) else {
@@ -487,7 +508,7 @@ fn serialise(shared: &Shared) -> Option<(Vec<u8>, Option<String>)> {
         return None;
     }
     let prebuilt = (!l.prebuilt.is_empty()).then(|| list(&tag(&bytes), &l.prebuilt));
-    Some((bytes, prebuilt))
+    Some(ShardSnapshot { blob: bytes, prebuilt, added: l.added, prebuilt_count: l.prebuilt.len() })
 }
 
 /// `n` zero bytes, or `None` when the host has no memory for them. The
@@ -925,6 +946,140 @@ mod tests {
             drop(saving);
             assert_eq!(loaded, Ok(true), "the load waited for the save");
         });
+    }
+
+    #[test]
+    fn pipelines_and_prebuilt_keys_added_during_publication_are_saved_next_time() {
+        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+        use windows::core::s;
+
+        let Some(device) = crate::host::host().and_then(|h| h.device.cast::<ID3D12Device1>().ok())
+        else {
+            return;
+        };
+        let source = br#"
+[RootSignature("UAV(u0)")]
+[numthreads(1, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {}
+"#;
+        let mut code = None;
+        // SAFETY: the source and entry point live across the compiler call.
+        unsafe {
+            D3DCompile(
+                source.as_ptr().cast(),
+                source.len(),
+                None,
+                None,
+                None,
+                s!("main"),
+                s!("cs_5_1"),
+                0,
+                0,
+                &mut code,
+                None,
+            )
+        }
+        .expect("compile the synthetic compute shader");
+        let code = code.unwrap();
+        // SAFETY: the compiled blob lives through root-signature and PSO creation.
+        let (root, bytecode) = unsafe {
+            let bytes =
+                std::slice::from_raw_parts(code.GetBufferPointer().cast(), code.GetBufferSize());
+            (
+                device
+                    .CreateRootSignature::<ID3D12RootSignature>(0, bytes)
+                    .unwrap(),
+                bytes,
+            )
+        };
+        let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+            // SAFETY: `root` outlives the description's users.
+            pRootSignature: unsafe { std::mem::transmute_copy(&root) },
+            CS: D3D12_SHADER_BYTECODE {
+                pShaderBytecode: bytecode.as_ptr().cast(),
+                BytecodeLength: bytecode.len(),
+            },
+            ..Default::default()
+        };
+        // SAFETY: the description holds a live signature and shader blob.
+        let pipeline: ID3D12PipelineState =
+            unsafe { device.CreateComputePipelineState(&desc) }.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let shared = shard(&device, Vec::new(), None).expect("an empty native library");
+        let at = 0;
+        let blob_path = dir.path().join(shard_file(at));
+        let sidecar_path = dir.path().join(prebuilt_file(at));
+        let store = |key: &str| {
+            let mut l = shared.state.lock().unwrap();
+            // SAFETY: the pipeline and unique name are live.
+            unsafe { l.library.StorePipeline(&HSTRING::from(key), &pipeline) }.unwrap();
+            l.added += 1;
+            l.prebuilt_changed |= l.prebuilt.insert(key.to_owned());
+        };
+        let published = || {
+            let blob = std::fs::read(&blob_path).unwrap();
+            let sidecar = std::fs::read(&sidecar_path).unwrap();
+            let reopened = shard(&device, blob, Some(sidecar)).expect("published shard");
+            assert!(
+                !reopened.state.lock().unwrap()._blob.is_empty(),
+                "host accepted the published blob"
+            );
+            let loaded = |key| {
+                // SAFETY: the library and matching description are live.
+                unsafe {
+                    reopened
+                        .loads
+                        .LoadComputePipeline::<_, ID3D12PipelineState>(&HSTRING::from(key), &desc)
+                }
+                .is_ok()
+            };
+            let keys = reopened.state.lock().unwrap().prebuilt.clone();
+            (loaded("before"), loaded("during"), keys)
+        };
+
+        store("before");
+        assert!(
+            save_shard(dir.path(), at, &shared, |path, bytes| {
+                if path == blob_path {
+                    // The writer has captured its snapshot and released the state lock.
+                    store("during");
+                }
+                write_atomically(path, bytes)
+            })
+            .is_some()
+        );
+        let first = published();
+        assert_eq!(first, (true, false, HashSet::from(["before".to_owned()])));
+        let pending = {
+            let l = shared.state.lock().unwrap();
+            (l.added, l.prebuilt_changed)
+        };
+        println!(
+            "first save: loaded before={}, during={}; pending stores={}, prebuilt dirty={}",
+            first.0, first.1, pending.0, pending.1
+        );
+
+        let second = save_shard(dir.path(), at, &shared, write_atomically);
+        println!("second save wrote shard: {}", second.is_some());
+        assert!(
+            second.is_some(),
+            "a pipeline stored during publication still needs saving"
+        );
+        assert_eq!(pending, (1, true));
+        let second = published();
+        assert_eq!(
+            second,
+            (
+                true,
+                true,
+                HashSet::from(["before".to_owned(), "during".to_owned()])
+            )
+        );
+        println!(
+            "reopened second save: loaded before={}, during={}, sidecar contains both keys",
+            second.0, second.1
+        );
+        assert!(save_shard(dir.path(), at, &shared, write_atomically).is_none());
     }
 
     #[test]
