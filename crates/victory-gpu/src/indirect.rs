@@ -255,10 +255,11 @@ pub(crate) fn bound(list: &HostList, gpu: u64, (kind, stride, records): (u32, u3
         l.SetComputeRootUnorderedAccessView(3, out.GetGPUVirtualAddress());
         // One group walks every record.
         l.Dispatch(records.min(1), 1, 1);
-        l.ResourceBarrier(&[
-            uav_barrier(),
-            transition(&out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT),
-        ]);
+        l.ResourceBarrier(&[transition(
+            &out,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+        )]);
     }
     Some(out)
 }
@@ -609,6 +610,28 @@ mod tests {
         assert!(super::clamp().is_some());
     }
 
+    /// Reads a finished argument buffer. Buffers in the DEFAULT heap
+    /// need a readback copy instead of a CPU mapping.
+    fn read_argument_words(
+        host: &crate::host::Host,
+        source: &super::ID3D12Resource,
+        words: usize,
+    ) -> Vec<u32> {
+        if words == 0 {
+            return Vec::new();
+        }
+        let bytes = words as u64 * 4;
+        let list = host.new_list().unwrap();
+        let (readback, mapped) = list.readback(host, bytes).unwrap();
+        // SAFETY: the source is COMMON and will promote to COPY_SOURCE.
+        // The readback buffer is COPY_DEST and covers the requested range.
+        unsafe { list.list.CopyBufferRegion(&readback, 0, source, 0, bytes) };
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: the copy finished and the mapping holds `words` dwords.
+        unsafe { std::slice::from_raw_parts(mapped.cast::<u32>(), words).to_vec() }
+    }
+
     /// The first word of each clamped record (zero when it runs empty).
     fn clamped(kind: u32, words: &[u32], records: u32, calls: u32) -> Option<Vec<u32>> {
         clamped_words(kind, words, records, calls, 1)
@@ -653,12 +676,13 @@ mod tests {
             for at in 0..all {
                 assert_eq!(data.add(at).read_volatile(), words[at % words.len()], "the title's copy as written");
             }
-            let mut out_data = std::ptr::null_mut();
-            out?.Map(0, None, Some(&mut out_data)).unwrap();
+            let data = read_argument_words(host, &out?, records as usize * per);
             assert!(fields <= per);
-            let indices = (0..records as usize)
-                .flat_map(|record| (0..fields).map(move |field| record * per + field));
-            Some(indices.map(|i| out_data.cast::<u32>().add(i).read_volatile()).collect())
+            Some(
+                data.chunks_exact(per)
+                    .flat_map(|record| record[..fields].iter().copied())
+                    .collect(),
+            )
         }
     }
 
@@ -764,13 +788,7 @@ mod tests {
             assert!(run.iter().all(|t| t.0 != key(&title)), "the title's copy is never transitioned");
             assert!(states.values().all(|&s| s == 0), "all common again");
             for (out, _) in &recorded {
-                let mut p = std::ptr::null_mut();
-                // SAFETY: a mapped buffer of ours, the lists have run.
-                let clamped = unsafe {
-                    out.Map(0, None, Some(&mut p)).unwrap();
-                    p.cast::<[u32; 3]>().read_volatile()
-                };
-                assert_eq!(clamped, [65_535, 1, 1]);
+                assert_eq!(read_argument_words(host, out, 3), [65_535, 1, 1]);
             }
             // SAFETY: as above.
             assert_eq!(unsafe { data.cast::<[u32; 3]>().read_volatile() }, [70_000, 1, 1], "the title's copy as written");
@@ -1104,13 +1122,7 @@ void main() { title.Store(at, value); }
         replay(&run, &mut states).unwrap();
         assert!(states.values().all(|&s| s == 0), "all common again");
         for (out, _) in &recorded {
-            let mut p = std::ptr::null_mut();
-            // SAFETY: a mapped buffer of ours, the lists have run.
-            let clamped = unsafe {
-                out.Map(0, None, Some(&mut p)).unwrap();
-                p.cast::<[u32; 6]>().read_volatile()
-            };
-            assert_eq!(clamped, [3, 1, 1, 4, 1, 1]);
+            assert_eq!(read_argument_words(host, out, 6), [3, 1, 1, 4, 1, 1]);
         }
     }
 

@@ -488,7 +488,7 @@ impl Shadow {
     // shortcut: a page the title wrote that was not armed (a write through
     // the heap's views no list declared) keeps the title's bytes, losing
     // the shaders' there (counted).
-    pub(crate) fn copy_back_marked(&self, page: usize) -> usize {
+    fn copy_back_marked(&self, page: usize, title_buf: &mut [u8], synced: &mut Vec<usize>) -> usize {
         let Some(t) = &self.tracked else {
             return 0;
         };
@@ -508,17 +508,17 @@ impl Shadow {
         let n = to - from;
         // SAFETY: inside the mapping; only the submitting thread writes it.
         let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(from - start), n) };
-        let mut title = vec![0u8; n];
-        if !crate::host::read_into(from as *const u8, &mut title) {
+        let title = &mut title_buf[..n];
+        if !crate::host::read_into(from as *const u8, title) {
             return 0;
         }
         let written = match &saved {
             // The title's bytes are the copy's from before: what differs is
             // the shaders'.
-            None => (*host != title[..]).then_some(host.as_ptr()),
+            None => (*host != *title).then_some(host.as_ptr()),
             Some(before) => {
                 let before = &before[from - page..to - page];
-                merge_writeback(&mut title, host, before).then_some(title.as_ptr())
+                merge_writeback(title, host, before).then_some(title.as_ptr())
             }
         };
         if let Some(bytes) = written {
@@ -527,7 +527,7 @@ impl Shadow {
         }
         // Equal to title memory now: taken, unless it holds the page in part.
         if from == page && to == page + PAGE {
-            t.taken(&[page / PAGE]);
+            synced.push(page / PAGE);
         }
         written.map_or(0, |_| n)
     }
@@ -946,6 +946,9 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
         let m = marks();
         marked.iter().filter_map(|&n| page_of(&m, n)).collect()
     };
+    let mut title = pooled(PAGE);
+    title.resize(PAGE, 0);
+    let mut synced: Option<(Arc<Shadow>, Vec<usize>)> = None;
     for (copy, page) in pages {
         if withheld
             .iter()
@@ -953,7 +956,19 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
         {
             continue;
         }
-        let written = copy.copy_back_marked(page);
+        let take = match &mut synced {
+            Some((prev, list)) if Arc::ptr_eq(prev, &copy) => list,
+            slot => {
+                if let Some((prev, list)) = slot.take()
+                    && !list.is_empty()
+                    && let Some(t) = &prev.tracked
+                {
+                    t.taken(&list);
+                }
+                &mut slot.insert((copy.clone(), Vec::new())).1
+            }
+        };
+        let written = copy.copy_back_marked(page, &mut title, take);
         #[cfg(feature = "diagnostics")]
         {
             crate::copystat::add(crate::copystat::C::MarkedPages, 1);
@@ -962,6 +977,13 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
         #[cfg(not(feature = "diagnostics"))]
         let _ = written;
     }
+    if let Some((prev, list)) = synced
+        && !list.is_empty()
+        && let Some(t) = &prev.tracked
+    {
+        t.taken(&list);
+    }
+    give_back(title);
 }
 
 struct Entry {
@@ -1629,8 +1651,12 @@ pub(crate) mod tests {
         copy.write_host((p + PAGE + 10) as u64, &[0xbb]);
         write(20, 0x66);
         write(PAGE + 20, 0x77);
-        copy.copy_back_marked(p);
-        copy.copy_back_marked(p + PAGE);
+        let (mut buf, mut synced) = (vec![0u8; PAGE], Vec::new());
+        copy.copy_back_marked(p, &mut buf, &mut synced);
+        copy.copy_back_marked(p + PAGE, &mut buf, &mut synced);
+        if let Some(t) = &copy.tracked {
+            t.taken(&synced);
+        }
         // SAFETY: bytes of our pool.
         let read = |at: usize| unsafe { ((p + at) as *const u8).read_volatile() };
         assert_eq!(
