@@ -2311,10 +2311,13 @@ impl<'a> Lower<'a> {
     /// exact product in f32. TwoSum recovers the error in the f32 sum to
     /// resolve f16 midpoints or correct the direction of truncation.
     fn fma_f16(&mut self, a: V, b: V, addend: V, clamp: bool) -> V {
+        // A finite half product is exact in f32, so using the f32 FMad
+        // for the sum gives the same rounded value. It also keeps the
+        // sum on the original FMAC lowering for non-finite operands.
+        let sum = self.fmad(a, b, addend);
         let c = self.cur;
         let m = &mut self.s.m;
         let product = m.bin(c, Bin::Mul, a, b);
-        let sum = m.bin(c, Bin::Add, product, addend);
         let addend_hi = m.bin(c, Bin::Sub, sum, product);
         let product_hi = m.bin(c, Bin::Sub, sum, addend_hi);
         let product_lo = m.bin(c, Bin::Sub, product, product_hi);

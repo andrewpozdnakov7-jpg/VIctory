@@ -716,6 +716,13 @@ fn half_fused_nonfinite_results_survive_rounding() {
         ([0x3c00, 0x3c00, 0xfc00, 0], 0xfc00),  // 1 - inf
         ([0x7c00, 0x3c00, 0xfc00, 0], F16_NAN), // inf - inf
         ([0x7c00, 0, 0x3c00, 0], F16_NAN),      // inf * 0
+        ([0x7e00_0001, 0xfc00_fc00, 0x5640_5152, 0], 0xfc00), // RX 7900 XTX report
+        ([0x8001, 0x7c00, 0x3c00, 0], 0xfc00),               // -min subnormal * +inf
+        ([0x7c00, 0x03ff, 0x3c00, 0], 0x7c00),               // +inf * max subnormal
+        ([0xfc00, 0x83ff, 0x3c00, 0], 0x7c00),               // -inf * -max subnormal
+        ([0x8000, 0xfc00, 0x3c00, 0], F16_NAN),              // -0 * -inf
+        ([0x7c00, 0x0001, 0xfc00, 0], F16_NAN),              // +inf * subnormal - inf
+        ([0x8000, 0x3c00, 0x8000, 0], 0x8000),               // -0 * 1 - 0
     ];
     let inputs = cases.map(|(input, _)| input);
     let fmac = (0x036 << 25) | (2 << 9) | u32::from(vgpr(1));
@@ -738,7 +745,7 @@ fn half_fused_nonfinite_results_survive_rounding() {
                         "{backend}: {form} {mode} case {i}: expected a quiet NaN, got {actual:#06x}"
                     );
                 } else {
-                    assert_eq!(actual, want, "{backend}: {form} {mode} infinity case {i}");
+                    assert_eq!(actual, want, "{backend}: {form} {mode} case {i}");
                 }
             });
         }
