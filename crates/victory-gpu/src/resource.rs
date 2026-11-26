@@ -400,17 +400,23 @@ fn subresource(desc: &ResourceDesc, index: u32) -> Option<(PlacedFootprint, u32,
         (false, 0) => (desc.format, PITCH),
         _ => return None,
     };
-    let (element, block) = element(format)?;
-    let width = (desc.width >> mip).max(1).next_multiple_of(block);
+    let (element, block_width, block_height) = match format {
+        68 | 69 => (4, 2, 1), // Packed RGBG/GRGB, four bytes per horizontal pair.
+        _ => {
+            let (element, block) = element(format)?;
+            (element, block, block)
+        }
+    };
+    let width = (desc.width >> mip).max(1).next_multiple_of(block_width);
     let height = (u64::from(desc.height) >> mip)
         .max(1)
-        .next_multiple_of(block);
+        .next_multiple_of(block_height);
     let depth = if desc.dimension == TEXTURE_3D {
         (u32::from(desc.depth_or_array_size) >> mip).max(1)
     } else {
         1
     };
-    let row_size = width / block * element;
+    let row_size = width / block_width * element;
     let footprint = PlacedFootprint {
         offset: 0,
         format,
@@ -419,7 +425,11 @@ fn subresource(desc: &ResourceDesc, index: u32) -> Option<(PlacedFootprint, u32,
         depth,
         row_pitch: u32::try_from(row_size.next_multiple_of(pitch_alignment)).ok()?,
     };
-    Some((footprint, u32::try_from(height / block).ok()?, row_size))
+    Some((
+        footprint,
+        u32::try_from(height / block_height).ok()?,
+        row_size,
+    ))
 }
 
 /// Places subresources at 512-byte boundaries relative to the supplied base.
@@ -2761,6 +2771,88 @@ mod tests {
             }
             assert_eq!(offsets, expected, "base {base}");
             assert_eq!(total, 2068, "base {base}");
+        }
+    }
+
+    #[test]
+    fn copyable_footprints_count_packed_pairs() {
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_PLACED_SUBRESOURCE_FOOTPRINT, D3D12_RESOURCE_DESC,
+            D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+        };
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_SAMPLE_DESC};
+
+        for format in [68, 69] {
+            for width in [10, 12] {
+                // Mip 1 is either 5×3 (a partial pair) or 6×3 (three full pairs).
+                let desc = texture(width, 6, format, 2);
+                let (mut layout, mut rows, mut row_size, mut total) = (NO_FOOTPRINT, 0, 0, 0);
+                copyable_footprints(
+                    std::ptr::null(),
+                    &desc,
+                    1,
+                    1,
+                    0,
+                    &mut layout,
+                    &mut rows,
+                    &mut row_size,
+                    &mut total,
+                );
+                let want = (6, 3, 3, 12, 256, 524);
+                if let Some(host) = crate::host::host() {
+                    let native = D3D12_RESOURCE_DESC {
+                        Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                        Width: width,
+                        Height: 6,
+                        DepthOrArraySize: 1,
+                        MipLevels: 2,
+                        Format: DXGI_FORMAT(format as i32),
+                        SampleDesc: DXGI_SAMPLE_DESC {
+                            Count: 1,
+                            Quality: 0,
+                        },
+                        ..Default::default()
+                    };
+                    let mut packed = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+                    let (mut nr, mut np, mut nt) = (0, 0, 0);
+                    // SAFETY: a valid description and one writable entry for each output.
+                    unsafe {
+                        host.device.GetCopyableFootprints(
+                            &native,
+                            1,
+                            1,
+                            0,
+                            Some(&mut packed),
+                            Some(&mut nr),
+                            Some(&mut np),
+                            Some(&mut nt),
+                        );
+                    }
+                    assert_eq!(
+                        (
+                            packed.Footprint.Width,
+                            packed.Footprint.Height,
+                            nr,
+                            np,
+                            packed.Footprint.RowPitch,
+                            nt
+                        ),
+                        want,
+                    );
+                }
+                assert_eq!(
+                    (
+                        layout.width,
+                        layout.height,
+                        rows,
+                        row_size,
+                        layout.row_pitch,
+                        total
+                    ),
+                    want,
+                    "format {format}, base width {width}",
+                );
+            }
         }
     }
 
