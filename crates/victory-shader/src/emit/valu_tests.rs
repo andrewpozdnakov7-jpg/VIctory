@@ -2240,6 +2240,48 @@ fn v_cvt_f16_f32_obeys_all_four_rounding_modes() {
     }
 }
 
+/// V_CVT_F16_F32 uses the single-precision input bit of DENORM_MODE.
+/// The other f32 bit only affects results of f32 instructions.
+#[test]
+fn v_cvt_f16_f32_directed_rounding_honors_input_denorm_mode() {
+    let inputs: Vec<_> = [0, 1, 0x0040_0000, 0x007F_FFFF, 0x0080_0000]
+        .into_iter()
+        .flat_map(|bits| {
+            [
+                [bits, 0, 0, 0xABCD_1234],
+                [bits | 0x8000_0000, 0, 0, 0xABCD_1234],
+            ]
+        })
+        .collect();
+    let modes = (12..=15)
+        .map(|denorm| (denorm, vec![0xBFA5_0000 | denorm]))
+        // s_setreg_imm32_b32 hwreg(HW_REG_MODE, 4, 1) changes only bit 4.
+        .chain([
+            (14, vec![0xBFA5_000F, 0xBA80_0101, 0]),
+            (13, vec![0xBFA5_000C, 0xBA80_0101, 1]),
+        ]);
+    for (denorm, setup) in modes {
+        for round in [1, 2, 0, 3] {
+            let mut body = setup.clone();
+            body.extend([
+                0xBFA4_0000 | round << 2, // s_round_mode
+                vop1(0x001, 0, vgpr(4)),  // v_mov_b32 v0, v4
+                vop1(0x00A, 0, vgpr(1)),  // v_cvt_f16_f32 v0, v1
+            ]);
+            let shader = build_valu_cs(&body);
+            run_cases(&shader, &inputs, |backend, _, input, got| {
+                let bits = input[0];
+                let sign = bits >> 31;
+                let abs = bits & 0x7FFF_FFFF;
+                let nonzero = abs >= 0x0080_0000 || abs != 0 && denorm & 1 != 0;
+                let away = (round, sign) == (1, 0) || (round, sign) == (2, 1);
+                let want = 0xABCD_0000 | (sign << 15) | u32::from(nonzero && away);
+                assert_eq!(got, want, "{backend}: DENORM={denorm} ROUND={round} f32={bits:#010x}");
+            });
+        }
+    }
+}
+
 /// `src_scc` reads SCC as 0 or 1, in scalar and vector instructions.
 #[test]
 fn src_scc_reads_as_zero_or_one() {

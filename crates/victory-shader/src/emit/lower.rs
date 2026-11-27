@@ -281,9 +281,12 @@ struct Lower<'a> {
     /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
     abort: Option<usize>,
     /// The 16/64-bit round mode (MODE bits 3:2) each block starts with, and
-    /// the one in force at the instruction being lowered (see [`round16`]).
+    /// the one in force at the instruction being lowered.
     round16: Vec<Option<u8>>,
     mode16: Option<u8>,
+    /// MODE bit 4 at block entry and at a direct conversion.
+    cvt_denorm32: Option<Vec<Option<bool>>>,
+    keep_cvt_denorm32: Option<bool>,
 }
 
 /// The 16/64-bit round mode (MODE bits 3:2)
@@ -312,20 +315,43 @@ fn round16_after(inst: &Inst, mode: Option<u8>) -> Option<u8> {
     }
 }
 
-/// The 16/64-bit round mode each block starts with: nearest even at the
-/// program's start, then as the MODE writes on the way set it; `None` where
-/// paths that set it differently join (or a write is not a constant).
-fn round16(p: &crate::ir::Program) -> Vec<Option<u8>> {
+/// MODE bit 4 enables single-precision input denormals.
+fn cvt_denorm32_after(inst: &Inst, keep: Option<bool>) -> Option<bool> {
+    match (inst.name(), &inst.fields) {
+        ("s_denorm_mode", Fields::Sopp { imm }) => Some(imm & 1 != 0),
+        (
+            "s_setreg_imm32_b32" | "s_setreg_b32",
+            Fields::Sop { src, imm: Some(h), .. },
+        ) => {
+            let (id, off, size) = (h & 0x3F, h >> 6 & 0x1F, (h >> 11 & 0x1F) + 1);
+            if id != 1 || off > 4 || off + size <= 4 {
+                return keep;
+            }
+            match src.first() {
+                Some(&Operand::Literal(x)) => Some(x >> (4 - off) & 1 != 0),
+                _ => None,
+            }
+        }
+        _ => keep,
+    }
+}
+
+/// The mode each block inherits. A join of different modes is unknown.
+fn mode_at_blocks<T: Copy + Eq>(
+    p: &Program,
+    initial: Option<T>,
+    after: fn(&Inst, Option<T>) -> Option<T>,
+) -> Vec<Option<T>> {
     // None: not reached yet; Some(m): the mode (m None: not known).
-    let mut entry: Vec<Option<Option<u8>>> = vec![None; p.blocks.len()];
-    entry[0] = Some(Some(0));
+    let mut entry = vec![None; p.blocks.len()];
+    entry[0] = Some(initial);
     let order = crate::ir::reverse_postorder(&p.blocks);
     loop {
         let mut changed = false;
         for &b in &order {
             let Some(mut m) = entry[b] else { continue };
             for inst in &p.blocks[b].insts {
-                m = round16_after(inst, m);
+                m = after(inst, m);
             }
             for s in p.blocks[b].exit.successors() {
                 let new = match entry[s] {
@@ -723,7 +749,11 @@ impl<'a> Lower<'a> {
             code_table: None,
             counters: HashMap::new(),
             abort: None,
-            round16: round16(p),
+            round16: mode_at_blocks(p, Some(0), round16_after),
+            cvt_denorm32: insts()
+                .any(|i| i.name() == "v_cvt_f16_f32")
+                .then(|| mode_at_blocks(p, None, cvt_denorm32_after)),
+            keep_cvt_denorm32: None,
             mode16: Some(0),
         }
     }
@@ -1353,6 +1383,7 @@ impl<'a> Lower<'a> {
             }
             let mut i = 0;
             self.mode16 = self.round16[b];
+            self.keep_cvt_denorm32 = self.cvt_denorm32.as_ref().and_then(|m| m[b]);
             while i < p.blocks[b].insts.len() {
                 if let Some(&lanes) = self.x.st.discards.get(&(b, i)) {
                     // A pixel's discard: the lanes stay on as helpers.
@@ -1365,7 +1396,11 @@ impl<'a> Lower<'a> {
                         .op(at, "discard", Attr::NoUnwind, self.s.t.void, 82, &[kill]);
                 }
                 self.inst(b, i)?;
-                self.mode16 = round16_after(&p.blocks[b].insts[i], self.mode16);
+                let inst = &p.blocks[b].insts[i];
+                self.mode16 = round16_after(inst, self.mode16);
+                if self.cvt_denorm32.is_some() {
+                    self.keep_cvt_denorm32 = cvt_denorm32_after(inst, self.keep_cvt_denorm32);
+                }
                 if let Some(end) = self.sections.get(&b).and_then(|s| s.get(&i)).map(|s| s.end) {
                     for j in i + 1..end {
                         self.section_inst(b, j, i);
@@ -2216,12 +2251,11 @@ impl<'a> Lower<'a> {
     /// arithmetic paths. Only a direct conversion uses directed rounding.
     fn narrow16(&mut self, f: V) -> V {
         let mode = if self.mode16 == Some(3) { 3 } else { 0 };
-        self.narrow16_in_mode(f, mode)
+        self.narrow16_in_mode(f, mode, false)
     }
 
-    /// `f` as an f16 in the low bits, rounded on the bits. f32 denormals
-    /// read as zero.
-    fn narrow16_in_mode(&mut self, f: V, mode: u8) -> V {
+    /// `f` as an f16 in the low bits, rounded on the bits.
+    fn narrow16_in_mode(&mut self, f: V, mode: u8, keep_f32_denormals: bool) -> V {
         let rtz = mode == 3;
         let c = self.cur;
         let x = self.as_int(f);
@@ -2282,10 +2316,11 @@ impl<'a> Lower<'a> {
         let far = self.s.m.cmp(c, pred::IUGT, s, k31);
         let s = self.s.m.select(c, far, k31, s);
         let (frac, hidden, zero) = (k(self, 0x7F_FFFF), k(self, 0x80_0000), k(self, 0));
-        let mant = self.s.m.bin(c, Bin::And, a, frac);
-        let mant = self.s.m.bin(c, Bin::Or, mant, hidden);
+        let frac = self.s.m.bin(c, Bin::And, a, frac);
+        let normal_mantissa = self.s.m.bin(c, Bin::Or, frac, hidden);
+        let denormal_mantissa = if keep_f32_denormals { frac } else { zero };
         let f32_denormal = self.s.m.cmp(c, pred::EQ, e, zero);
-        let mant = self.s.m.select(c, f32_denormal, zero, mant);
+        let mant = self.s.m.select(c, f32_denormal, denormal_mantissa, normal_mantissa);
         let q = self.s.m.bin(c, Bin::LShr, mant, s);
         let den = if let Some(away) = away {
             let one = k(self, 1);
@@ -7021,7 +7056,10 @@ impl<'a> Lower<'a> {
                 f = l.unary(7, f);
             }
             let h = if name == "v_cvt_f16_f32" {
-                l.narrow16_in_mode(f, l.mode16.unwrap_or_default())
+                let mode = l.mode16.unwrap_or_default();
+                // Preserve the old flush behavior when MODE is unknown.
+                let keep = matches!(mode, 1 | 2) && l.keep_cvt_denorm32 == Some(true);
+                l.narrow16_in_mode(f, mode, keep)
             } else {
                 l.narrow16(f)
             };
