@@ -1354,8 +1354,7 @@ pub fn view_strides(views: &[View]) -> Vec<u32> {
         DXGI_FORMAT_R32G32B32A32_SINT | DXGI_FORMAT_R16G16B16A16_SINT | DXGI_FORMAT_R32G32_SINT
         | DXGI_FORMAT_R8G8B8A8_SINT | DXGI_FORMAT_R16G16_SINT | DXGI_FORMAT_R32_SINT
         | DXGI_FORMAT_R8G8_SINT | DXGI_FORMAT_R16_SINT | DXGI_FORMAT_R8_SINT => super::VIEW_INTEGER | super::VIEW_SIGNED,
-        f if super::normalized_buffer_format(f.0 as u32) => super::VIEW_NORMALIZED,
-        _ => 0,
+        f => super::normalized_buffer_flags(f.0 as u32),
     };
     views
         .iter()

@@ -1039,13 +1039,10 @@ fn view_kind(view: &View) -> u32 {
     if words[1] != 1 || !typed {
         return 0;
     }
-    if victory_shader::emit::normalized_buffer_format(format) {
-        return victory_shader::emit::VIEW_NORMALIZED;
-    }
     match integer_format(format) {
         Some(true) => VIEW_INTEGER | VIEW_SIGNED,
         Some(false) => VIEW_INTEGER,
-        None => 0,
+        None => victory_shader::emit::normalized_buffer_flags(format),
     }
 }
 
@@ -1843,7 +1840,13 @@ mod tests {
         assert_eq!(view_kind(&uav(59, 0, 0)), VIEW_INTEGER | VIEW_SIGNED, "R16_SINT");
         assert_eq!(view_kind(&uav(64, 0, 0)), VIEW_INTEGER | VIEW_SIGNED, "R8_SINT");
         assert_eq!(view_kind(&uav(10, 0, 0)), 0, "R16G16B16A16_FLOAT");
-        assert_eq!(view_kind(&uav(58, 0, 0)), victory_shader::emit::VIEW_NORMALIZED, "R16_SNORM");
+        use victory_shader::emit::{VIEW_NORMALIZED, VIEW_NORMALIZED_16};
+        for format in [11, 35, 56] {
+            assert_eq!(view_kind(&uav(format, 0, 0)), VIEW_NORMALIZED_16);
+        }
+        for format in [13, 37, 58] {
+            assert_eq!(view_kind(&uav(format, 0, 0)), VIEW_NORMALIZED_16 | VIEW_NORMALIZED);
+        }
         assert_eq!(view_kind(&uav(39, 0, 1)), 0, "raw");
         assert_eq!(view_kind(&uav(0, 16, 0)), 0, "structured");
         for format in [85, 86, 87, 88, 115] {

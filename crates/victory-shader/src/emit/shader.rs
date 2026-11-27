@@ -24,12 +24,21 @@ pub const VIEW_STRIDE_BITS: u32 = (1 << 29) - 1;
 pub const VIEW_INTEGER: u32 = 1 << 31;
 /// With [`VIEW_INTEGER`]: a signed (`SINT`) format.
 pub const VIEW_SIGNED: u32 = 1 << 30;
-/// A normalized typed buffer view, whose D16 loads round to nearest even.
+/// With VIEW_INTEGER clear: a 16-bit normalized format. Shares the SINT flag,
+/// which is only interpreted as signedness when VIEW_INTEGER is set.
+pub const VIEW_NORMALIZED_16: u32 = VIEW_SIGNED;
+/// For other non-integer views: round to nearest even. With VIEW_NORMALIZED_16:
+/// select SNORM16 instead of UNORM16.
 pub const VIEW_NORMALIZED: u32 = 1 << 29;
 
-/// UNORM and SNORM color formats usable for typed buffer elements (DXGI_FORMAT).
-pub fn normalized_buffer_format(format: u32) -> bool {
-    matches!(format, 11 | 13 | 24 | 28 | 31 | 35 | 37 | 49 | 51 | 56 | 58 | 61 | 63 | 85 | 86 | 87 | 88 | 115)
+/// View-stride flags for a normalized DXGI buffer format.
+pub fn normalized_buffer_flags(format: u32) -> u32 {
+    match format {
+        11 | 35 | 56 => VIEW_NORMALIZED_16,
+        13 | 37 | 58 => VIEW_NORMALIZED_16 | VIEW_NORMALIZED,
+        24 | 28 | 31 | 49 | 51 | 61 | 63 | 85 | 86 | 87 | 88 | 115 => VIEW_NORMALIZED,
+        _ => 0,
+    }
 }
 
 /// Where the title-memory page table is bound: `t0` (a raw root SRV) in

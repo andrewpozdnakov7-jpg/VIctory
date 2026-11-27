@@ -775,7 +775,6 @@ fn mubuf_d16_descriptor_rounding() {
 }
 
 #[test]
-#[ignore = "precision probe for 16-bit normalized values adjacent to f16 midpoints"]
 fn mubuf_d16_rounding_four_edge_codes() {
     use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R16_SNORM, DXGI_FORMAT_R16_UNORM};
 

@@ -11,7 +11,10 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use super::UserData;
 use super::bitcode::{Attr, Bin, Cast, Term, V, pred};
 use super::container::SigElement;
-use super::shader::{Shader, VIEW_INTEGER, VIEW_NORMALIZED, VIEW_SIGNED, VIEW_STRIDE_BITS, VIEW_STRIDES, flags};
+use super::shader::{
+    Shader, VIEW_INTEGER, VIEW_NORMALIZED, VIEW_NORMALIZED_16, VIEW_SIGNED, VIEW_STRIDE_BITS,
+    VIEW_STRIDES, flags,
+};
 use crate::ShaderError;
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
 use crate::io::{Barycentric, Elsewhere, Export, Input, Interp, Io, Target};
@@ -21,6 +24,7 @@ use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 mod bvh;
+mod d16;
 
 type Why = &'static str;
 
@@ -5198,46 +5202,6 @@ impl<'a> Lower<'a> {
         self.s.m.select(c, is_zero, zero, bits)
     }
 
-    /// Channels of buffer format `format`, as [`Self::format_load`] gives
-    /// them, as d16 data: 16 bits each, two per dword, low half first (an
-    /// odd last high half 0). Integer formats keep their low 16 bits; the
-    /// others become f16.
-    fn d16_channels(&mut self, format: u8, channels: Vec<V>) -> Result<Vec<V>, Why> {
-        let (_, numeric) = buffer_format(format).ok_or("a buffer format")?;
-        let c = self.cur;
-        let mut halves = Vec::new();
-        for x in channels {
-            halves.push(match numeric {
-                Numeric::Uint | Numeric::Sint => {
-                    let m = self.s.m.i32(0xFFFF);
-                    self.s.m.bin(c, Bin::And, x, m)
-                }
-                Numeric::Uscaled | Numeric::Sscaled | Numeric::Unorm | Numeric::Snorm => {
-                    // D16 rounds these formats to nearest even, independently of VALU MODE.
-                    let f = self.as_float(x);
-                    self.narrow16_bits(f, false)
-                }
-                Numeric::Float => {
-                    let f = self.as_float(x);
-                    self.s.op(c, "legacyF32ToF16", Attr::ReadNone, self.s.t.i32, 130, &[f])
-                }
-            });
-        }
-        let mut out = Vec::new();
-        for pair in halves.chunks(2) {
-            out.push(match *pair {
-                [lo, hi] => {
-                    let k16 = self.s.m.i32(16);
-                    let hi = self.s.m.bin(c, Bin::Shl, hi, k16);
-                    self.s.m.bin(c, Bin::Or, lo, hi)
-                }
-                [lo] => lo,
-                _ => unreachable!("chunks of one or two"),
-            });
-        }
-        Ok(out)
-    }
-
     /// The byte offset a buffer descriptor built around a root descriptor adds
     /// (constant and computed parts); none for other descriptors.
     fn built_offset(&mut self, src: &Source) -> Result<(u32, Option<V>), Why> {
@@ -9858,34 +9822,13 @@ impl<'a> Lower<'a> {
             // passes a mismatched component type (unchanged on the RX 6700
             // XT and WARP, `stride_tests`); an integer-typed second handle
             // for the slot would not rely on it.
-            let kinds = typed_h.and_then(|h| self.view_flags(h, [VIEW_INTEGER, VIEW_NORMALIZED]));
-            let c = self.cur;
-            let k16 = self.s.m.i32(16);
-            let i32t = self.s.t.i32;
-            for k in 0..count.div_ceil(2) {
-                let mut x = None;
-                for ch in (2 * k..(2 * k + 2).min(count)).rev() {
-                    let f = self.s.m.extract(c, r, ch);
-                    let mut h = self
-                        .s
-                        .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f]);
-                    if let Some([int, normalized]) = kinds {
-                        let rounded = self.narrow16_bits(f, false);
-                        h = self.s.m.select(c, normalized, rounded, h);
-                        let bits = self.as_int(f);
-                        let low = self.s.m.i32(0xFFFF);
-                        let low = self.s.m.bin(c, Bin::And, bits, low);
-                        h = self.s.m.select(c, int, low, h);
-                    }
-                    x = Some(match x {
-                        Some(hi) => {
-                            let hi = self.s.m.bin(c, Bin::Shl, hi, k16);
-                            self.s.m.bin(c, Bin::Or, h, hi)
-                        }
-                        None => h,
-                    });
-                }
-                self.write(inst, Reg::V(reg + k as u8), x.expect("a channel"), guard);
+            let kinds = typed_h.and_then(|h| {
+                self.view_flags(h, [VIEW_INTEGER, VIEW_NORMALIZED, VIEW_NORMALIZED_16])
+            });
+            let channels = (0..count).map(|k| self.s.m.extract(c, r, k)).collect();
+            let halves = self.d16_view_channels(channels, kinds);
+            for (k, packed) in self.pack_d16(&halves).into_iter().enumerate() {
+                self.write(inst, Reg::V(reg + k as u8), packed, guard);
             }
             return Ok(());
         }
