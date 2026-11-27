@@ -596,6 +596,38 @@ fn tbuffer_d16_loads_of_16_bit_norms_round_once() {
 }
 
 #[test]
+fn typed_buffer_loads_zero_missing_channels() {
+    for (format, input) in [(20, 0x0123_4567), (22, 0x3F80_0000)] {
+        // Store a 32_UINT or 32_FLOAT element, then read its four channels.
+        // XOR X and W together to check that X survived and W is zero.
+        let mut body = buffer_store_dword(1, 8, 0).to_vec();
+        body.extend(mtbuf(3, 4, 8, format)); // tbuffer_load_format_xyzw v[4:7]
+        body.extend(vop3(0x11D, 0, vgpr(4), vgpr(7), 0)); // v_xor_b32 v0, v4, v7
+        let shader = build_valu_cs(&body);
+        run_cases(&shader, &[[input, 0, 0, 0]], |label, _, _, got| {
+            assert_eq!(got, input, "{label}, format {format}");
+        });
+    }
+}
+
+#[test]
+fn tbuffer_d16_keeps_rounding_and_zeroes_missing_channels() {
+    for (format, stored, half) in [(7, 0xffaf, 0x3bfd), (8, 0x8009, 0xbbff), (13, 0x3c00, 0x3c00)] {
+        for (second, expected) in [(false, half), (true, 0)] {
+            let mut body = buffer_store_dword(1, 8, 0).to_vec();
+            body.extend(mtbuf(11, 0, 8, format)); // tbuffer_load_format_d16_xyzw v[0:1]
+            if second {
+                body.push(vop1(0x001, 0, vgpr(1)));
+            }
+            let shader = build_valu_cs(&body);
+            run_cases(&shader, &[[stored, 0, 0, 0]], |backend, _, _, got| {
+                assert_eq!(got, expected, "{backend}: format {format}, second dword {second}");
+            });
+        }
+    }
+}
+
+#[test]
 fn normalized_buffer_formats_load_their_ends_exactly() {
     // tbuffer_load_format_x.
     let x = 0;

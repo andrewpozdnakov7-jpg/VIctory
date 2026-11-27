@@ -118,7 +118,10 @@ impl Lower<'_> {
         let c = self.cur;
         let mut halves = Vec::with_capacity(channels.len());
         for (k, x) in channels.into_iter().enumerate() {
-            let width = widths.get(k).copied().unwrap_or(0);
+            let Some(&width) = widths.get(k) else {
+                halves.push(self.s.m.i32(0));
+                continue;
+            };
             let half = match numeric {
                 Numeric::Uint => {
                     let max = self.s.m.i32(0xffff);
