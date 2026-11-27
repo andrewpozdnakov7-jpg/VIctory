@@ -16,8 +16,9 @@ const KINDS: [Program; 4] = [
 
 fn emit(kind: Program, lanes: u32) -> super::HostShader {
     let n = program(kind, lanes);
-    let (p, st) = crate::range::build(&n.patched_code(), n.wave64, n.vgprs).unwrap();
+    let (p, st) = crate::range::build_native(&n).unwrap();
     let st = st.unwrap();
+    assert_eq!(st.group_votes.len(), 2, "{kind:?}, {lanes} lanes");
     let res = crate::resource::track(&p, &n.layout, n.stage, Some(&st)).unwrap();
     let io = crate::io::raise(&p, &n).unwrap();
     let bytes = crate::dxbc::build(&[]);
@@ -36,6 +37,10 @@ fn only_a_branch_reads_the_scc_of_a_mask_it_is_found() {
             let want = usize::from(!matches!(kind, Program::BranchMaskRead));
             assert_eq!(st.any_sccs.len(), want, "{kind:?}, {lanes} lanes");
             drop(p);
+            if matches!(kind, Program::BranchMaskRead) {
+                let (_, grouped) = crate::range::build_native(&n).unwrap();
+                assert!(grouped.unwrap().group_votes.is_empty(), "{lanes} lanes");
+            }
         }
     }
 }
@@ -54,24 +59,6 @@ fn the_branches_on_the_waves_vote_validate() {
             }
         }
     }
-}
-
-/// Whether the host has waves of exactly `lanes` lanes to run on.
-fn runs_waves_of(host: &Host, lanes: u32) -> bool {
-    use windows::Win32::Graphics::Direct3D12::*;
-    let mut opts1 = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
-    // SAFETY: a capability query on a live device, into a structure of the
-    // size given.
-    let queried = unsafe {
-        host.device.CheckFeatureSupport(
-            D3D12_FEATURE_D3D12_OPTIONS1,
-            (&raw mut opts1).cast(),
-            size_of_val(&opts1) as u32,
-        )
-    };
-    queried.is_ok()
-        && opts1.WaveOps.as_bool()
-        && (opts1.WaveLaneCountMin..=opts1.WaveLaneCountMax).contains(&lanes)
 }
 
 /// Every active lane of the group takes the arm the wave's mask decides, in
@@ -120,69 +107,44 @@ fn every_active_lane_takes_the_arm_of_the_waves_vote_on_gpu() {
     };
     let mut ran = 0;
     for lanes in [32, 64] {
-        if !runs_waves_of(&host, lanes) {
-            eprintln!("host has no {lanes}-lane waves; lowered and validated only");
-            continue;
-        }
         for kind in KINDS {
             let shader = emit(kind, lanes);
-            // WARP (1.0.22) now and then compiles a divergent wave vote
-            // into a pipeline that gives the wrong lanes (so does a plain
-            // DXC `WaveActiveAnyTrue` in `if (lane < below)`, in a few
-            // runs of 25, always the same pipeline): a wrong lowering is
-            // wrong in every pipeline, so it takes three wrong ones.
-            let mut wrong = Vec::new();
-            for _ in 0..3 {
-                let (root, pso) = host.compute_pipeline(&shader).expect("compute_pipeline");
-                wrong.clear();
-                for (below, selected) in cases(lanes) {
-                    let mut data = vec![0; shader.user_data_dwords().max(1) as usize];
-                    for u in &shader.user_data {
-                        if u.root == RootType::Constants && u.slot == 0 && u.dword < 2 {
-                            data[u.index as usize] = [below, selected][u.dword as usize];
+            let (root, pso) = host.compute_pipeline(&shader).expect("compute_pipeline");
+            for (below, selected) in cases(lanes) {
+                let mut data = vec![0; shader.user_data_dwords().max(1) as usize];
+                for u in &shader.user_data {
+                    if u.root == RootType::Constants && u.slot == 0 && u.dword < 2 {
+                        data[u.index as usize] = [below, selected][u.dword as usize];
+                    }
+                }
+                let want: Vec<u32> = (0..lanes)
+                    .map(|lane| {
+                        if lane < below {
+                            1 + u32::from(selected < below)
+                        } else {
+                            0
                         }
-                    }
-                    let want: Vec<u32> = (0..lanes)
-                        .map(|l| {
-                            if l < below {
-                                1 + u32::from(selected < below)
-                            } else {
-                                0
-                            }
-                        })
-                        .collect();
-                    let got = host
-                        .dispatch(
-                            &root,
-                            &pso,
-                            &Dispatch {
-                                roots: vec![(0, Root::Constants(data))],
-                                views: &[View::RawUav(lanes)],
-                                samplers: &[],
-                                groups: [1, 1, 1],
-                            },
-                        )
-                        .expect("dispatch")
-                        .remove(0);
-                    ran += 1;
-                    if got != want {
-                        wrong.push(format!(
-                            "{kind:?}, {lanes} lanes, {below} active, lane {selected}: {got:?}, not {want:?}"
-                        ));
-                    }
-                }
-                if wrong.is_empty() {
-                    break;
-                }
+                    })
+                    .collect();
+                let got = host
+                    .dispatch(
+                        &root,
+                        &pso,
+                        &Dispatch {
+                            roots: vec![(0, Root::Constants(data))],
+                            views: &[View::RawUav(lanes)],
+                            samplers: &[],
+                            groups: [1, 1, 1],
+                        },
+                    )
+                    .expect("dispatch")
+                    .remove(0);
+                assert_eq!(
+                    got, want,
+                    "{kind:?}, {lanes} lanes, {below} active, lane {selected}"
+                );
+                ran += 1;
             }
-            assert!(
-                wrong.is_empty(),
-                "{}",
-                wrong.join(
-                    "
-"
-                )
-            );
         }
     }
     eprintln!("{ran} dispatches");

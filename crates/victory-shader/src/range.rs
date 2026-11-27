@@ -21,6 +21,7 @@ use std::collections::{HashMap, HashSet};
 use crate::ShaderError;
 use crate::gfx10::{Fields, Operand};
 use crate::ir::{self, EXEC, Inst, M0, Program, Reg, Value};
+use crate::native::{NativeProgram, StageIo};
 use crate::structure::{self, Atom, LaneExit, Structured};
 
 /// [`ir::build`] and [`structure::structure`], built again with the register
@@ -38,8 +39,38 @@ pub fn build(
     wave64: bool,
     vgprs: u16,
 ) -> Result<(Program, Result<Structured, ShaderError>), ShaderError> {
+    build_with_structure(code, wave64, vgprs, structure::structure)
+}
+
+/// Builds a native program with its compute-group layout available to
+/// the control-flow analysis.
+pub fn build_native(
+    native: &NativeProgram,
+) -> Result<(Program, Result<Structured, ShaderError>), ShaderError> {
+    // The group vote needs one shared dword in addition to the guest LDS.
+    const MAX_TGSM_BYTES: u32 = 8192 * 4;
+    let make_structure = |p: &Program| match &native.io {
+        StageIo::Cs(cs) if cs.lds_bytes() <= MAX_TGSM_BYTES - 4 => {
+            structure::for_compute(p, cs.threads)
+        }
+        _ => structure::structure(p),
+    };
+    build_with_structure(
+        &native.patched_code(),
+        native.wave64,
+        native.vgprs,
+        make_structure,
+    )
+}
+
+fn build_with_structure(
+    code: &[u8],
+    wave64: bool,
+    vgprs: u16,
+    make_structure: impl Fn(&Program) -> Result<Structured, ShaderError>,
+) -> Result<(Program, Result<Structured, ShaderError>), ShaderError> {
     let p = ir::build(code, wave64, vgprs)?;
-    let st = structure::structure(&p);
+    let st = make_structure(&p);
     let mut assumed: HashMap<usize, u8> = p
         .blocks
         .iter()
@@ -56,7 +87,7 @@ pub fn build(
             break;
         }
         let q = ir::build_bounded(code, wave64, vgprs, &assumed)?;
-        let Ok(s) = structure::structure(&q) else {
+        let Ok(s) = make_structure(&q) else {
             break;
         };
         let found = relative_bounds(&q, &s);
@@ -69,7 +100,7 @@ pub fn build(
                 return Ok((q, Ok(s)));
             }
             let q = ir::build_bounded(code, wave64, vgprs, &proven)?;
-            let s = structure::structure(&q);
+            let s = make_structure(&q);
             return Ok((q, s));
         }
         assumed = assumed

@@ -184,6 +184,35 @@ fn reference(lanes: u32) -> Vec<u8> {
 }
 
 #[test]
+fn group_vote_branches_keep_vector_store_guards() {
+    for lanes in [32, 64] {
+        for kind in [Program::Branch, Program::StoreOnScc0, Program::StoreOnScc1] {
+            let mut n = program(kind, lanes);
+            let (p, st) = crate::range::build_native(&n).unwrap();
+            let st = st.unwrap();
+            assert_eq!(st.group_votes.len(), 2, "Wave{lanes} {kind:?}");
+            for (b, block) in p.blocks.iter().enumerate() {
+                for (i, inst) in block.insts.iter().enumerate() {
+                    if inst.name() == "buffer_store_dword" {
+                        assert!(st.guards[b][i].is_some(), "Wave{lanes} {kind:?}, block {b}");
+                    }
+                }
+            }
+
+            let StageIo::Cs(io) = &mut n.io else {
+                unreachable!()
+            };
+            io.threads[0] *= 2;
+            let (_, st) = crate::range::build_native(&n).unwrap();
+            assert!(
+                st.unwrap().group_votes.is_empty(),
+                "more than one guest wave"
+            );
+        }
+    }
+}
+
+#[test]
 #[ignore = "requires a D3D12 device and PC DXC"]
 fn every_active_lane_observes_the_scc_of_a_mask_operation() {
     let host = Host::new(false).expect("D3D12 adapter");
@@ -229,8 +258,7 @@ fn every_active_lane_observes_the_scc_of_a_mask_operation() {
                 }
                 _ => {
                     let n = program(kind, lanes);
-                    let (p, st) =
-                        crate::range::build(&n.patched_code(), n.wave64, n.vgprs).unwrap();
+                    let (p, st) = crate::range::build_native(&n).unwrap();
                     let st = st.unwrap();
                     let res = crate::resource::track(&p, &n.layout, n.stage, Some(&st)).unwrap();
                     let io = crate::io::raise(&p, &n).unwrap();
