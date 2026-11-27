@@ -893,11 +893,11 @@ pub(crate) fn forget_read(slot: u32) {
 /// `withheld` (ranges of copies that lists whose writes stay out of title
 /// memory declared) and, with `memory_withheld`, pages that shaders using
 /// title memory marked; the bitmaps are cleared. Before the copy-backs of
-/// declared ranges, which disarm the copies.
+/// declared ranges, which disarm the copies. Returns the bytes written.
 // shortcut: marks do not tell lists apart: a page that a withheld list and
 // another both wrote through views goes back unless the withheld list
 // declared it.
-pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_withheld: bool) {
+pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_withheld: bool) -> usize {
     let (mut marked, mut held) = (Vec::new(), Vec::new());
     for memory in [false, true] {
         let Some(b) = bitmap(memory) else {
@@ -940,12 +940,13 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
         }
     }
     if marked.is_empty() {
-        return;
+        return 0;
     }
     let pages: Vec<(Arc<Shadow>, usize)> = {
         let m = marks();
         marked.iter().filter_map(|&n| page_of(&m, n)).collect()
     };
+    let mut total = 0;
     for (copy, page) in pages {
         if withheld
             .iter()
@@ -954,14 +955,14 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
             continue;
         }
         let written = copy.copy_back_marked(page);
+        total += written;
         #[cfg(feature = "diagnostics")]
         {
             crate::copystat::add(crate::copystat::C::MarkedPages, 1);
             crate::copystat::add(crate::copystat::C::MarkedBytes, written as u64);
         }
-        #[cfg(not(feature = "diagnostics"))]
-        let _ = written;
     }
+    total
 }
 
 struct Entry {
