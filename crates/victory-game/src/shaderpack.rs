@@ -383,10 +383,10 @@ mod tests {
 
     /// A pack with one graphics entry (PS, VS) and one compute entry.
     fn pack_bytes() -> Vec<u8> {
-        pack_with_raster(b"packet".to_vec(), 4)
+        pack_with_states(b"packet".to_vec(), [3, 4, 5])
     }
 
-    fn pack_with_raster(packet: Vec<u8>, raster_hash: u64) -> Vec<u8> {
+    fn pack_with_states(packet: Vec<u8>, [depth, raster, blend]: [u64; 3]) -> Vec<u8> {
         let nop = |h: u32| [0xD580_0000 | (h & 0xFFFF), 0x03FF_0000, h];
         let mut code0 = Vec::new();
         le(&mut code0, &nop(0x1234));
@@ -404,7 +404,7 @@ mod tests {
         // Graphics: key, packet 0, metadata 1, five hashes, PS and VS.
         out.extend(0x1111_u64.to_le_bytes());
         le(&mut out, &[0, 1]);
-        for h in [1u64, 2, 3, raster_hash, 5] {
+        for h in [1u64, 2, depth, raster, blend] {
             out.extend(h.to_le_bytes());
         }
         le(&mut out, &[0, 2, 1, NONE]);
@@ -458,18 +458,63 @@ mod tests {
             desc[8..12].copy_from_slice(&slope.to_le_bytes());
             desc[12..].copy_from_slice(&tail);
             let hash = city64(&desc);
-            let file = pack_with_raster(packet.clone(), hash);
+            let file = pack_with_states(packet.clone(), [3, hash, 5]);
             let named = Named::find(&Pack::parse(&file).unwrap(), &[]);
             found.push((named.source.get(&hash).copied(), named.raster.get(&hash) == Some(&desc)));
 
             // A valid register image must not name a description with a different clamp.
             desc[4..8].copy_from_slice(&0.625f32.to_le_bytes());
             let unmatched = city64(&desc);
-            let file = pack_with_raster(packet, unmatched);
+            let file = pack_with_states(packet, [3, unmatched, 5]);
             let named = Named::find(&Pack::parse(&file).unwrap(), &[]);
             assert!(!named.raster.contains_key(&unmatched));
         }
         assert_eq!(found, [(Some("registers"), true); 2], "vertex and mesh rasteriser sources");
+    }
+
+    #[test]
+    fn names_raster_depth_and_blend_from_one_register_image() {
+        use crate::cityhash::city64;
+        use crate::pipelines::{BLEND, DEPTH, Named, RASTER};
+
+        let mut packet = vec![0; 0x74 + 0x28];
+        packet[4] = 4; // Vertex-shader register image.
+        le(
+            &mut packet,
+            &[0, 1, 0, 0, 0.375f32.to_bits(), 21.0f32.to_bits(), (-4.0f32).to_bits()],
+        );
+        packet.resize(0x74 + 0x44, 0);
+        // Depth on, stencil off. Only the stencil read mask survived.
+        le(&mut packet, &[2 | 3 << 4, 0, 0x52 << 8, 0, 0, 0xa5]);
+        packet.resize(0x74 + 0x44 + 14 * 4, 0);
+
+        let mut raster = [0; RASTER];
+        raster[..4].copy_from_slice(&[3, 2, 1, 252]);
+        raster[4..8].copy_from_slice(&0.375f32.to_le_bytes());
+        raster[8..12].copy_from_slice(&1.3125f32.to_le_bytes());
+        raster[12..].copy_from_slice(&[1, 1, 0, 0]);
+
+        let mut depth = [0; DEPTH];
+        depth[..6].copy_from_slice(&[1, 0, 4, 0, 0x52, 0x52]);
+        depth[6..14].copy_from_slice(&[1, 1, 1, 8, 1, 1, 1, 8]);
+        depth[22..].copy_from_slice(&[1, 1]);
+
+        let mut blend = [0; BLEND];
+        blend[..2].copy_from_slice(&[1, 1]); // Alpha-to-coverage, independent targets.
+        blend[4..].as_chunks_mut::<8>().0.fill([0, 2, 1, 1, 2, 1, 1, 15]);
+        blend[11] = 5;
+        blend[12..20].copy_from_slice(&[0, 5, 6, 1, 2, 2, 1, 10]);
+
+        let hashes = [city64(&depth), city64(&raster), city64(&blend)];
+        let bytes = pack_with_states(packet, hashes);
+        let named = Named::find(&Pack::parse(&bytes).unwrap(), &[]);
+        let found = [
+            named.depth.get(&hashes[0]) == Some(&depth),
+            named.raster.get(&hashes[1]) == Some(&raster),
+            named.blend.get(&hashes[2]) == Some(&blend),
+        ];
+        assert_eq!(found, [true; 3], "depth, raster, blend");
+        assert_eq!(hashes.map(|hash| named.source.get(&hash).copied()), [Some("registers"); 3]);
     }
 
     #[test]
