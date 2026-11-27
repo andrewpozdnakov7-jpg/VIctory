@@ -1769,10 +1769,14 @@ impl HostList {
     pub(crate) fn close(&self) {
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
-            let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
+            let notes = self.notes.lock().unwrap_or_else(|e| e.into_inner()).len();
+            let count = notes.min(STAMPS as usize - 1) as u32;
             // SAFETY: an open list, our heap and read-back buffer.
             unsafe {
-                self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, count);
+                // At capacity the first untimed note already closed the last sample.
+                if notes < STAMPS as usize {
+                    self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, count);
+                }
                 self.list.ResolveQueryData(heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, count + 1, back, 0);
             }
         }
@@ -2018,7 +2022,7 @@ impl HostList {
         }
         let at = self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32;
         if let Some((heap, _)) = self.stamps()
-            && at < STAMPS - 1
+            && at < STAMPS
         {
             // SAFETY: an open list and our query heap.
             unsafe { self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, at) };
