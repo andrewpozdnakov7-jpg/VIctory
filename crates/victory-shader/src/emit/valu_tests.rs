@@ -1089,6 +1089,31 @@ fn v_fract_f16_never_returns_one() {
     });
 }
 
+#[test]
+fn v_exp_f16_rounds_the_exact_result_once() {
+    // v_exp_f16 v0, v1 (VOP1 opcode 0x058). Input 0x11c5 is a double-rounding
+    // boundary: exact 2^x is slightly above the midpoint of f16 values
+    // 0x3c00 and 0x3c01, but the nearest f32 is exactly that midpoint.
+    let shader = build_valu_cs(&[vop1(0x058, 0, vgpr(1))]);
+    let cases: &[(u16, u16)] = &[
+        (0x0000, 0x3C00), // 2^0 = 1
+        (0xBC00, 0x3800), // 2^-1 = 0.5
+        (0x11C5, 0x3C01), // correctly rounded up, not a f32 midpoint tie to 1.0
+    ];
+    let inputs: Vec<[u32; 4]> = cases
+        .iter()
+        .map(|&(x, _)| [u32::from(x), 0, 0, 0])
+        .collect();
+    run_cases(&shader, &inputs, |backend, i, inp, got| {
+        let want = u32::from(cases[i].1);
+        assert_eq!(
+            got, want,
+            "{backend}: v_exp_f16({:#06x}) = {got:#010x}, want {want:#010x}",
+            inp[0],
+        );
+    });
+}
+
 /// RDNA2's flt16_to_snorm16 / flt16_to_unorm16: clamp, scale by 32767 or
 /// 65535, round the exact product to nearest even; NaN gives 0.
 fn cvt_norm16_reference(bits: u16, signed: bool) -> u16 {

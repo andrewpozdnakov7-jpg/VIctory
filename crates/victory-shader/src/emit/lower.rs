@@ -7069,6 +7069,19 @@ impl<'a> Lower<'a> {
                     let one = self.s.m.f32(1.0f32.to_bits());
                     self.s.m.bin(c, Bin::SDiv, one, a)
                 }
+                "v_exp_f16" => {
+                    let a = self.half_fsrc(inst, 0)?;
+                    let r = self.unary(21, a);
+                    // Scanning the finite f16 domain finds one input whose
+                    // exact 2^x and its nearest f32 fall on opposite sides of
+                    // a f16 rounding midpoint: round the
+                    // exact result up, not the f32 midpoint tie down.
+                    let x = self.s.m.f32(0x3A38_A000); // f16 0x11c5
+                    let boundary = self.s.m.cmp(c, pred::OEQ, a, x);
+                    // f16 0x3c01, widened exactly.
+                    let up = self.s.m.f32(0x3F80_2000);
+                    self.s.m.select(c, boundary, up, r)
+                }
                 _ => {
                     let a = self.half_fsrc(inst, 0)?;
                     let op = match name {
