@@ -645,6 +645,23 @@ impl Prebuild {
         }
     }
 
+    /// What a run lists a compute pipeline by, from its container's 16-char
+    /// BLAKE3 hex hash (without re-copying or re-hashing the container).
+    pub fn compute_key(hash: &str) -> String {
+        make::key_from_hashes([("compute", hash)], None)
+    }
+
+    /// What a run lists a graphics stream by, from its state subobjects and
+    /// precomputed `(stage, hash)` pairs (without copying or hashing the
+    /// shader containers referenced in `stream`).
+    ///
+    /// # Safety
+    /// The stream's input-element pointers point at live elements.
+    pub unsafe fn graphics_key(stream: &[u8], shaders: &[(&'static str, &str)]) -> String {
+        let (_, graphics) = read_stream(stream, |_, _| None);
+        make::key_from_hashes(shaders.iter().copied(), Some(&graphics))
+    }
+
     /// What a run lists the pipeline by (its early list).
     pub fn key(&self) -> String {
         make::key(&self.shaders, self.graphics.as_deref())
@@ -896,6 +913,160 @@ mod tests {
         put(&mut stream, 0x1e0, 10 | 2 << 32);
         // SAFETY: as above.
         assert_ne!(unsafe { Prebuild::graphics(&stream) }.key(), title.host.key);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn prebuild_key_shortcuts_match_full_prebuild_keys() {
+        let (vs, ms, ps, cs) = ([7u8; 64], [9u8; 48], [5u8; 32], [3u8; 96]);
+        let hex16 = |b: &[u8]| blake3::hash(b).to_hex()[..16].to_owned();
+        let (vs_h, ms_h, ps_h, cs_h) = (hex16(&vs), hex16(&ms), hex16(&ps), hex16(&cs));
+
+        assert_eq!(Prebuild::compute(&cs).key(), Prebuild::compute_key(&cs_h));
+
+        let name = c"POSITION";
+        let mut element = [0u8; 32];
+        element[..8].copy_from_slice(&(name.as_ptr() as u64).to_le_bytes());
+        for (i, w) in [0u32, 6, 0, 0, 0, 0].iter().enumerate() {
+            element[8 + 4 * i..12 + 4 * i].copy_from_slice(&w.to_le_bytes());
+        }
+        let make_stream = |first_kind: u64, first: &[u8], pixel: Option<&[u8]>| {
+            let mut stream = vec![0u8; 0x2b0];
+            let put = |s: &mut Vec<u8>, at: usize, v: u64| {
+                s[at..at + 8].copy_from_slice(&v.to_le_bytes())
+            };
+            for (at, kind) in [
+                (0x10, first_kind),
+                (0x28, 2),
+                (0x40, 3),
+                (0x58, 4),
+                (0x70, 5),
+                (0x88, 8),
+                (0x210, 21),
+                (0x250, 17),
+            ] {
+                put(&mut stream, at, kind);
+            }
+            put(&mut stream, 0x18, first.as_ptr() as u64);
+            put(&mut stream, 0x20, first.len() as u64);
+            if let Some(p) = pixel {
+                put(&mut stream, 0x30, p.as_ptr() as u64);
+                put(&mut stream, 0x38, p.len() as u64);
+            }
+            put(&mut stream, 0x1d8, 9 | 0xffff_ffff << 32);
+            put(&mut stream, 0x1e0, 10 | 3 << 32);
+            put(&mut stream, 0x254, 1);
+            put(&mut stream, 0x260, 12);
+            put(&mut stream, 0x268, element.as_ptr() as u64);
+            put(&mut stream, 0x270, 1);
+            put(&mut stream, 0x278, 14 | 4 << 32);
+            put(&mut stream, 0x280, 15 | 87 << 32);
+            put(&mut stream, 0x2a0, 1 << 32);
+            put(&mut stream, 0x2a8, 16 | 40 << 32);
+            stream
+        };
+
+        // 1) VS + PS
+        let full = make_stream(1, &vs, Some(&ps));
+        let empty = make_stream(1, &[], None);
+        // SAFETY: stream points at live shader code and input element.
+        let full_key = unsafe { Prebuild::graphics(&full) }.key();
+        // SAFETY: stream points at live input element; shader pointers are unused.
+        let fast_key = unsafe { Prebuild::graphics_key(&empty, &[("vertex", &vs_h), ("pixel", &ps_h)]) };
+        assert_eq!(full_key, fast_key);
+
+        // 2) VS-only
+        let full_vs = make_stream(1, &vs, None);
+        // SAFETY: stream points at live shader code and input element.
+        let full_vs_key = unsafe { Prebuild::graphics(&full_vs) }.key();
+        // SAFETY: stream points at live input element; shader pointers are unused.
+        let fast_vs_key = unsafe { Prebuild::graphics_key(&empty, &[("vertex", &vs_h)]) };
+        assert_eq!(full_vs_key, fast_vs_key);
+
+        // 3) MS + PS
+        let full_ms = make_stream(24, &ms, Some(&ps));
+        let empty_ms = make_stream(24, &[], None);
+        // SAFETY: stream points at live shader code and input element.
+        let full_ms_key = unsafe { Prebuild::graphics(&full_ms) }.key();
+        // SAFETY: stream points at live input element; shader pointers are unused.
+        let fast_ms_key = unsafe { Prebuild::graphics_key(&empty_ms, &[("mesh", &ms_h), ("pixel", &ps_h)]) };
+        assert_eq!(full_ms_key, fast_ms_key);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "benchmark"]
+    fn bench_prebuild_key_vs_full() {
+        // Simulate 4,000 warm pipeline key checks (3,000 graphics + 1,000 compute)
+        // referencing 64 KiB shader containers.
+        let vs = vec![0x5Au8; 64 * 1024];
+        let ps = vec![0xA5u8; 64 * 1024];
+        let cs = vec![0x3Cu8; 64 * 1024];
+        let vs_h = blake3::hash(&vs).to_hex()[..16].to_owned();
+        let ps_h = blake3::hash(&ps).to_hex()[..16].to_owned();
+        let cs_h = blake3::hash(&cs).to_hex()[..16].to_owned();
+
+        let make_stream = |first: &[u8], pixel: Option<&[u8]>| {
+            let mut stream = vec![0u8; 0x2b0];
+            let put = |s: &mut Vec<u8>, at: usize, v: u64| {
+                s[at..at + 8].copy_from_slice(&v.to_le_bytes())
+            };
+            for (at, kind) in [
+                (0x10, 1u64),
+                (0x28, 2),
+                (0x40, 3),
+                (0x58, 4),
+                (0x70, 5),
+                (0x88, 8),
+                (0x210, 21),
+                (0x250, 17),
+            ] {
+                put(&mut stream, at, kind);
+            }
+            put(&mut stream, 0x18, first.as_ptr() as u64);
+            put(&mut stream, 0x20, first.len() as u64);
+            if let Some(p) = pixel {
+                put(&mut stream, 0x30, p.as_ptr() as u64);
+                put(&mut stream, 0x38, p.len() as u64);
+            }
+            put(&mut stream, 0x1d8, 9 | 0xffff_ffff << 32);
+            put(&mut stream, 0x1e0, 10 | 3 << 32);
+            put(&mut stream, 0x254, 1);
+            put(&mut stream, 0x260, 12);
+            put(&mut stream, 0x278, 14 | 4 << 32);
+            put(&mut stream, 0x280, 15 | 87 << 32);
+            put(&mut stream, 0x2a0, 1 << 32);
+            put(&mut stream, 0x2a8, 16 | 40 << 32);
+            stream
+        };
+        let full_stream = make_stream(&vs, Some(&ps));
+        let empty_stream = make_stream(&[], None);
+
+        let t0 = std::time::Instant::now();
+        for _ in 0..3000 {
+            // SAFETY: stream points at live vs/ps buffers.
+            std::hint::black_box(unsafe { Prebuild::graphics(&full_stream) }.key());
+        }
+        for _ in 0..1000 {
+            std::hint::black_box(Prebuild::compute(&cs).key());
+        }
+        let full_ms = t0.elapsed().as_secs_f64() * 1e3;
+
+        let t1 = std::time::Instant::now();
+        for _ in 0..3000 {
+            // SAFETY: stream has no shader pointers read by graphics_key.
+            std::hint::black_box(unsafe {
+                Prebuild::graphics_key(&empty_stream, &[("vertex", &vs_h), ("pixel", &ps_h)])
+            });
+        }
+        for _ in 0..1000 {
+            std::hint::black_box(Prebuild::compute_key(&cs_h));
+        }
+        let fast_ms = t1.elapsed().as_secs_f64() * 1e3;
+        eprintln!(
+            "prebuild key (4000 jobs, 64 KiB shaders): full={full_ms:.2} ms, key_only={fast_ms:.2} ms ({:.2}x)",
+            full_ms / fast_ms
+        );
     }
 }
 
