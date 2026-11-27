@@ -853,6 +853,151 @@ pub(crate) fn recent_levels() -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn rgba32_uint_gpu_readback_preserves_pitched_texels() {
+        use super::*;
+        use crate::host::{host, transition};
+
+        let Some(host) = host() else {
+            eprintln!("no D3D12 device; skipped RGBA32 UINT readback");
+            return;
+        };
+        let format = DXGI_FORMAT_R32G32B32A32_UINT;
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 2,
+            Height: 2,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: format,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            ..Default::default()
+        };
+        let mut texture: Option<ID3D12Resource> = None;
+        let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+        let mut size = 0u64;
+        // SAFETY: the device and the texture description are live.
+        unsafe {
+            host.device
+                .CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES {
+                        Type: D3D12_HEAP_TYPE_DEFAULT,
+                        ..Default::default()
+                    },
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    None,
+                    &mut texture,
+                )
+                .unwrap();
+            host.device.GetCopyableFootprints(
+                &desc,
+                0,
+                1,
+                0,
+                Some(&mut footprint),
+                None,
+                None,
+                Some(&mut size),
+            );
+        }
+        let texture = texture.unwrap();
+        let (upload, data) = host.upload_buffer(size).unwrap();
+        let rows = [
+            [
+                0x8000_0000,
+                0x4000_0000,
+                0,
+                u32::MAX,
+                0x2000_0000,
+                0,
+                0x8000_0000,
+                1,
+            ],
+            [
+                0,
+                0x2000_0000,
+                0x8000_0000,
+                0,
+                0x4000_0000,
+                0x8000_0000,
+                0x2000_0000,
+                u32::MAX,
+            ],
+        ];
+        let pitch = footprint.Footprint.RowPitch as usize;
+        assert!(pitch > 32);
+        let list = host.new_list().unwrap();
+        // SAFETY: these are the two active rows of the mapped upload
+        // footprint. The command list and all copy resources are live.
+        unsafe {
+            data.write_bytes(0xA5, size as usize);
+            for (y, row) in rows.into_iter().enumerate() {
+                let bytes: Vec<_> = row.into_iter().flat_map(u32::to_le_bytes).collect();
+                data.add(footprint.Offset as usize + y * pitch)
+                    .copy_from_nonoverlapping(bytes.as_ptr(), bytes.len());
+            }
+            let from = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&upload),
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    PlacedFootprint: footprint,
+                },
+            };
+            let to = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&texture),
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    SubresourceIndex: 0,
+                },
+            };
+            list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None);
+            list.list.ResourceBarrier(&[transition(
+                &texture,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+        }
+        let (readback, read) = read_back(&host.device, &list.list, &texture).unwrap();
+        list.close();
+        host.execute(&[&list]);
+        let mut mapped = std::ptr::null_mut();
+        let pitch = read.Footprint.RowPitch as usize;
+        assert_eq!(
+            (
+                read.Footprint.Width,
+                read.Footprint.Height,
+                read.Footprint.Format
+            ),
+            (2, 2, format)
+        );
+        // SAFETY: the readback completed. The span ends at the last texel
+        // of the second row and stays within the mapped buffer.
+        let pixels = unsafe {
+            readback.Map(0, None, Some(&mut mapped)).unwrap();
+            let data = mapped.cast::<u8>().add(read.Offset as usize);
+            let bytes = std::slice::from_raw_parts(data, pitch + 32);
+            let pixels = to_rgba(format.0 as u32, 2, 2, pitch, bytes);
+            readback.Unmap(0, None);
+            pixels
+        };
+        println!(
+            "RGBA32 UINT readback 2x2 pitch={pitch} converted={}",
+            pixels.is_some()
+        );
+        assert_eq!(
+            pixels,
+            Some(vec![
+                255, 127, 0, 255, 63, 0, 255, 255, 0, 63, 255, 255, 127, 255, 63, 255,
+            ])
+        );
+    }
+
     #[test]
     fn crc_matches_the_png_check_value() {
         assert_eq!(super::crc32(b"IEND"), 0xae42_6082);
