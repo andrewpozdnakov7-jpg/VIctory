@@ -2827,19 +2827,29 @@ impl<'a> Lower<'a> {
         match v.omod {
             0 => {}
             k => {
-                // On the flushed result; a zero or denormal product comes out
-                // +0 (measured on RDNA2 with IEEE mode off).
+                // On the flushed result; an unscaled zero or denormal becomes +0
+                // (measured on RDNA2 by the Leonida project, gfx1031/gfx1036,
+                // with IEEE mode off). On gfx1035 (AnyPS5 #567), div:2 of the
+                // lowest normal binade gives a zero of its sign, even when
+                // rounding the half to f32 would give a normal.
                 let factor = [1.0f32, 2.0, 4.0, 0.5][usize::from(k)];
                 let c = self.cur;
-                let k = self.s.m.f32(factor.to_bits());
-                let r = self.ftz(f);
-                let r = self.s.m.bin(c, Bin::Mul, r, k);
-                let x = self.as_int(r);
+                let factor = self.s.m.f32(factor.to_bits());
+                let product = self.s.m.bin(c, Bin::Mul, f, factor);
+                let product = self.as_int(product);
+                let x = self.as_int(f);
                 let (exp, zero) = (self.s.m.i32(0x7F80_0000), self.s.m.i32(0));
                 let e = self.s.m.bin(c, Bin::And, x, exp);
                 let tiny = self.s.m.cmp(c, pred::EQ, e, zero);
-                let x = self.s.m.select(c, tiny, zero, x);
-                f = self.as_float(x);
+                let mut x_out = self.s.m.select(c, tiny, zero, product);
+                if k == 3 {
+                    let min_normal = self.s.m.i32(0x0080_0000);
+                    let lowest = self.s.m.cmp(c, pred::EQ, e, min_normal);
+                    let sign = self.s.m.i32(0x8000_0000);
+                    let signed_zero = self.s.m.bin(c, Bin::And, x, sign);
+                    x_out = self.s.m.select(c, lowest, signed_zero, x_out);
+                }
+                f = self.as_float(x_out);
             }
         }
         if v.clamp {

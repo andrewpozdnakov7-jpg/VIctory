@@ -816,14 +816,17 @@ fn mods_in(x: u32, k: usize, m: M) -> u32 {
 /// into +0, then the clamp to [0, 1], which gives +0 for NaN (DX10 clamp)
 /// and for -0. Measured on RDNA2 by the Leonida project (gfx1031 and
 /// gfx1036 for the multiplier with IEEE off and denormals flushed; the
-/// clamp's -0 and NaN on gfx1036 for f16).
+/// clamp's -0 and NaN on gfx1036 for f16). On gfx1035 a nonzero normal
+/// that underflows under div:2 keeps its sign (AnyPS5 #567).
 fn mods_out(r: u32, m: M) -> u32 {
     let mut r = r;
     if m.omod != 0 && !nan(r) {
-        r = out(fl(r) * [1.0, 2.0, 4.0, 0.5][usize::from(m.omod)]);
-        if r == 0x8000_0000 {
-            r = 0;
-        }
+        let x = d(r);
+        r = if x == 0.0 {
+            0
+        } else {
+            out64(x * [1.0, 2.0, 4.0, 0.5][usize::from(m.omod)])
+        };
     }
     if m.clamp {
         r = if nan(r) || fl(r) <= 0.0 {
@@ -2882,6 +2885,36 @@ fn defect_multiply_adds_fused_only_where_the_host_fuses() {
     defect(p, FMA);
 }
 
+/// Compose the legacy zero-factor rule with div:2 and its later clamp.
+#[test]
+fn legacy_fma_div2_preserves_underflow_sign_before_clamp() {
+    let half = M { omod: 3, ..NONE };
+    let clamped = M {
+        clamp: true,
+        ..half
+    };
+    let body = [
+        vop3(0x140, 5, [v(1), v(2), v(3)], half),
+        vop3(0x140, 6, [v(1), v(2), v(3)], clamped),
+    ]
+    .concat();
+    let one = 1.0f32.to_bits();
+    let infinity = f32::INFINITY.to_bits();
+    let rows = vec![
+        [0x8080_0000, one, 0, 0x8000_0000],
+        [0x80FF_FFFF, one, 0, 0x8000_0000],
+        [0x00FF_FFFF, one, 0, 0],
+        [0x8100_0000, one, 0, 0x8080_0000],
+        [0x0100_0000, one, 0, 0x0080_0000],
+        [0x8000_0000, infinity, 0x8080_0000, 0x8000_0000],
+        [0x8000_0000, infinity, 0x8000_0000, 0],
+    ];
+    assert_clean(check(&[probe(body, rows, INT, |i| {
+        let expected = i[3];
+        vec![expected, if expected >> 31 == 0 { expected } else { 0 }]
+    })]));
+}
+
 /// The VOP3 output multipliers flush the result and turn a zero into +0
 /// with IEEE mode off (measured on RDNA2, gfx1031 and gfx1036, by the
 /// Leonida project). Was a defect: the host's multiply kept -0.
@@ -2891,6 +2924,118 @@ fn output_multipliers_give_positive_zero() {
     p.extend(min_max_probes());
     p.extend(transcendental_probes());
     defect(p, OMOD);
+}
+
+/// gfx1035 (AnyPS5 #567): div:2 flushes the lowest normal binade before
+/// rounding. A zero that was already zero loses its sign.
+#[test]
+fn div2_of_the_lowest_binade_keeps_the_sign() {
+    let half = M { omod: 3, ..NONE };
+    let rows = [
+        (0x0000_0000, 0),
+        (0x8000_0000, 0),
+        (0x0080_0000, 0),
+        (0x8080_0000, 0x8000_0000),
+        (0x00FF_FFFF, 0),
+        (0x80FF_FFFF, 0x8000_0000),
+        (0x0100_0000, 0x0080_0000),
+        (0x8100_0000, 0x8080_0000),
+    ];
+    // Multiply x by one, add zero to x, and take min(x, x).
+    let body = [
+        vop3(0x108, 5, [v(1), v(2), 0], half),
+        vop3(0x103, 6, [int(0), v(1), 0], half),
+        vop3(0x10F, 7, [v(1), v(1), 0], half),
+    ]
+    .concat();
+    let inputs = rows.map(|(x, expected)| [x, 1.0f32.to_bits(), expected, OLD]);
+    assert_clean(check(&[probe(body, inputs.to_vec(), INT, |i| {
+        vec![i[2]; 3]
+    })]));
+    for (x, expected) in rows {
+        assert_eq!(mods_out(x, half), expected, "model div:2 of {x:08x}");
+    }
+}
+
+/// RDNA2 f32 `div:2` output modifier in IEEE=0, f32 denormals flushed (`0xc0`):
+/// zero or flushed-denormal inputs become `+0`, whereas `exp == 1` values
+/// (`0x0080_0000..=0x00ff_ffff`, including negative `-FLT_MIN`) underflow to
+/// a zero preserving sign before rounding.
+/// Measured hardware rows from `boykopovar/AnyPS5`
+/// `core/libs/prx/libSceAgcDriver/tests/execution/F32OutputModifier.cpp` (`d3f2611384`).
+#[test]
+fn f32_omod_div2_underflow_matches_rdna2_oracle() {
+    let div2 = M { omod: 3, ..NONE };
+    let mul2 = M { omod: 1, ..NONE };
+    let clamp_div2 = M {
+        omod: 3,
+        clamp: true,
+        ..NONE
+    };
+    let make2 = |op: u16, m: M, rows: Vec<([u32; 4], u32)>| {
+        let inputs: Vec<[u32; 4]> = rows.iter().map(|&(i, _)| i).collect();
+        probe(vop3(op, 5, [v(1), v(2), 0], m), inputs, INT, move |i| {
+            vec![
+                rows.iter()
+                    .find(|&&(r, _)| r == i)
+                    .expect("known input")
+                    .1,
+            ]
+        })
+    };
+    let mul_div2_rows = vec![
+        ([0x8000_0000, 0x3F80_0000, 0, OLD], 0x0000_0000),
+        ([0x8080_0000, 0x3F80_0000, 0, OLD], 0x8000_0000),
+        ([0x00FF_FFFF, 0x3F80_0000, 0, OLD], 0x0000_0000),
+        ([0x3F80_0000, 0x0100_0000, 0, OLD], 0x0080_0000),
+        ([0xBF80_0000, 0x0100_0000, 0, OLD], 0x8080_0000),
+    ];
+    let mul_mul2_rows = vec![
+        ([0x8000_0000, 0x3F80_0000, 0, OLD], 0x0000_0000),
+        ([0x8080_0000, 0x3F80_0000, 0, OLD], 0x8100_0000),
+    ];
+    let add_div2_rows = vec![
+        ([0x0000_0000, 0x8080_0000, 0, OLD], 0x8000_0000),
+        ([0x0000_0000, 0x0080_0000, 0, OLD], 0x0000_0000),
+        ([0x8000_0000, 0x8000_0000, 0, OLD], 0x0000_0000),
+    ];
+    let min_div2_rows = vec![
+        ([0x8080_0000, 0x3F80_0000, 0, OLD], 0x8000_0000),
+        ([0x00FF_FFFF, 0x3F80_0000, 0, OLD], 0x0000_0000),
+        ([0x0000_0000, 0x8080_0000, 0, OLD], 0x8000_0000),
+        ([0x8080_0000, 0x8080_0000, 0, OLD], 0x8000_0000),
+    ];
+    let fma_div2_rows = [
+        ([0x0000_0000, 0x8080_0000, 0x8080_0000, OLD], 0x8000_0000),
+        ([0x8000_0000, 0x3F80_0000, 0x8000_0000, OLD], 0x0000_0000),
+    ];
+    let mul_clamp_div2_rows = vec![
+        ([0x00FF_FFFF, 0x3F80_0000, 0, OLD], 0x0000_0000),
+        ([0x3F80_0000, 0x0100_0000, 0, OLD], 0x0080_0000),
+        ([0x8080_0000, 0x3F80_0000, 0, OLD], 0x0000_0000),
+    ];
+    let fma_inputs: Vec<[u32; 4]> = fma_div2_rows.iter().map(|&(i, _)| i).collect();
+    assert_clean(check(&[
+        make2(0x108, div2, mul_div2_rows),
+        make2(0x108, mul2, mul_mul2_rows),
+        make2(0x103, div2, add_div2_rows),
+        make2(0x10F, div2, min_div2_rows),
+        probe(
+            vop3(0x14B, 5, [v(1), v(2), v(3)], div2),
+            fma_inputs,
+            INT,
+            move |i| {
+                vec![
+                    fma_div2_rows
+                        .iter()
+                        .find(|&&(r, _)| r == i)
+                        .expect("known input")
+                        .1,
+                ]
+            },
+        ),
+        make2(0x108, clamp_div2, mul_clamp_div2_rows),
+    ]));
 }
 
 /// Denormal operands of `v_min/max/med3/min3/max3_f32` read as zeros of
