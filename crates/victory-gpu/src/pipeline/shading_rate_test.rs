@@ -91,9 +91,10 @@ fn shading_rate_controls_coarse_pixel_rasterization() {
     let name = String::from_utf16_lossy(&adapter.Description);
     let tier = host.shading_rate_tier.0 as u32;
     eprintln!(
-        "shading rate on {}: tier={tier}, additional={}",
+        "shading rate on {}: tier={tier}, additional={}, sum={}",
         name.trim_end_matches('\0'),
-        host.additional_shading_rates
+        host.additional_shading_rates,
+        host.shading_rate_sum_combiner
     );
 
     let vs = compile_hlsl(
@@ -391,6 +392,11 @@ fn shading_rate_controls_coarse_pixel_rasterization() {
     let non_passthrough = [0u32, 3u32];
     set_rate(list, 0x5, non_passthrough.as_ptr());
     draw_quad(0, 2);
+    // The shading-rate image defaults to 1x1, so SUM in the second
+    // combiner or its passthrough fallback preserves the 2x2 rate.
+    let sum = [0u32, 4];
+    set_rate(list, 0x5, sum.as_ptr());
+    draw_quad(2, 2);
     let pass2 = read_target();
 
     assert_ne!(pass2[0][0][0], pass2[0][1][0], "reset must restore 1x1 X");
@@ -408,8 +414,13 @@ fn shading_rate_controls_coarse_pixel_rasterization() {
             pass2[2][0], pass2[3][1],
             "2x2 with [PASSTHROUGH, MAX] must produce 2x2 on Tier 1 and Tier 2"
         );
+        assert_eq!(
+            pass2[2][2], pass2[3][3],
+            "2x2 with SUM or its fallback must broadcast across the block"
+        );
     } else {
         assert_ne!(pass2[2][0][0], pass2[2][1][0]);
+        assert_ne!(pass2[2][2][0], pass2[2][3][0]);
     }
 
     // When the adapter advertises AdditionalShadingRatesSupported, 4x4 (0xA)

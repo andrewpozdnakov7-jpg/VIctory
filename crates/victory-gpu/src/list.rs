@@ -1342,22 +1342,22 @@ pub(crate) struct SanitizedShadingRate {
 
 /// Sanitizes console `RSSetShadingRate` parameters against the host's
 /// `D3D12_VARIABLE_SHADING_RATE_TIER` (`0` unsupported, `1` tier 1, `2` tier 2)
-/// and `AdditionalShadingRatesSupported`.
+/// and its optional additional-rate and SUM-combiner capabilities.
 ///
 /// - Tier 0 returns `None`.
 /// - Additional 4x rates (`2x4`, `4x2`, `4x4`) fall back to `2x2` when the
 ///   host does not advertise `AdditionalShadingRatesSupported`.
 /// - Unknown base rates fall back to `1x1` (`0`) with `invalid_rate = true`.
-/// - Tier 1 drops combiners to `None` (D3D12 forbids non-passthrough combiners
-///   on Tier 1).
-/// - Tier 2 validates each combiner against `0..=4` (`PASSTHROUGH..=SUM`),
-///   replacing out-of-range entries with `PASSTHROUGH` (`0`).
+/// - Tier 1 only uses the command-list rate, so combiners are omitted.
+/// - Tier 2 accepts `SUM` when the host advertises it. Unsupported and
+///   unknown combiners become `PASSTHROUGH` (`0`).
 #[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) fn sanitize_shading_rate(
     rate: u32,
     combiners: Option<[u32; 2]>,
     tier: u32,
     additional: bool,
+    sum_combiner: bool,
 ) -> Option<SanitizedShadingRate> {
     const RATE_1X1: u32 = 0x0;
     const RATE_1X2: u32 = 0x1;
@@ -1367,6 +1367,7 @@ pub(crate) fn sanitize_shading_rate(
     const RATE_4X2: u32 = 0x9;
     const RATE_4X4: u32 = 0xA;
     const COMBINER_PASSTHROUGH: u32 = 0;
+    const COMBINER_MAX: u32 = 3;
     const COMBINER_SUM: u32 = 4;
 
     if tier == 0 {
@@ -1382,8 +1383,9 @@ pub(crate) fn sanitize_shading_rate(
         None
     } else {
         combiners.map(|[c0, c1]| {
+            let last = if sum_combiner { COMBINER_SUM } else { COMBINER_MAX };
             let check = |c: u32, bad: &mut Option<u32>| {
-                if c <= COMBINER_SUM {
+                if c <= last {
                     c
                 } else {
                     if bad.is_none() {
@@ -2137,13 +2139,30 @@ mod tests {
     }
 
     #[test]
+    fn shading_rate_sum_requires_its_own_capability() {
+        for additional in [false, true] {
+            for (input, fallback) in [([3, 4], [3, 0]), ([4, 2], [0, 2]), ([4, 4], [0, 0])] {
+                let restricted =
+                    sanitize_shading_rate(0x5, Some(input), 2, additional, false).unwrap();
+                assert_eq!(restricted.combiners, Some(fallback));
+                assert_eq!(restricted.invalid_combiner, Some(4));
+
+                let supported =
+                    sanitize_shading_rate(0x5, Some(input), 2, additional, true).unwrap();
+                assert_eq!(supported.combiners, Some(input));
+                assert_eq!(supported.invalid_combiner, None);
+            }
+        }
+    }
+
+    #[test]
     fn sanitize_shading_rate_enforces_tier_and_validates_inputs() {
-        assert_eq!(sanitize_shading_rate(0x5, None, 0, false), None);
+        assert_eq!(sanitize_shading_rate(0x5, None, 0, false, false), None);
 
         // Tier 1 keeps standard rates, clamps 4x rates when additional rates
         // are unavailable, and drops combiners to None.
         assert_eq!(
-            sanitize_shading_rate(0x5, Some([1, 3]), 1, false),
+            sanitize_shading_rate(0x5, Some([1, 3]), 1, false, false),
             Some(SanitizedShadingRate {
                 rate: 0x5,
                 combiners: None,
@@ -2153,18 +2172,18 @@ mod tests {
         );
         for extra in [0x6, 0x9, 0xA] {
             assert_eq!(
-                sanitize_shading_rate(extra, None, 1, false).unwrap().rate,
+                sanitize_shading_rate(extra, None, 1, false, false).unwrap().rate,
                 0x5
             );
             assert_eq!(
-                sanitize_shading_rate(extra, None, 1, true).unwrap().rate,
+                sanitize_shading_rate(extra, None, 1, true, false).unwrap().rate,
                 extra
             );
         }
 
         // Tier 2 forwards valid combiners and falls back on out-of-range values.
         assert_eq!(
-            sanitize_shading_rate(0x4, Some([2, 4]), 2, true),
+            sanitize_shading_rate(0x4, Some([2, 4]), 2, true, true),
             Some(SanitizedShadingRate {
                 rate: 0x4,
                 combiners: Some([2, 4]),
@@ -2173,7 +2192,7 @@ mod tests {
             })
         );
         assert_eq!(
-            sanitize_shading_rate(0x1, Some([1, 99]), 2, false),
+            sanitize_shading_rate(0x1, Some([1, 99]), 2, false, true),
             Some(SanitizedShadingRate {
                 rate: 0x1,
                 combiners: Some([1, 0]),
@@ -2184,7 +2203,7 @@ mod tests {
 
         // Unknown base shading rate falls back to 1x1 and is flagged.
         assert_eq!(
-            sanitize_shading_rate(0x7, None, 2, true),
+            sanitize_shading_rate(0x7, None, 2, true, false),
             Some(SanitizedShadingRate {
                 rate: 0x0,
                 combiners: None,

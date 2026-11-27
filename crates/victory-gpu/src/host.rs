@@ -44,6 +44,7 @@ pub(crate) struct Host {
     pub(crate) depth_bounds_supported: bool,
     pub(crate) shading_rate_tier: D3D12_VARIABLE_SHADING_RATE_TIER,
     pub(crate) additional_shading_rates: bool,
+    pub(crate) shading_rate_sum_combiner: bool,
     queue: ID3D12CommandQueue,
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
@@ -222,6 +223,16 @@ fn create() -> windows::core::Result<Host> {
         } else {
             (D3D12_VARIABLE_SHADING_RATE_TIER_NOT_SUPPORTED, false)
         };
+        let mut options10 = D3D12_FEATURE_DATA_D3D12_OPTIONS10::default();
+        let shading_rate_sum_combiner = shading_rate_tier.0 >= D3D12_VARIABLE_SHADING_RATE_TIER_2.0
+            && device
+                .CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS10,
+                    (&raw mut options10).cast(),
+                    size_of_val(&options10) as u32,
+                )
+                .is_ok()
+            && options10.VariableRateShadingSumCombinerSupported.as_bool();
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();
@@ -270,6 +281,7 @@ fn create() -> windows::core::Result<Host> {
             depth_bounds_supported,
             shading_rate_tier,
             additional_shading_rates,
+            shading_rate_sum_combiner,
             queue,
             fence,
             submitted: Mutex::new(0),
@@ -810,6 +822,7 @@ pub(crate) struct HostList {
     pub(crate) shading_rate: Option<ID3D12GraphicsCommandList5>,
     pub(crate) shading_rate_tier: D3D12_VARIABLE_SHADING_RATE_TIER,
     pub(crate) additional_shading_rates: bool,
+    pub(crate) shading_rate_sum_combiner: bool,
     /// Work for submission time, in recorded order.
     deferred: Mutex<Deferred>,
     /// Upload memory for data the list's draws make (expanded vertices),
@@ -893,7 +906,7 @@ pub(crate) fn warn_invalid_shading_rate_combiner(combiner: u32) {
     ONCE.call_once(|| {
         tracing::warn!(
             combiner,
-            "invalid shading rate combiner; falling back to passthrough"
+            "unsupported shading rate combiner, using passthrough"
         );
     });
 }
@@ -1182,6 +1195,7 @@ impl Host {
                     .flatten(),
                 shading_rate_tier: self.shading_rate_tier,
                 additional_shading_rates: self.additional_shading_rates,
+                shading_rate_sum_combiner: self.shading_rate_sum_combiner,
                 list,
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),

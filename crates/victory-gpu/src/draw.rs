@@ -547,6 +547,7 @@ impl State {
             combiners,
             list.shading_rate_tier.0 as u32,
             list.additional_shading_rates,
+            list.shading_rate_sum_combiner,
         ) else {
             return;
         };
