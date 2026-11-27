@@ -2231,12 +2231,13 @@ impl<'a> Lower<'a> {
         let sign = self.s.m.bin(c, op, ia, ib);
         let signed = self.as_float(sign);
         let r = self.s.m.select(c, zeros, signed, r);
-        // A NaN operand gives the other operand; if both are NaN, keep the
-        // first operand's NaN (RDNA2 ISA; semantics_tests::min_max). DXIL
-        // FMax/FMin has this semantics, but keep it explicit so a driver
-        // quirk cannot turn a NaN into a black pixel.
-        let a_nan = self.s.m.cmp(c, pred::UNO, a, a);
-        let b_nan = self.s.m.cmp(c, pred::UNO, b, b);
+        // Keep the first NaN if both inputs are NaN. Classify on the bits
+        // so a host floating-point comparison cannot discard the NaN case.
+        let infinity = self.s.m.i32(0x7F80_0000);
+        let a_magnitude = self.s.m.bin(c, Bin::And, ia, magnitude);
+        let b_magnitude = self.s.m.bin(c, Bin::And, ib, magnitude);
+        let a_nan = self.s.m.cmp(c, pred::IUGT, a_magnitude, infinity);
+        let b_nan = self.s.m.cmp(c, pred::IUGT, b_magnitude, infinity);
         let r = self.s.m.select(c, a_nan, b, r);
         self.s.m.select(c, b_nan, a, r)
     }

@@ -798,6 +798,9 @@ fn max_and_min_treat_a_nan_as_the_other_operand() {
     let nan = 0x7FC0_0001u32;
     let nan2 = 0x7FC0_0002u32;
     let nan3 = 0x7FC0_0003u32;
+    let negative_nan = 0xFFC0_0004u32;
+    let positive_inf = f32::INFINITY.to_bits();
+    let negative_inf = f32::NEG_INFINITY.to_bits();
     let a = 1.0f32.to_bits();
     let b = 2.0f32.to_bits();
     // (inputs, 2-op want, max3 want, min3 want)
@@ -806,6 +809,18 @@ fn max_and_min_treat_a_nan_as_the_other_operand() {
         ([a, nan, b, 0], a, b, a),
         ([nan, nan2, b, 0], nan, b, b),
         ([nan, nan2, nan3, 0], nan, nan, nan),
+        (
+            [negative_nan, nan2, nan3, 0],
+            negative_nan,
+            negative_nan,
+            negative_nan,
+        ),
+        (
+            [negative_nan, positive_inf, negative_inf, 0],
+            positive_inf,
+            positive_inf,
+            negative_inf,
+        ),
     ];
     let ops = [
         ("v_max_f32", 0x110u16),
