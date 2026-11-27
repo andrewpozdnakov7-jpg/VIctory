@@ -2525,14 +2525,15 @@ impl<'a> Lower<'a> {
     /// than turning an infinite or NaN factor into a NaN.
     fn legacy_fmad(&mut self, a: V, b: V, c: V) -> V {
         let cur = self.cur;
-        let fused = self.fmad(a, b, c);
         let zero = self.s.m.f32(0);
         let az = self.s.m.cmp(cur, pred::OEQ, a, zero);
         let bz = self.s.m.cmp(cur, pred::OEQ, b, zero);
         let z = self.s.m.bin(cur, Bin::Or, az, bz);
-        // +0 + c, so the sign of a zero addend follows the addition.
-        let addend = self.s.m.bin(cur, Bin::Add, zero, c);
-        self.s.m.select(cur, z, addend, fused)
+        // Select a +0 product inside the multiply-add. A separate +0 + c
+        // can fold to c on a host driver, changing the sign when c is -0.
+        let a = self.s.m.select(cur, z, zero, a);
+        let b = self.s.m.select(cur, z, zero, b);
+        self.fmad(a, b, c)
     }
 
     // ---- lane booleans ----

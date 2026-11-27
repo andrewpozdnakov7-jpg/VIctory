@@ -2249,8 +2249,6 @@ fn relative_moves_reach_only_what_their_clamped_index_can() {
     );
 }
 
-/// `v_fma_legacy_f32` (VOP3 0x140) as RDNA 2 runs it: fused, with flushed
-/// sources and the legacy zero-factor rule.
 #[test]
 fn v_mul_legacy_f32_treats_denormals_as_zero() {
     // v_mul_legacy_f32 v0, v1, v2 (VOP2 opcode 0x007 in its VOP3 encoding)
@@ -2283,27 +2281,11 @@ fn v_mul_legacy_f32_treats_denormals_as_zero() {
         );
     });
 }
-fn v_mad_f32_flushes_subnormals_around_omod() {
-    // 1.5 * FLT_MIN * 1.0 - FLT_MIN is a positive subnormal. RDNA flushes
-    // it before mul:2, so it stays +0 instead of becoming FLT_MIN.
-    let [w0, mut w1] = vop3(0x141, 0, vgpr(1), vgpr(2), vgpr(3));
-    w1 |= 1 << 27; // OMOD = multiply by two.
-    let before_omod = build_valu_cs(&[w0, w1]);
-    let before_cases: [[u32; 4]; 1] = [[0x00c0_0000, 0x3f80_0000, 0x8080_0000, 0]];
-    // A subnormal product is flushed before the normal accumulator is added.
-    let product_cases = [[0x0080_0000, 0x3f00_0000, 0x0080_0000, 0]];
-    // A subnormal input is flushed before arithmetic; without that, it nudges
-    // FLT_MIN to the next representable f32 before mul:2.
-    let input_cases = [[0x0000_0001, 0x3f80_0000, 0x0080_0000, 0]];
-    // OMOD=div:2 turns FLT_MIN into a subnormal, which the result flush clears.
-    let [out_w0, mut out_w1] = vop3(0x141, 0, vgpr(1), vgpr(2), vgpr(3));
-    out_w1 |= 3 << 27;
-    let after_omod = build_valu_cs(&[out_w0, out_w1]);
-    let after_cases = [[0x0080_0000, 0x3f80_0000, 0, 0]];
 
-}
+/// Legacy FMA and FMAC as RDNA 2 runs them, with flushed sources and the
+/// zero-factor rule.
+#[test]
 fn legacy_mad_fuses_its_product_and_flushes_its_sources() {
-    let mad = build_valu_cs(&vop3(0x140, 0, vgpr(1), vgpr(2), vgpr(3)));
     let cases = [
         // (1 + 2^-23) * (1 - 2^-23) - 1 is -2^-46 exactly: kept by one
         // rounding, lost when the product is rounded before the add.
@@ -2312,8 +2294,11 @@ fn legacy_mad_fuses_its_product_and_flushes_its_sources() {
         [0x0000_0001, 0x3f80_0000, 0x3f80_0000, 0],
         // A zero factor gives a +0 product even with an infinite factor.
         [0, 0x7f80_0000, 0x3f80_0000, 0],
+        // +0 + -0 gives +0 for either zero factor and either sign of zero.
+        [0, 0x7f80_0000, 0x8000_0000, 0],
+        [0xff80_0000, 0x8000_0000, 0x8000_0000, 0],
     ];
-    let want = [0xa880_0000u32, 0x3f80_0000, 0x3f80_0000];
+    let want = [0xa880_0000, 0x3f80_0000, 0x3f80_0000, 0, 0];
     if Host::new(false).is_err() && Host::new(true).is_err() {
         eprintln!("no SM 6.6 host or WARP device; skipped");
         return;
@@ -2322,13 +2307,21 @@ fn legacy_mad_fuses_its_product_and_flushes_its_sources() {
     // here although the old probe passed) cannot be the reference for the
     // fused form: skip the case there as on WARP.
     let fuses = Host::new(false).ok().and_then(|h| h.fuses_fmad().ok());
-    run_cases(&mad, &cases, |backend, i, _, got| {
-        if i == 0 && (backend == "warp" || fuses == Some(false)) {
-            eprintln!("{backend}: the device rounds the product before the add; skipped");
-            return;
-        }
-        assert_eq!(got, want[i], "{backend}: case {i}");
-    });
+    let fma = vop3(0x140, 0, vgpr(1), vgpr(2), vgpr(3));
+    let fmac = [
+        vop1(0x001, 0, vgpr(3)),
+        0x0C00_0501, // v_fmac_legacy_f32 v0, v1, v2
+    ];
+    for (name, words) in [("FMA", fma), ("FMAC", fmac)] {
+        let shader = build_valu_cs(&words);
+        run_cases(&shader, &cases, |backend, i, _, got| {
+            if i == 0 && (backend == "warp" || fuses == Some(false)) {
+                eprintln!("{backend}: the device rounds the product before the add; skipped");
+                return;
+            }
+            assert_eq!(got, want[i], "{backend}, {name}: case {i}");
+        });
+    }
 }
 
 /// The same without a GPU: one fused `tertiary.f32` and one flush per source.
@@ -2345,6 +2338,11 @@ fn legacy_mad_lowers_to_one_fused_op_with_flushed_sources() {
         .lines()
         .filter(|line| line.contains("and i32") && line.contains("2139095040"))
         .count();
-    assert_eq!(count("call float @dx.op.tertiary.f32"), 1, "one fused multiply-add");
+    assert_eq!(
+        count("call float @dx.op.tertiary.f32"),
+        1,
+        "one fused multiply-add"
+    );
     assert_eq!(flushes, 3, "each source is flushed");
+    assert_eq!(count(" fadd "), 0, "zero products use the fused operation");
 }
