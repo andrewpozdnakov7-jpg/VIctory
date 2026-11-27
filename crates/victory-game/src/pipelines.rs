@@ -432,6 +432,9 @@ fn blend_target(control: u32, mask: u8) -> Vec<[u8; 8]> {
         // Off: the factors are not kept; the defaults and the common ones.
         return [
             [2, 1, 1, 2, 1, 1],
+            // Source-alpha interpolation in RGB can copy or accumulate source alpha.
+            [5, 6, 1, 2, 1, 1],
+            [5, 6, 1, 2, 2, 1],
             [5, 6, 1, 2, 6, 1],
             [5, 6, 1, 5, 6, 1],
             [2, 2, 1, 2, 2, 1],
@@ -1053,6 +1056,32 @@ mod tests {
         let mut found = false;
         blend_from_registers(&regs, &[28, 0, 0, 0, 0, 0, 0, 0], |b| found |= b == want);
         assert!(found);
+    }
+
+    #[test]
+    fn disabled_blends_keep_their_separate_alpha_factors() {
+        let formats = [10, 28, 0, 0, 0, 0, 0, 0];
+        let mut regs = [0; 14];
+        regs[5] = 0xa5;
+        for (independent, target, alpha_dst, mask) in [(0, 0usize, 1, 5), (1, 1, 2, 10)] {
+            let mut expected = [0; BLEND];
+            expected[0] = 1; // alpha-to-coverage
+            expected[1] = independent;
+            expected[4..].as_chunks_mut::<8>().0.fill(DEFAULT_TARGET);
+            if independent == 1 {
+                expected[11] = 5;
+            }
+            let at = 4 + 8 * target;
+            expected[at..at + 8].copy_from_slice(&[0, 5, 6, 1, 2, alpha_dst, 1, mask]);
+
+            let hash = city64(&expected);
+            let mut wanted = HashSet::from([hash]);
+            let mut named = HashMap::new();
+            blend_from_registers(&regs, &formats, |b| {
+                try_one(&mut named, &mut wanted, &b);
+            });
+            assert_eq!(named.get(&hash), Some(&expected));
+        }
     }
 
     #[test]
