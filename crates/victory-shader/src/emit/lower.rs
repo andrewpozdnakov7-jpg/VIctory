@@ -8304,6 +8304,20 @@ impl<'a> Lower<'a> {
         false
     }
 
+    /// `x` (an f16 in the low bits) as the low half of VGPR `reg`: 16-bit
+    /// results keep the register's high half (GFX10).
+    fn low_half(&mut self, inst: &Inst, reg: u8, x: V) -> V {
+        let c = self.cur;
+        let old = match inst.read(Reg::V(reg)).map(|o| self.i32_of(o)) {
+            Some(Ok(o)) => o,
+            _ => self.s.m.i32(0),
+        };
+        let (high, low) = (self.s.m.i32(0xFFFF_0000), self.s.m.i32(0xFFFF));
+        let old = self.s.m.bin(c, Bin::And, old, high);
+        let x = self.s.m.bin(c, Bin::And, x, low);
+        self.s.m.bin(c, Bin::Or, old, x)
+    }
+
     /// VOP3 f16 output modifiers: omod, then clamp, applied in f32 so the
     /// half conversion rounds once (the order `write_f` uses).
     fn half_modifiers(&mut self, inst: &Inst, h: V) -> V {
