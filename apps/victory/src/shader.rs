@@ -3,7 +3,7 @@
 //! given files holds it.
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -35,6 +35,24 @@ impl Source<'_> {
             Source::Packed(r) => format!("@{:#x} {}", r.offset, r.name.unwrap_or("?")),
         }
     }
+}
+
+/// Reads an input once per warm-up pass when several roots can overlap.
+pub(crate) fn read_warmup_input(
+    path: &Path,
+    read_paths: &mut Option<HashSet<PathBuf>>,
+) -> Option<Vec<u8>> {
+    if read_paths
+        .as_ref()
+        .is_some_and(|paths| paths.contains(path))
+    {
+        return None;
+    }
+    let bytes = std::fs::read(path).ok()?;
+    if let Some(paths) = read_paths {
+        paths.insert(path.to_owned());
+    }
+    Some(bytes)
 }
 
 /// The packed records of SGD5 data, and every container stored as is (the
@@ -400,4 +418,25 @@ fn format_instruction(i: &Instruction, wave64: bool) -> String {
         None => format!("<{:?} {:#x}>", i.encoding, i.opcode),
     };
     format!("    {:06x}: {:<44} {text}", i.offset, words.join(" "))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn warmup_remembers_only_successful_reads() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let missing = root.join("missing-warmup-input");
+        let input = root.join("Cargo.toml");
+        let other = root.join("src").join("main.rs");
+        let mut paths = Some(HashSet::new());
+
+        assert!(read_warmup_input(&missing, &mut paths).is_none());
+        assert!(paths.as_ref().unwrap().is_empty());
+        let contents = read_warmup_input(&input, &mut paths).expect("read first input");
+        assert!(read_warmup_input(&input, &mut paths).is_none());
+        assert!(read_warmup_input(&other, &mut paths).is_some());
+        assert_eq!(read_warmup_input(&input, &mut None), Some(contents));
+    }
 }

@@ -12,7 +12,7 @@
 //! interrupted pre-build keeps its work, and the next one finds those
 //! pipelines there.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -24,7 +24,7 @@ use victory_game::{sgd5, shaderpack};
 use victory_gpu::pipeline::{self, Prebuild};
 use victory_shader::{Container, FourCC, HwStage, native_programs};
 
-use crate::shader::{MAX_FILE, Source, sources};
+use crate::shader::{MAX_FILE, Source, read_warmup_input, sources};
 
 /// Where a native program's container is: file, source, and its stage.
 type Found = (usize, usize, HwStage);
@@ -40,6 +40,7 @@ pub fn run(paths: &[PathBuf], threads: usize) -> Result<()> {
     let started = Instant::now();
     pipeline::use_pipeline_cache(victory_core::Config::load()?.cache_subdir("pipelines")?);
     // The files that hold shaders (or the pack itself).
+    let mut read_paths = (paths.len() > 1).then(HashSet::new);
     let files: Vec<(PathBuf, Vec<u8>)> = paths
         .iter()
         .flat_map(|root| {
@@ -48,7 +49,11 @@ pub fn run(paths: &[PathBuf], threads: usize) -> Result<()> {
                 .filter_map(Result::ok)
         })
         .filter(|e| e.file_type().is_file() && e.metadata().is_ok_and(|m| m.len() <= MAX_FILE))
-        .filter_map(|e| Some((e.path().to_owned(), std::fs::read(e.path()).ok()?)))
+        .filter_map(|e| {
+            let path = e.into_path();
+            let bytes = read_warmup_input(&path, &mut read_paths)?;
+            Some((path, bytes))
+        })
         .filter(|(_, d)| d.starts_with(shaderpack::MAGIC) || !sources(d).is_empty())
         .collect();
     // It ships beside the shader databases.

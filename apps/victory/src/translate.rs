@@ -15,7 +15,7 @@ use victory_shader::{
 };
 use victory_shader::{io, resource};
 
-use crate::shader::{MAX_FILE, Source, sources};
+use crate::shader::{MAX_FILE, Source, read_warmup_input, sources};
 
 #[derive(Default)]
 struct Tally {
@@ -336,6 +336,7 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result
     }
     let started = std::time::Instant::now();
     let seen = Mutex::new(HashSet::new());
+    let mut read_paths = (paths.len() > 1).then(HashSet::new);
     // Containers already cached, translated now, refused now.
     let counts = [const { AtomicUsize::new(0) }; 3];
     let cached_refusals = AtomicUsize::new(0);
@@ -347,7 +348,7 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result
             if !entry.file_type().is_file() || entry.metadata().map_or(0, |m| m.len()) > MAX_FILE {
                 continue;
             }
-            let Ok(data) = std::fs::read(entry.path()) else {
+            let Some(data) = read_warmup_input(entry.path(), &mut read_paths) else {
                 continue;
             };
             let jobs = sources(&data);
