@@ -6,6 +6,7 @@
 mod census;
 mod inspect;
 mod prebuild;
+mod preload;
 mod run;
 mod shader;
 mod translate;
@@ -101,6 +102,19 @@ enum Command {
         #[arg(long, conflicts_with_all = ["validate", "list"])]
         cache: bool,
     },
+    /// Warm the shader cache and pipeline library, retrying the offline
+    /// warm-up in a fresh process if it crashes. Completed pipelines stay in
+    /// the library and are skipped by the next attempt.
+    Preload {
+        paths: Vec<PathBuf>,
+        /// Positive worker thread count for each attempt (default: every
+        /// logical core).
+        #[arg(long)]
+        jobs: Option<NonZeroUsize>,
+        /// Maximum number of child processes to start (default: 16).
+        #[arg(long, default_value_t = 16)]
+        attempts: usize,
+    },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
         exe: PathBuf,
@@ -189,6 +203,11 @@ fn main() -> Result<()> {
             list,
             jobs.map(NonZeroUsize::get),
         ),
+        Command::Preload {
+            paths,
+            jobs,
+            attempts,
+        } => preload::run(&paths, jobs.map(NonZeroUsize::get), attempts),
         Command::Run {
             exe,
             unimplemented,

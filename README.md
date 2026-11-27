@@ -94,6 +94,15 @@ target\release\victory.exe translate --cache --pipelines <game dir>\shaders.rpf 
 target\release\victory.exe run <game dir>\<the title's exe> --execute
 ```
 
+For an unattended warm-up that survives a compiler crash, use `preload`
+instead. It runs the same `translate --cache --pipelines` step in a child
+process and retries; each attempt resumes from the pipelines the previous one
+saved:
+
+```powershell
+target\release\victory.exe preload <game dir>\shaders.rpf <game dir>\<the title's exe> <game dir>\XboxBvhBuilder.dll <game dir>\amd_fidelityfx_upscaler_xbox.dll
+```
+
 The `translate --cache` step (minutes; again after a change of the shader
 translator) translates every shader the title can ask for into the cache
 (about 1.3 GB), so a run does not translate them while it plays; without it
