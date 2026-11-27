@@ -321,7 +321,8 @@ fn depth_from_registers(regs: &[u32; 14], mut f: impl FnMut([u8; DEPTH])) {
             faces.push((front.to_vec(), back.to_vec()));
         }
         let mut writes = vec![b[5]];
-        if b[3] == 1 && b[5] == 0 {
+        // A disabled stencil also loses its write mask in the register image.
+        if b[5] == 0 {
             writes.extend([0xFF, b[4]]);
         }
         for (fr, bk) in &faces {
@@ -935,6 +936,22 @@ mod tests {
         depth_from_registers(&regs, |b| all.push(b));
         assert!(all.iter().any(|b| b[3] == 1 && b[4..6] == [0xFF, 0]));
         assert!(all.iter().any(|b| b[3] == 1 && b[4..6] == [0xFF, 0xFF]));
+    }
+
+    #[test]
+    fn disabled_stencil_can_retain_matching_read_and_write_masks() {
+        let mut regs = [0; 14];
+        regs[0] = 2 | (3 << 4); // Depth on, less-equal, no stencil.
+        regs[2] = 0x52 << 8; // Only the read mask survived.
+
+        let mut expected = [0; DEPTH];
+        expected[..6].copy_from_slice(&[1, 0, 4, 0, 0x52, 0x52]);
+        expected[6..14].copy_from_slice(&[1, 1, 1, 8, 1, 1, 1, 8]);
+        expected[22..].copy_from_slice(&[1, 1]);
+
+        let mut found = false;
+        depth_from_registers(&regs, |state| found |= state == expected);
+        assert!(found);
     }
 
     #[test]
