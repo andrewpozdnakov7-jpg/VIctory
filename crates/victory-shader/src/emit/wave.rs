@@ -162,8 +162,15 @@ pub(crate) fn sections(p: &Program, block: usize) -> HashMap<usize, Section> {
         let Some(end) = end else {
             break;
         };
-        let shapes = simulate(&insts[i + 1..end], wave, saved);
-        out.insert(i, Section { end, shapes });
+        let body = &insts[i + 1..end];
+        // Exports need normal lowering. The simulation only defines values.
+        if !body
+            .iter()
+            .any(|inst| matches!(inst.fields, Fields::Exp { .. }))
+        {
+            let shapes = simulate(body, wave, saved);
+            out.insert(i, Section { end, shapes });
+        }
         i = end + 1;
     }
     out
