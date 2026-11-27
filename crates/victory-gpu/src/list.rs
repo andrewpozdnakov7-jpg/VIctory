@@ -2081,12 +2081,9 @@ mod call_counters {
     use crate::copystat::{C, count};
     use crate::object::slot;
 
-    /// A call that records into a live host list is counted once, and its
-    /// handler's time is the call's time. The wait counts the list's own two
-    /// locks only, so a handler that is slow is not a call waiting for the
-    /// list: 2 ms in the handler leaves `CallLockWaitUs` where it was.
-    #[test]
-    fn a_call_with_a_live_host_list_is_counted() {
+    use std::time::{Duration, Instant};
+
+    fn new_test_list() -> (This, This) {
         let null = std::ptr::null();
         let mut allocator = null;
         assert_eq!(
@@ -2098,36 +2095,53 @@ mod call_counters {
             create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list),
             S_OK
         );
+        (list, allocator)
+    }
+
+    fn release_test_list(list: This, allocator: This) {
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(list), 0);
+        assert_eq!(release(allocator), 0);
+    }
+
+    /// A live handler counts once even while another thread records into
+    /// a different list. Only the time before the handler counts as lock wait.
+    #[test]
+    fn a_call_with_a_live_host_list_is_counted() {
+        let (list, allocator) = new_test_list();
         if host_list(list).is_none() {
-            // No host GPU: no host list to record into, so nothing counted
-            // (the test below covers a call without one).
-            assert_eq!(release(list), 0);
-            assert_eq!(release(allocator), 0);
+            release_test_list(list, allocator);
             return;
         }
         let calls = count(C::Calls);
         let us = count(C::CallUs);
         let waits = count(C::CallLockWaitUs);
-        let ran = std::cell::Cell::new(0);
+        let started = Instant::now();
+        let mut handler_times = None;
         with_state(list, |_, _| {
-            ran.set(ran.get() + 1);
-            std::thread::sleep(std::time::Duration::from_millis(2));
+            let entered = Instant::now();
+            std::thread::spawn(|| {
+                let (other, allocator) = new_test_list();
+                assert!(host_list(other).is_some());
+                with_state(other, |_, _| {});
+                release_test_list(other, allocator);
+            })
+            .join()
+            .unwrap();
+            std::thread::sleep(Duration::from_millis(2));
+            handler_times = Some((entered, Instant::now()));
         });
-        assert_eq!(ran.get(), 1, "the handler ran, once");
-        assert_eq!(count(C::Calls) - calls, 1, "the call is counted");
+        release_test_list(list, allocator);
+
+        let (entered, left) = handler_times.expect("the handler ran");
+        assert_eq!(count(C::Calls) - calls, 1, "only this call is counted");
         let us = count(C::CallUs) - us;
         let waits = count(C::CallLockWaitUs) - waits;
+        assert!(us >= left.duration_since(entered).as_micros() as u64);
         assert!(
-            us >= 1000,
-            "2 ms in the handler is the call's time: {us} us"
+            waits <= entered.duration_since(started).as_micros() as u64,
+            "handler time must not be counted as a list lock wait: {waits} us"
         );
-        assert!(
-            waits < 1000,
-            "a slow handler is not a wait for the list's locks: {waits} us"
-        );
-        assert_eq!(release(list), 0);
-        assert_eq!(release(allocator), 0);
     }
 
     /// A call without a live host list has nothing to record into: it runs

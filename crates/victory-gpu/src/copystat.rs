@@ -121,14 +121,26 @@ pub(crate) enum C {
 const COUNTERS: usize = 64;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
-pub(crate) fn add(c: C, n: u64) {
-    COUNT[c as usize].fetch_add(n, Relaxed);
+#[cfg(test)]
+thread_local! {
+    static TEST_COUNT: [std::cell::Cell<u64>; COUNTERS] =
+        const { [const { std::cell::Cell::new(0) }; COUNTERS] };
 }
 
-/// What a counter holds now (tests: a call's share of the line).
+pub(crate) fn add(c: C, n: u64) {
+    let index = c as usize;
+    COUNT[index].fetch_add(n, Relaxed);
+    #[cfg(test)]
+    TEST_COUNT.with(|counters| {
+        let counter = &counters[index];
+        counter.set(counter.get().wrapping_add(n));
+    });
+}
+
+/// This test thread's increments, independent of frame resets and other tests.
 #[cfg(test)]
 pub(crate) fn count(c: C) -> u64 {
-    COUNT[c as usize].load(Relaxed)
+    TEST_COUNT.with(|counters| counters[c as usize].get())
 }
 
 /// How copies run: 0 guarded (as always), 1 plain, 2 not at all.
