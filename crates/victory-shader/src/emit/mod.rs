@@ -1897,4 +1897,168 @@ mod tests {
         // Translated or refused with a reason; it must not panic.
         let _ = super::emit(&c, &native, &p, &st, &io, &res);
     }
+
+    #[cfg(windows)]
+    #[test]
+    fn immediate_sampler_used_with_and_without_comparison_validates_and_runs() {
+        let mut tested_cases = 0;
+        for cmp_first in [false, true] {
+            for (reduction, want_plain) in [(0, 0.5), (1, 0.125), (2, 0.875)] {
+                let sampler = [(reduction << 29) | 0x3092, 0, 0x0050_0000, 0];
+                let plain = [0xF09C_0108, 0x0043_0503]; // image_sample_lz v5, v[3:4], s[12:19], s[8:11]
+                let cmp = [0xF0BC_0108, 0x0043_0602]; // image_sample_c_lz v6, v[2:4], s[12:19], s[8:11]
+                let (first_sample, second_sample) = if cmp_first {
+                    (cmp, plain)
+                } else {
+                    (plain, cmp)
+                };
+                let words: Vec<u32> = [
+                    0xBE84_0300, // s_mov_b32 s4, s0
+                    0xBE85_0380, // s_mov_b32 s5, 0
+                    0xF40C_0302,
+                    0xFA00_0000, // s_load_dwordx8 s[12:19], s[4:5], 0x0
+                    0xF408_0502,
+                    0xFA00_0020, // s_load_dwordx4 s[20:23], s[4:5], 0x20
+                    0xBE88_03FF,
+                    sampler[0], // clamp and LESS_EQUAL, with standard/minimum/maximum reduction
+                    0xBE89_03FF,
+                    sampler[1], // s_mov_b32 s9, 0
+                    0xBE8A_03FF,
+                    sampler[2], // linear min/mag, base mip
+                    0xBE8B_03FF,
+                    sampler[3], // s_mov_b32 s11, 0
+                    0x7E04_02FF,
+                    0x3F00_0000, // v_mov_b32 v2, 0.5 (comparison reference)
+                    0x7E06_02F0, // v_mov_b32 v3, 0.5 (u)
+                    0x7E08_02F0, // v_mov_b32 v4, 0.5 (v)
+                    0x7E0E_0280, // v_mov_b32 v7, 0
+                    0x7E10_0284, // v_mov_b32 v8, 4
+                    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+                    first_sample[0],
+                    first_sample[1],
+                    second_sample[0],
+                    second_sample[1],
+                    0xBF8C_3F70, // s_waitcnt vmcnt(0)
+                    0xE070_1000,
+                    0x8005_0507, // buffer_store_dword v5, v7, s[20:23], 0 offen
+                    0xE070_1000,
+                    0x8005_0608, // buffer_store_dword v6, v8, s[20:23], 0 offen
+                    0xBF81_0000, // s_endpgm
+                ]
+                .into_iter()
+                .collect();
+                let native = super::NativeProgram {
+                    stage: super::HwStage::Cs,
+                    wave64: false,
+                    vgprs: 16,
+                    layout: vec![crate::native::RootParam {
+                        root: crate::native::RootType::Table,
+                        table_offset_dwords: 0,
+                        sgprs: 1,
+                        base_register: 0,
+                        user_data: 0,
+                        slot: 0,
+                    }],
+                    used: vec![
+                        crate::native::UsedResource {
+                            kind: crate::native::ResourceType::Srv,
+                            root: crate::native::RootType::Table,
+                            table_offset_dwords: 0,
+                            lower_bound: 0,
+                            stride: 0,
+                            dwords: 8,
+                            user_data: 0,
+                            slot: 0,
+                        },
+                        crate::native::UsedResource {
+                            kind: crate::native::ResourceType::Uav,
+                            root: crate::native::RootType::Table,
+                            table_offset_dwords: 8,
+                            lower_bound: 0,
+                            stride: 0,
+                            dwords: 4,
+                            user_data: 0,
+                            slot: 0,
+                        },
+                    ],
+                    io: crate::native::StageIo::Cs(crate::native::ComputeIo {
+                        rsrc2: 0,
+                        threads: [1, 1, 1],
+                    }),
+                    code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+                };
+                let (p, st) =
+                    crate::range::build(&native.patched_code(), native.wave64, native.vgprs)
+                        .unwrap();
+                let st = st.unwrap();
+                let res =
+                    crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+                let io = crate::io::raise(&p, &native).unwrap();
+                let bytes = crate::dxbc::build(&[]);
+                let container = Container::parse(&bytes).expect("container");
+                let mut host = super::emit(&container, &native, &p, &st, &io, &res).expect("emit");
+                assert_eq!(host.samplers, vec![sampler; 2]);
+                let plain_filter = [0x14, 0x114, 0x194][reduction as usize];
+                let plain_slot = usize::from(cmp_first);
+                let cmp_slot = usize::from(!cmp_first);
+                assert_eq!(host.static_samplers.len(), 2);
+                assert_eq!(host.static_samplers[plain_slot].filter, plain_filter);
+                assert_eq!(
+                    host.static_samplers[cmp_slot].filter, 0x94,
+                    "comparison slot reduction={reduction} cmp_first={cmp_first}"
+                );
+                if let Ok(mut v) = super::validator::Validator::load(
+                    super::validator::Validator::default_path().as_deref(),
+                ) {
+                    v.validate(&mut host.dxil).expect("DXIL validation failed");
+                } else {
+                    eprintln!("no dxil.dll; validation skipped");
+                }
+                let _one = super::valu_tests::ONE_AT_A_TIME
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                // R32_FLOAT: comparison sampling is not defined on RGBA32F
+                // (drivers return the raw texel or zeros there).
+                let texels = [0.125, 0.375, 0.625, 0.875];
+                let views = [
+                    super::host::View::Depth(2, 2, &texels),
+                    super::host::View::RawUav(2),
+                ];
+                for (label, warp) in [("hardware", false), ("warp", true)] {
+                    let Ok(device) = super::host::Host::new(warp) else {
+                        continue;
+                    };
+                    let (root, pso) = device
+                        .compute_pipeline(&host)
+                        .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+                    let out = device
+                        .dispatch(
+                            &root,
+                            &pso,
+                            &super::host::Dispatch {
+                                roots: vec![(0, super::host::Root::Constants(vec![0]))],
+                                views: &views,
+                                samplers: &[],
+                                groups: [1, 1, 1],
+                            },
+                        )
+                        .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+                    assert_eq!(
+                        f32::from_bits(out[0][0]),
+                        want_plain,
+                        "{label} plain sample reduction={reduction} cmp_first={cmp_first}"
+                    );
+                    assert_eq!(
+                        f32::from_bits(out[0][1]),
+                        0.5,
+                        "{label} cmp sample reduction={reduction} cmp_first={cmp_first}"
+                    );
+                    tested_cases += 1;
+                }
+            }
+        }
+        if tested_cases == 0 {
+            eprintln!("no SM 6.6 adapter ran the immediate sampler test; skipped");
+        }
+    }
 }
