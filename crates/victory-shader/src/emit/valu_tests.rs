@@ -236,6 +236,43 @@ fn run_cases(
 }
 
 #[test]
+fn half_transcendentals_round_to_nearest_in_both_modes() {
+    // RDNA2 ignores MODE.FP_ROUND for these instructions. The first input
+    // for each opcode needs rounding away from zero, the second is exact.
+    const OLD_HIGH: u32 = 0xA55A_0000;
+    let mut mismatches = Vec::new();
+    for (name, opcode, cases) in [
+        ("rcp", 0x54, [(0x4C40, 0x2B88), (0x4400, 0x3400)]),
+        ("sqrt", 0x55, [(0x3200, 0x36EE), (0x8000, 0x8000)]),
+        ("rsq", 0x56, [(0x3300, 0x4047), (0x4400, 0x3800)]),
+        ("log", 0x57, [(0x3300, 0xC063), (0x3C00, 0x0000)]),
+        ("exp", 0x58, [(0x2E00, 0x3C45), (0x3C00, 0x4000)]),
+        ("sin", 0x60, [(0x2400, 0x2E46), (0x3400, 0x3C00)]),
+        ("cos", 0x61, [(0x2E00, 0x3AA7), (0x0000, 0x3C00)]),
+    ] {
+        let inputs = cases.map(|(input, _)| [input, OLD_HIGH | 0xFFFF, 0, 0]);
+        for mode in [0, 3] {
+            let shader = build_valu_cs(&[
+                0xBA80_0881, // s_setreg_imm32_b32 hwreg(HW_REG_MODE, 2, 2)
+                mode,
+                vop1(1, 0, vgpr(2)),
+                vop1(opcode, 0, vgpr(1)),
+            ]);
+            run_cases(&shader, &inputs, |host, i, input, actual| {
+                let expected = OLD_HIGH | cases[i].1;
+                if actual != expected {
+                    mismatches.push(format!(
+                        "{host}: {name}({:#06x}) with FP_ROUND={mode}: {actual:#010x}, expected {expected:#010x}",
+                        input[0]
+                    ));
+                }
+            });
+        }
+    }
+    assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+}
+
+#[test]
 fn scalar_quad_masks_pack_nibbles_and_set_scc() {
     let pack_words = |opcode: u32| {
         [

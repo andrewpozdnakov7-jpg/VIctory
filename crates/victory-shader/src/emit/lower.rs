@@ -2220,7 +2220,10 @@ impl<'a> Lower<'a> {
     // shortcut: rounding toward +-infinity, or a mode not known at this
     // point (paths that set it differently join), rounds to nearest even.
     fn narrow16(&mut self, f: V) -> V {
-        let rtz = self.mode16 == Some(3);
+        self.narrow16_rounded(f, self.mode16 == Some(3))
+    }
+
+    fn narrow16_rounded(&mut self, f: V, rtz: bool) -> V {
         let c = self.cur;
         let x = self.as_int(f);
         let k = |l: &mut Self, v: u32| l.s.m.i32(v);
@@ -6987,7 +6990,18 @@ impl<'a> Lower<'a> {
             if v.clamp {
                 f = l.unary(7, f);
             }
-            let h = l.narrow16(f);
+            // RDNA2 rounds these instructions to nearest even in every FP_ROUND mode.
+            let rounds_to_nearest = matches!(
+                name,
+                "v_rcp_f16"
+                    | "v_sqrt_f16"
+                    | "v_rsq_f16"
+                    | "v_log_f16"
+                    | "v_exp_f16"
+                    | "v_sin_f16"
+                    | "v_cos_f16"
+            );
+            let h = l.narrow16_rounded(f, !rounds_to_nearest && l.mode16 == Some(3));
             l.write_half(inst, h, guard)
         };
         if name == "v_cvt_f16_f32" {
