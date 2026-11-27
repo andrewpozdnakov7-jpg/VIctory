@@ -2316,3 +2316,35 @@ fn v_cmp_f_and_t_64bit_match_rdna2() {
         );
     }
 }
+
+#[test]
+fn constant_cmpx64_respects_the_active_mask_without_int64() {
+    use crate::dxbc::{Container, FourCC};
+
+    const EXEC_LO: u8 = 126;
+    let inputs = [[0; 4], [0xffff_ffff, 0x7fff_ffff, 1, 0x8000_0000]];
+    for (op, yes) in [(0x0b0, false), (0x0b7, true), (0x0f0, false), (0x0f7, true)] {
+        for initially_active in [true, false] {
+            // Save EXEC and establish a value before the compare can mask off the lane.
+            let mut body = vec![s_mov_b32(12, EXEC_LO), vop1(0x001, 0, 0x87)];
+            if !initially_active {
+                body.push(s_mov_b32(EXEC_LO, 0x80));
+            }
+            body.extend(vop3(op, 0, vgpr(1), vgpr(3), 0));
+            body.push(vop1(0x001, 0, 0x8b)); // v_mov_b32 v0, 11 under the new EXEC
+            body.push(s_mov_b32(EXEC_LO, 12)); // restore EXEC for the fixture's store
+            let shader = build_valu_cs(&body);
+            let container = Container::parse(&shader.dxil).unwrap();
+            let feature_bytes = container.part(FourCC::SFI0).unwrap().data;
+            let features = u64::from_le_bytes(feature_bytes.try_into().unwrap());
+            assert_eq!(features & 0x8000, 0, "Int64 flag for opcode {op:#x}");
+            let expected = if initially_active && yes { 11 } else { 7 };
+            run_cases(&shader, &inputs, |backend, _, _, got| {
+                assert_eq!(
+                    got, expected,
+                    "{backend}: opcode {op:#x} with initial EXEC active={initially_active}"
+                );
+            });
+        }
+    }
+}
