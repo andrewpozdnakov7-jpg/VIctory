@@ -1068,11 +1068,34 @@ fn whole_wave_section_read_at_one_lane_after_it_on_gpu() {
             lane_v2_old(l as u32)
         }
     });
-    let items = [(
-        "an OR reduction read at lane 31 (branched, 0x77777777)",
-        build_wave32_cs(MaskPattern::ThreeOfFour, Divergence::Branched, &w),
-        want,
-    )];
+    let mut read_under_branch = w[..w.len() - 3].to_vec();
+    read_under_branch.extend([
+        v_and_b32_imm(4, 1, 0),
+        v_cmp_eq_u32_imm(0, 4),
+        s_and_saveexec_b32(12, VCC_LO),
+        s_cbranch_execz(3),
+    ]);
+    read_under_branch.extend_from_slice(&w[w.len() - 3..]);
+    read_under_branch.push(s_or_b32(EXEC_LO, EXEC_LO, 12));
+    let even = std::array::from_fn(|l| {
+        if l % 2 == 0 {
+            u32::MAX
+        } else {
+            lane_v2_old(l as u32)
+        }
+    });
+    let items = [
+        (
+            "an OR reduction read at lane 31 (branched, 0x77777777)",
+            build_wave32_cs(MaskPattern::ThreeOfFour, Divergence::Branched, &w),
+            want,
+        ),
+        (
+            "an all-lane OR reduction read later by even lanes only",
+            build_wave32_cs(MaskPattern::All, Divergence::Full, &read_under_branch),
+            even,
+        ),
+    ];
     check_cases("section lane read", &items);
 }
 
