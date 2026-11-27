@@ -1225,7 +1225,7 @@ fn shared_texture(
     let map = map.get_or_insert_with(Default::default);
     let live = key.and_then(|k| map.get(&k)?.upgrade());
     if let Some(t) = &live
-        && takes(t, &d)
+        && takes(t, &d, desc.format)
     {
         SHARED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if let Some(host) = crate::host::host() {
@@ -1274,14 +1274,22 @@ fn shared_texture(
 
 /// Whether host texture `t` takes a title texture of host description
 /// `d` at its memory: its uses, and a view format of its family or
-/// castable list.
+/// castable list. An sRGB texture made typeless for unordered access
+/// needs both the sRGB read format and the linear write format.
 #[cfg(windows)]
-fn takes(t: &HostTexture, d: &ResourceDesc) -> bool {
+fn takes(t: &HostTexture, d: &ResourceDesc, title_format: u32) -> bool {
     // SAFETY: a live resource.
     let td = unsafe { t.texture.GetDesc() };
     let (flags, own) = (td.Flags.0 as u32, td.Format.0 as u32);
     d.flags & USES & !flags == 0
-        && (family(d.format) == family(own) || t.castable.contains(&d.format))
+        && (family(d.format) == family(own)
+            || t.castable.contains(&d.format)
+            || (d.format != title_format
+                && SRGB.iter().any(|&(srgb, linear)| {
+                    srgb == title_format
+                        && t.castable.contains(&srgb)
+                        && t.castable.contains(&linear)
+                })))
 }
 
 /// Whether `this`'s host texture is still its memory's (not replaced by one
@@ -2418,6 +2426,55 @@ mod tests {
             assert_eq!(slot::<Release>(r, 0x10)(r), 0);
         }
         assert_eq!(slot::<Release>(h, 0x10)(h), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_typeless_alias_reuses_a_castable_host_texture() {
+        use windows::Win32::Graphics::Dxgi::Common::{
+            DXGI_FORMAT_R8G8B8A8_TYPELESS, DXGI_FORMAT_R8G8B8A8_UNORM,
+            DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, DXGI_FORMAT_R32_UINT,
+        };
+
+        if crate::host::host().is_none() {
+            return;
+        }
+        let null = std::ptr::null();
+        let h = heap(1 << 20);
+        let place = |format| {
+            let desc = ResourceDesc {
+                flags: UNORDERED,
+                ..texture(64, 64, format, 1)
+            };
+            let mut out = null;
+            assert_eq!(
+                create_placed(null, h, 0, &desc, 0, null.cast(), &RESOURCE_IIDS[0], &mut out),
+                S_OK
+            );
+            out
+        };
+        let typed = place(DXGI_FORMAT_R32_UINT.0 as u32);
+        let srgb = place(DXGI_FORMAT_R8G8B8A8_UNORM_SRGB.0 as u32);
+        assert_eq!(
+            host_desc(&resource(srgb).desc).unwrap().format,
+            DXGI_FORMAT_R8G8B8A8_TYPELESS.0 as u32
+        );
+        let first = host_copy(typed).expect("typed host texture");
+        let supports_casting = [DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB]
+            .iter()
+            .all(|format| first.castable.contains(&(format.0 as u32)));
+        let shared = supports_casting
+            && std::sync::Arc::ptr_eq(&first, &host_copy(srgb).expect("sRGB host texture"));
+        for r in [srgb, typed] {
+            assert_eq!(slot::<Release>(r, 0x10)(r), 0);
+        }
+        assert_eq!(slot::<Release>(h, 0x10)(h), 0);
+        if !supports_casting {
+            eprintln!("skipping typeless alias sharing: no explicit castable format list");
+            return;
+        }
+        assert!(shared, "castable RGBA8 typeless alias needs no second host texture");
+        eprintln!("RGBA8 typeless alias reused the R32_UINT host texture");
     }
 
     /// Host textures the GPU writes (render target, depth, unordered access)
