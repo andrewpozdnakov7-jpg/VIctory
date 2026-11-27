@@ -106,8 +106,12 @@ pub(crate) enum C {
     /// Title threads writing a view into a shader-visible heap: time
     /// waiting for the heaps' lock (held by heap syncs and other writers).
     MirrorWaitUs,
+    /// Explicit copy-back ranges, deduplicated within each submission.
+    BackEligible,
+    BackWritten,
+    BackWithheld,
 }
-const COUNTERS: usize = 62;
+const COUNTERS: usize = C::BackWithheld as usize + 1;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -307,6 +311,12 @@ pub(crate) fn log(frames: f64) {
             let hard = hard_faults();
             (hard - HARD.swap(hard, Relaxed).min(hard)) as f64 / frames
         },
+    );
+    tracing::info!(
+        "copy-back ranges per frame: {:.1} eligible, {:.1} wrote bytes, {:.1} withheld",
+        c[C::BackEligible as usize],
+        c[C::BackWritten as usize],
+        c[C::BackWithheld as usize],
     );
     let held: Vec<String> = crate::watch::held_times()
         .iter()

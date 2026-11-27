@@ -1399,16 +1399,29 @@ impl Host {
         if !read.is_empty() {
             crate::descriptor::make_read(&read);
         }
+        #[cfg(feature = "diagnostics")]
+        let mut written_ranges = 0;
         for (shadow, address, len, goes_back) in &back {
             let (address, len) = (*address, *len);
             if *goes_back {
                 let written = shadow.copy_back(address, len);
+                #[cfg(feature = "diagnostics")]
+                {
+                    written_ranges += u64::from(written != 0);
+                }
                 COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
             } else {
                 shadow.keep_writes(address, len);
                 crate::memory::note_withheld(len as u64);
                 crate::memory::drop_withheld(address, len);
             }
+        }
+        #[cfg(feature = "diagnostics")]
+        if !back.is_empty() {
+            use crate::copystat::{C, add};
+            add(C::BackEligible, (back.len() - withheld.len()) as u64);
+            add(C::BackWritten, written_ranges);
+            add(C::BackWithheld, withheld.len() as u64);
         }
         for list in runs {
             for work in &list.deferred().after {
