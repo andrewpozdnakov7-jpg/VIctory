@@ -2281,3 +2281,52 @@ fn v_mul_legacy_f32_treats_denormals_as_zero() {
         );
     });
 }
+
+#[test]
+fn operandless_vop1_preserves_a_live_move() {
+    let cases = [
+        [0x1234_5678, 0x89AB_CDEF, 0, 0],
+        [0xF00D_CAFE, 0xFF00_8001, 0, 0],
+    ];
+    let mut checked = 0;
+    let mut wrong = Vec::new();
+    let mut kept_initial = 0;
+    for (opcode, name) in [(0, "v_nop"), (0x1B, "v_pipeflush"), (0x41, "v_clrexcp")] {
+        for src0 in [0xE9, 0xEA, 0xF9, 0xFA, 0xFF] {
+            let shader = build_valu_cs(&[
+                vop1(0x001, 0, vgpr(1)), // Initial value in the output register.
+                vop1(opcode, 0, src0),
+                vop1(0x001, 0, vgpr(2)), // The following live move must run.
+            ]);
+            run_cases(
+                &shader,
+                &cases,
+                |backend, _, [initial, expected, ..], got| {
+                    checked += 1;
+                    if got != expected {
+                        kept_initial += usize::from(got == initial);
+                        wrong.push((backend.to_owned(), name, src0, expected, got));
+                    }
+                },
+            );
+        }
+    }
+
+    let literal = 0xA1B2_C3D4;
+    let control = build_valu_cs(&[vop1(0x000, 0, 0), vop1(0x001, 0, 0xFF), literal]);
+    run_cases(&control, &cases[..1], |backend, _, _, got| {
+        assert_eq!(
+            got, literal,
+            "{backend}: v_mov_b32 must still read its literal"
+        );
+    });
+    eprintln!(
+        "VOP1 readbacks: {checked} checked, {} wrong, {kept_initial} kept initial value",
+        wrong.len(),
+    );
+    assert!(
+        wrong.is_empty(),
+        "first incorrect live move: {:?}",
+        wrong.first()
+    );
+}
