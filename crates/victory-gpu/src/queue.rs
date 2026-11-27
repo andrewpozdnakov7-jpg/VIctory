@@ -804,7 +804,7 @@ mod tests {
         // SAFETY: the texture is a live render target, on an open list.
         unsafe {
             list.list.ClearRenderTargetView(
-                host.rtv(&primary.texture, None).unwrap().handle,
+                host.rtv(Some(&primary.texture), None).unwrap().handle,
                 &[0.25, 0.5, 0.75, 1.0],
                 None,
             );

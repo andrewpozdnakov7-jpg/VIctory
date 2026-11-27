@@ -482,18 +482,18 @@ pub(crate) mod tests {
             // SAFETY: the list is open and the view names a live render target.
             unsafe { list.list.ClearRenderTargetView(rtv, &color, None) };
         };
-        let first = host.rtv(&left, None).unwrap();
+        let first = host.rtv(Some(&left), None).unwrap();
         clear(first.handle, [0.0, 0.0, 0.0, 1.0]);
-        let second = host.rtv(&right, None).unwrap();
+        let second = host.rtv(Some(&right), None).unwrap();
         clear(second.handle, [0.0, 0.0, 1.0, 1.0]);
 
-        let pending = host.rtv(&left, None).unwrap();
+        let pending = host.rtv(Some(&left), None).unwrap();
         std::thread::scope(|scope| {
             scope
                 .spawn(|| {
                     // One full lap of the old global CPU descriptor ring.
                     for _ in 0..1024 {
-                        let _view = host.rtv(&right, None).unwrap();
+                        let _view = host.rtv(Some(&right), None).unwrap();
                     }
                 })
                 .join()
@@ -1765,14 +1765,17 @@ impl Host {
         first_error
     }
 
-    /// A host render target view of `resource`, valid until it is recorded.
+    /// A host render target view, valid until it is recorded.
     pub(crate) fn rtv(
         &self,
-        resource: &ID3D12Resource,
+        resource: Option<&ID3D12Resource>,
         desc: Option<&D3D12_RENDER_TARGET_VIEW_DESC>,
     ) -> Option<CpuView<'_>> {
+        if resource.is_none() && desc.is_none() {
+            return None;
+        }
         let view = self.rtvs.take(&self.device)?;
-        // SAFETY: the requested slot is reserved and the resource is live.
+        // SAFETY: the slot is reserved and the view names a live resource or a typed null.
         unsafe {
             self.device
                 .CreateRenderTargetView(resource, desc.map(std::ptr::from_ref), view.handle);
@@ -4201,7 +4204,7 @@ mod present_plane_tests {
                     .unwrap();
                 let texture = texture.unwrap();
                 list.list
-                    .ClearRenderTargetView(host.rtv(&texture, None).unwrap().handle, color, None);
+                    .ClearRenderTargetView(host.rtv(Some(&texture), None).unwrap().handle, color, None);
                 texture
             }
         };
