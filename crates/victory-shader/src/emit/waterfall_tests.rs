@@ -141,12 +141,23 @@ fn run(shader: &HostShader, views: &[View]) -> Vec<(&'static str, Vec<u32>)> {
             assert_eq!(u.root, RootType::Table, "{u:?}");
             ud[u.index as usize] = 0;
         }
+        let mut roots = vec![(0, Root::Constants(ud))];
+        if !shader.root_srvs.is_empty() {
+            assert_eq!(shader.root_srvs, [super::VIEW_STRIDES]);
+            roots.push((
+                1,
+                Root::View {
+                    srv: true,
+                    data: super::host::view_strides(views),
+                },
+            ));
+        }
         let words = host
             .dispatch(
                 &root,
                 &pso,
                 &Dispatch {
-                    roots: vec![(0, Root::Constants(ud))],
+                    roots,
                     views,
                     samplers: &samplers,
                     groups: [1, 1, 1],
@@ -209,7 +220,7 @@ fn packed_image_load_keeps_unwritten_high_half() {
             0x800A_0010 | reg << 8, // buffer_store_dword v[reg], v16, s[40:43], 0 offen
             0xBF81_0000, // s_endpgm
         ];
-        let results = run(&build_with_handle_count(&words, false, 0), &views);
+        let results = run(&build_with_handle_count(&words, false, 2), &views);
         assert!(!results.is_empty(), "no SM 6.6 test adapter");
         for (backend, got) in results {
             assert_eq!(got, [want; 32], "{backend}: dmask {dmask:#x}");
