@@ -10,6 +10,9 @@ use super::host::{Draw, Host};
 use super::{HostShader, emit};
 use crate::native::{HwStage, NativeProgram, PsInput, StageIo, Usage, VsInput, VsOutput};
 use crate::{Container, FourCC, io, ir, resource, structure};
+use windows::Win32::Graphics::Direct3D12::{
+    D3D12_FEATURE_D3D12_OPTIONS3, D3D12_FEATURE_DATA_D3D12_OPTIONS3,
+};
 
 const S_ENDPGM: u32 = 0xBF81_0000;
 /// `SPI_PS_INPUT_ADDR` PERSP_CENTER: I and J in v0 and v1.
@@ -186,11 +189,37 @@ fn barycentrics_and_p0_follow_the_vertex_order() {
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    let hosts: Vec<(&str, Host)> = [("hardware", false), ("warp", true)]
-        .into_iter()
-        .filter_map(|(label, warp)| Host::new(warp).ok().map(|h| (label, h)))
-        .collect();
-    assert!(!hosts.is_empty(), "no SM 6.6 device");
+    let force_warp = std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
+    let mut hosts = Vec::new();
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        if force_warp && !warp {
+            continue;
+        }
+        let host = match Host::new(warp) {
+            Ok(host) => host,
+            Err(err) => {
+                eprintln!("{label}: skipping barycentric draw: {err}");
+                continue;
+            }
+        };
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS3::default();
+        // SAFETY: OPTIONS3 expects a writable OPTIONS3 structure of this size.
+        let support = unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS3,
+                std::ptr::from_mut(&mut options).cast(),
+                std::mem::size_of_val(&options) as u32,
+            )
+        };
+        if support.is_err() || !options.BarycentricsSupported.as_bool() {
+            eprintln!("{label}: skipping barycentric draw: SV_Barycentrics unavailable");
+            continue;
+        }
+        hosts.push((label, host));
+    }
+    if hosts.is_empty() {
+        return;
+    }
     let mut failures = Vec::new();
     for (name, body, want) in cases() {
         let mut words = body;
