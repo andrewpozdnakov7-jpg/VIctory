@@ -1764,6 +1764,101 @@ fn user_data_cs32(shader: &HostShader, k: u32) -> Vec<u32> {
     ud
 }
 
+#[test]
+fn gradient_samples_apply_the_offset_at_the_clamped_mip() {
+    use windows::Win32::Graphics::Direct3D12::*;
+
+    let mut prefix = vec![s_mov_b32(5, 0x80), s_mov_b32(7, 0x80)];
+    for (op, dst, base, offset) in [(3u32, 8u32, 4u32, 0u32), (2, 20, 4, 0x20), (2, 16, 6, 0)] {
+        prefix.extend([
+            0x3D << 26 | op << 18 | dst << 6 | base >> 1,
+            125 << 25 | offset,
+        ]);
+    }
+    let used = [
+        (4, ResourceType::Srv, 0, 8),
+        (4, ResourceType::Uav, 8, 4),
+        (6, ResourceType::Sampler, 0, 4),
+    ];
+    let sample = |offset| {
+        let mut words = prefix.clone();
+        words.extend([vop1(0x001, 1, 255), offset]);
+        // Two 1/16 gradients select mip 0, unless the clamp in s0 raises it.
+        for (reg, value) in [
+            (2, 1.0 / 16.0f32),
+            (3, 0.0),
+            (4, 0.0),
+            (5, 1.0 / 16.0),
+            (6, 11.0 / 32.0),
+            (7, 19.0 / 32.0),
+        ] {
+            words.extend([vop1(0x001, reg, 255), value.to_bits()]);
+        }
+        words.push(vop1(0x001, 8, sgpr(0)));
+        // image_sample_d_cl_o v9, v[1:8], s[8:15], s[16:19] dmask:1 dim:2D
+        words.extend([0xF0CC_0108, 1 | 9 << 8 | 2 << 16 | 4 << 21]);
+        // v_lshlrev_b32 v10, 2, v0, then store to each lane's own dword.
+        words.push(0x1A << 25 | 10 << 17 | 130);
+        let [store, operands] = buffer_store_dword(9, 20, 0);
+        words.extend([store | 1 << 12, operands | 10]); // offen, v10
+        words.push(S_ENDPGM);
+        lower_cs32(&words, &used, true)
+    };
+    let plain = sample(0);
+    let shifted = sample(0x3F01); // x = 1, y = -1 in signed six-bit fields
+    let mut texels = Vec::new();
+    for level in 0..5 {
+        let width = 16 >> level;
+        for y in 0..width {
+            for x in 0..width {
+                texels.push([(level * 1000 + y * 32 + x + 1) as f32, 0.0, 0.0, 1.0]);
+            }
+        }
+    }
+    let views = [View::Mipped(16, 16, 5, &texels), View::RawUav(32)];
+    let samplers = [D3D12_SAMPLER_DESC {
+        Filter: D3D12_FILTER_MIN_MAG_MIP_POINT,
+        AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        MaxAnisotropy: 1,
+        MaxLOD: f32::MAX,
+        ..Default::default()
+    }];
+    let cases = [
+        (&plain, 0.0f32, 294.0f32), // mip 0 (5, 9)
+        (&shifted, 0.0, 263.0),     // mip 0 (6, 8)
+        (&plain, 2.0, 2066.0),      // mip 2 (1, 2)
+        (&shifted, 2.0, 2035.0),    // mip 2 (2, 1)
+    ];
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        for (shader, clamp, want) in cases {
+            let (root, pso) = host.compute_pipeline(shader).expect("sample pipeline");
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(user_data_cs32(shader, clamp.to_bits())))],
+                        views: &views,
+                        samplers: &samplers,
+                        groups: [1, 1, 1],
+                    },
+                )
+                .expect("sample dispatch");
+            assert_eq!(out[0], [want.to_bits(); 32], "{label}: clamp {clamp}");
+            ran += 1;
+        }
+    }
+    assert!(ran > 0, "no device ran the gradient sample");
+}
+
 /// Image addresses with `a16` after a whole-VGPR operand (the offset or
 /// bias keeps a VGPR; the coordinates share the next) and the clamp of
 /// `image_sample_d_cl` (after the coordinates). Program 1: a biased sample

@@ -8643,7 +8643,9 @@ impl<'a> Lower<'a> {
             }
             "image_sample_b" | "image_sample_b_o" => (61, true),
             "image_sample_c_lz" | "image_sample_c_lz_o" => (65, true),
-            "image_sample_d" | "image_sample_d_cl" | "image_sample_d_o" => (63, true),
+            "image_sample_d" | "image_sample_d_cl" | "image_sample_d_o" | "image_sample_d_cl_o" => {
+                (63, true)
+            }
             "image_get_lod" if self.s.pixel => (81, true),
             // Implicit derivatives: pixel shaders only.
             "image_sample_c" | "image_sample_c_o" if self.s.pixel => (64, true),
@@ -8726,6 +8728,7 @@ impl<'a> Lower<'a> {
             // whole VGPR (the `extra` count the packed address path splits
             // on); counting them by name missed the offset form's bias.
             let offset_word = name.ends_with("_o");
+            let lod_clamp = matches!(name, "image_sample_d_cl" | "image_sample_d_cl_o");
             let first = extra;
             // Coordinates the size divides (not the array slice); explicit
             // gradients (x then y) come before the coordinates.
@@ -8808,6 +8811,9 @@ impl<'a> Lower<'a> {
             // Texel offsets: x in bits 0-5, y in 8-13, z in 16-21, signed.
             // Gathers use other bits and parse their own below.
             if offset_word && !matches!(op, 73 | 74) {
+                if name == "image_sample_d_cl_o" && kind == 5 {
+                    return Err("a cube gradient sample with a texel offset");
+                }
                 let w = addr_val(self, 0)?;
                 let w = self
                     .s
@@ -8883,7 +8889,7 @@ impl<'a> Lower<'a> {
                     let half = self.s.m.f32(0.5f32.to_bits());
                     let l = self.unary(23, m);
                     let mut lod = self.s.m.bin(c, Bin::Mul, l, half);
-                    if name.ends_with("_cl") {
+                    if lod_clamp {
                         let x = addr_val(self, first + grads + coords)?;
                         let clamp = to_float(self, x);
                         lod = self.binary(35, lod, clamp);
@@ -8914,7 +8920,7 @@ impl<'a> Lower<'a> {
                     args.extend(&os);
                     args.extend(g);
                     // `_cl`: the least level of detail, after the coordinates.
-                    let clamp = if name.ends_with("_cl") {
+                    let clamp = if lod_clamp {
                         let x = addr_val(self, first + grads + coords)?;
                         to_float(self, x)
                     } else {
