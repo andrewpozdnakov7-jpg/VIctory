@@ -1052,42 +1052,83 @@ fn wave64_dpp_row_mask_preserves_both_halves_on_warp() {
         return;
     }
 
-    for (control, row_mask, xor) in [(0x140, 0xC, 15), (0x140, 0x5, 15), (0xB1, 0xF, 1)] {
-        let mut w = vec![s_mov_b32(1, 0x80)];
-        w.extend(s_load_dwordx4(4, 0));
-        w.extend([
-            0x7E04_02C0, // v_mov_b32 v2, 64 (sentinel)
-            0x7E04_02FA, // v_mov_b32_dpp v2, v0
-            dpp16_word(0, control, row_mask, 0xF, false, false),
-            v_lshlrev_b32_imm(5, 2, 0),
-        ]);
-        w.extend(buffer_store_dword_offen(2, 5, 4));
-        w.push(S_ENDPGM);
-        let shader = build_crosslane_cs(&w, true);
-        let (root, pso) = host.compute_pipeline(&shader).expect("D3D12 pipeline");
-        let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
-        let out = host
-            .dispatch(
-                &root,
-                &pso,
-                &Dispatch {
-                    roots: vec![(0, Root::Constants(ud))],
-                    views: &[View::RawUav(64)],
-                    samplers: &[],
-                    groups: [1, 1, 1],
-                },
-            )
-            .expect("D3D12 readback");
+    for row_mask in [0xC, 0x5] {
+        let op = [
+            0x7E04_02FA, // v_mov_b32_dpp v2, v0 row_mirror
+            dpp16_word(0, 0x140, row_mask, 0xF, false, false),
+        ];
+        let actual = dispatch_wave64_guest(&host, op);
         let want: [u32; 64] = std::array::from_fn(|lane| {
             if row_mask >> (lane / 16) & 1 != 0 {
-                lane as u32 ^ xor
+                lane as u32 ^ 15
             } else {
                 64
             }
         });
-        let matched = out[0][..64].iter().zip(want).filter(|(a, b)| **a == *b).count();
+        let matched = actual.iter().zip(want).filter(|(a, b)| **a == *b).count();
         println!("Wave64 DPP row_mask={row_mask:#x}: {matched}/64 words");
-        assert_eq!(out[0][..64], want, "row mask {row_mask:#x}");
+        assert_eq!(actual, want, "row mask {row_mask:#x}");
+    }
+}
+
+fn dispatch_wave64_guest(host: &Host, op: [u32; 2]) -> [u32; 64] {
+    let mut w = vec![s_mov_b32(1, 0x80)];
+    w.extend(s_load_dwordx4(4, 0));
+    w.push(0x7E04_02C0); // v_mov_b32 v2, 64 (sentinel)
+    w.extend(op);
+    w.push(v_lshlrev_b32_imm(5, 2, 0));
+    w.extend(buffer_store_dword_offen(2, 5, 4));
+    w.push(S_ENDPGM);
+    let shader = build_crosslane_cs(&w, true);
+    let (root, pso) = host.compute_pipeline(&shader).expect("D3D12 pipeline");
+    let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+    let out = host
+        .dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![(0, Root::Constants(ud))],
+                views: &[View::RawUav(64)],
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        )
+        .expect("D3D12 readback");
+    out[0][..64].try_into().unwrap()
+}
+
+#[test]
+fn wave64_quad_swizzle_and_dpp_run_on_supported_adapters() {
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    for warp in [false, true] {
+        let name = if warp { "WARP" } else { "hardware" };
+        if !warp && std::env::var("VICTORY_WARP").as_deref() == Ok("1") {
+            continue;
+        }
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {name} adapter; skipped");
+            continue;
+        };
+        let info = if warp {
+            name.to_owned()
+        } else {
+            let Some(info) = wave32_hardware_info(&host) else {
+                eprintln!("no native Wave32 adapter; skipped");
+                continue;
+            };
+            info
+        };
+        let dpp = [0x7E04_02FA, dpp16_word(0, 0xB1, 0xF, 0xF, false, false)];
+        let ds_quad = [0xD8D4_80B1, 0x0200_0000];
+        let ds_bit = [0xD8D4_041F, 0x0200_0000];
+        let want = std::array::from_fn::<_, 64, _>(|lane| lane as u32 ^ 1);
+        for (instruction, op) in [("DPP", dpp), ("DS quad", ds_quad), ("DS bit", ds_bit)] {
+            let actual = dispatch_wave64_guest(&host, op);
+            assert_eq!(actual, want, "{info}: {instruction}");
+            println!("{info}: Wave64 guest {instruction} matched all 64 outputs");
+        }
     }
 }
 
