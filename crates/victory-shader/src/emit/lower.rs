@@ -4013,14 +4013,25 @@ impl<'a> Lower<'a> {
                 }
             }
             "s_bfm_b32" => {
-                let (a, b) = (src32(self, 0)?, src32(self, 1)?);
-                let k31 = self.s.m.i32(31);
-                let one = self.s.m.i32(1);
-                let a = self.s.m.bin(c, Bin::And, a, k31);
-                let b = self.s.m.bin(c, Bin::And, b, k31);
-                let m = self.s.m.bin(c, Bin::Shl, one, a);
-                let m = self.s.m.bin(c, Bin::Sub, m, one);
-                (self.s.m.bin(c, Bin::Shl, m, b), None)
+                let (width, offset) = (src32(self, 0)?, src32(self, 1)?);
+                let immediate = self.s.m.int_value(width).zip(self.s.m.int_value(offset));
+                let mask = if let Some((width, offset)) = immediate {
+                    self.s.m.i32(((1u32 << (width & 31)) - 1) << (offset & 31))
+                } else {
+                    // Bfi uses the low five bits of width and offset, inserting
+                    // a field of ones into zero to make the mask.
+                    let ones = self.s.m.i32(u32::MAX);
+                    let zero = self.s.m.i32(0);
+                    self.s.op(
+                        c,
+                        "quaternary.i32",
+                        Attr::ReadNone,
+                        self.s.t.i32,
+                        53,
+                        &[width, offset, ones, zero],
+                    )
+                };
+                (mask, None)
             }
             _ => return Err(name),
         };

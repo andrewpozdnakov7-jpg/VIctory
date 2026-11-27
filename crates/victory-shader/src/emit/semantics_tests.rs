@@ -2665,6 +2665,39 @@ fn sop1_probe(op: u16, inputs: Vec<[u32; 4]>, f: fn(u32) -> (u32, Option<bool>))
     scalar_out(sop1(op, 20, s(16)), inputs, move |i| f(i[0]))
 }
 
+/// The scalar bit-field mask uses the low five bits of each operand and
+/// preserves the condition code, including when the resulting mask is zero.
+#[test]
+fn scalar_bitfield_mask_preserves_width_offset_and_scc() {
+    let mut inputs = Vec::new();
+    for width in 0..32 {
+        for offset in 0..32 {
+            for upper in [0, 0xFFFF_FFE0] {
+                for condition in [0, 1] {
+                    inputs.push([width | upper, offset | upper, condition, OLD]);
+                }
+            }
+        }
+    }
+    let words = [
+        sopc(0x06, s(18), int(0)),      // s_cmp_eq_u32 s18, 0
+        sop2(0x24, 20, s(16), s(17)),   // s_bfm_b32 s20, s16, s17
+        sop2(0x0A, 21, int(1), int(0)), // s_cselect_b32 s21, 1, 0
+        vop1(0x01, 5, s(20)),
+        vop1(0x01, 6, s(21)),
+    ];
+    let probe = scalar(words, inputs, |[width, offset, condition, _]| {
+        let mask = (((1u64 << (width & 31)) - 1) << (offset & 31)) as u32;
+        vec![mask, u32::from(condition == 0)]
+    });
+    let mut literal = words;
+    literal[1] = sop2(0x24, 20, int(12), int(12)); // a constant mask used by descriptor analysis
+    let literal = scalar(literal, vec![[0, 0, 0, OLD], [0, 0, 1, OLD]], |i| {
+        vec![0x00FF_F000, u32::from(i[2] == 0)]
+    });
+    assert_clean(check(&[probe, literal]));
+}
+
 /// Scalar ALU results and SCC (RDNA2 ISA, SOP1/SOP2/SOPC): shift counts
 /// read five bits, `s_bfe` takes its offset from bits 4:0 and its width from
 /// bits 22:16 of the second operand.
