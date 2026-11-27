@@ -15,8 +15,17 @@ pub(crate) fn on(name: &str) -> bool {
     value_is_on(std::env::var_os(name).as_deref())
 }
 
+/// Whether a list records command notes: DRED needs them as breadcrumbs, and
+/// GPU timing needs them to pair each timestamp with its command.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn notes_enabled(dred: bool, timing: bool) -> bool {
+    dred || timing
+}
+
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "diagnostics")]
+    use super::notes_enabled;
     use super::value_is_on;
     use std::ffi::OsStr;
 
@@ -41,5 +50,14 @@ mod tests {
         for value in ["", "true", "yes", "2", "00", " 0", "0 "] {
             assert!(value_is_on(Some(OsStr::new(value))), "{value:?}");
         }
+    }
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn notes_are_recorded_for_dred_or_timing() {
+        assert!(!notes_enabled(false, false));
+        assert!(notes_enabled(true, false));
+        assert!(notes_enabled(false, true));
+        assert!(notes_enabled(true, true));
     }
 }
