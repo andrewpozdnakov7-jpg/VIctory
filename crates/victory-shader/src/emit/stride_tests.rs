@@ -773,3 +773,33 @@ fn mubuf_d16_descriptor_rounding() {
         }
     }
 }
+
+#[test]
+#[ignore = "precision probe for 16-bit normalized values adjacent to f16 midpoints"]
+fn mubuf_d16_rounding_four_edge_codes() {
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R16_SNORM, DXGI_FORMAT_R16_UNORM};
+
+    let shader = build(
+        D16_X_LOAD_WAVE32,
+        vec![param(RootType::Table, 0), param(RootType::Table, 1)],
+        vec![entry(ResourceType::Srv, 4, 0), entry(ResourceType::Uav, 4, 1)],
+        32,
+    );
+    let mut failures = 0;
+    for (format, code, expected) in [
+        (DXGI_FORMAT_R16_UNORM, 0xffaf, 0x3bfd),
+        (DXGI_FORMAT_R16_UNORM, 0xffef, 0x3bff),
+        (DXGI_FORMAT_R16_SNORM, 0x7ff7, 0x3bff),
+        (DXGI_FORMAT_R16_SNORM, 0x8009, 0xbbff),
+    ] {
+        let data = vec![code | code << 16; 16];
+        let views = [View::Buffer { data: &data, stride: Stride::Format(format, 2) }, View::RawUav(32)];
+        for (backend, words) in run_tables(&shader, &views, super::host::view_strides(&views)) {
+            let actual = words[0][0] & 0xffff;
+            let incorrect = words[0].iter().filter(|&&word| word & 0xffff != expected).count();
+            eprintln!("{backend}: MUBUF {format:?} {code:#06x}: {actual:#06x}, one rounding {expected:#06x} ({incorrect}/32 incorrect)");
+            failures += incorrect;
+        }
+    }
+    assert_eq!(failures, 0, "MUBUF normalized rounding");
+}

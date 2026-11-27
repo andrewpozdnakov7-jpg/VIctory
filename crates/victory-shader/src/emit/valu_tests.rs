@@ -532,6 +532,26 @@ fn d16_uscaled_keeps_nearest_even_in_valu_rtz_mode() {
 }
 
 #[test]
+#[ignore = "precision probe for 16-bit normalized values adjacent to f16 midpoints"]
+fn tbuffer_d16_rounding_four_edge_codes() {
+    let mut failures = 0;
+    for (format, cases) in [
+        (7, [(0xffaf, 0x3bfd), (0xffef, 0x3bff)]),
+        (8, [(0x7ff7, 0x3bff), (0x8009, 0xbbff)]),
+    ] {
+        let input = cases.map(|(bits, _)| [bits, 0, 0, 0]);
+        let shader = tbuffer_load_of_v1(8, format);
+        run_cases(&shader, &input, |backend, i, _, bits| {
+            let (code, expected) = cases[i];
+            let actual = bits & 0xffff;
+            eprintln!("{backend}: MTBUF {format} {code:#06x}: {actual:#06x}, one rounding {expected:#06x}");
+            failures += usize::from(actual != expected);
+        });
+    }
+    assert_eq!(failures, 0, "MTBUF normalized rounding");
+}
+
+#[test]
 fn normalized_buffer_formats_load_their_ends_exactly() {
     // tbuffer_load_format_x.
     let x = 0;
