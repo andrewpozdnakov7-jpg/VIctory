@@ -195,6 +195,8 @@
 //!   the console's, without `SV_PrimitiveID` and `SV_CullPrimitive` (the
 //!   console never exports them).
 
+#[cfg(all(test, windows))]
+mod barycentric_draw_tests;
 mod bitcode;
 #[cfg(test)]
 mod census_tests;
