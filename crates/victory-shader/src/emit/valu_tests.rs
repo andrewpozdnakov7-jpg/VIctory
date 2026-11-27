@@ -854,6 +854,10 @@ fn clamped_fma_keeps_the_high_half_from_sdwa_sign_extension() {
         ([0, 0x3c00, 0xbc00, 0], [0xffff_0000; 2]),      // 0*1 - 1 = -1
         ([0x3c00, 0x3c00, 0xb800, 0], [0xffff_3800; 2]), // 1*1 - 0.5 = 0.5
         ([0x0001, 0x8001, 0x3c00, 0], [0x3c00, 0x3bff]), // 1 - 2^-48
+        // The seed is -4096 with RNE and -4094 with RTZ. The following
+        // 4096*1 + seed clamps to 0 and 1 respectively.
+        ([0x6c00, 0x3c00, 0xec00, 0x0400], [0xffff_0000, 0xffff_3c00]),
+        ([0x6c00, 0x3c00, 0x0400, 0xec00], [0xffff_0000, 0xffff_3c00]),
     ];
     let inputs = cases.map(|(input, _)| input);
     for (i, mode) in [0, 3].into_iter().enumerate() {
