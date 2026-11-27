@@ -294,13 +294,19 @@ struct Lower<'a> {
 /// `v_add_f16`, `v_mul_f16`, `v_max_f16` and `v_fmac_f16`). The VOP3-only
 /// 16-bit operations (`v_fma_f16`, `v_med3_f16`, `v_add_nc_u16`,
 /// `v_mul_lo_u16`, `v_max_u16`, `v_lshlrev_b16`) honour them.
+/// Ordinary 16-bit compares ignore these bits too. Keep the class tests'
+/// selection because the hardware comparison did not cover them.
 fn half_opsel(inst: &Inst) -> u8 {
     let Fields::Valu(v) = &inst.fields else {
         return 0;
     };
     // VOP3 opcodes 0x100..0x13f are VOP2 operations, 0x180..0x1ff VOP1 ones.
     let m = &inst.machine;
-    if m.encoding == Encoding::Vop3 && matches!(m.opcode, 0x100..0x140 | 0x180..0x200) {
+    let name = inst.name();
+    let compare = name.starts_with("v_cmp") && !name.contains("class");
+    if m.encoding == Encoding::Vop3
+        && (matches!(m.opcode, 0x100..0x140 | 0x180..0x200) || compare)
+    {
         0
     } else {
         v.opsel
