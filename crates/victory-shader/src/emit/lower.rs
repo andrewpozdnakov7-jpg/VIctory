@@ -8284,6 +8284,20 @@ impl<'a> Lower<'a> {
         false
     }
 
+    /// `x` (an f16 in the low bits) as the low half of VGPR `reg`: 16-bit
+    /// results keep the register's high half (GFX10).
+    fn low_half(&mut self, inst: &Inst, reg: u8, x: V) -> V {
+        let c = self.cur;
+        let old = match inst.read(Reg::V(reg)).map(|o| self.i32_of(o)) {
+            Some(Ok(o)) => o,
+            _ => self.s.m.i32(0),
+        };
+        let (high, low) = (self.s.m.i32(0xFFFF_0000), self.s.m.i32(0xFFFF));
+        let old = self.s.m.bin(c, Bin::And, old, high);
+        let x = self.s.m.bin(c, Bin::And, x, low);
+        self.s.m.bin(c, Bin::Or, old, x)
+    }
+
     /// VOP3 f16 output modifiers: omod, then clamp, applied in f32 so the
     /// half conversion rounds once (the order `write_f` uses).
     fn half_modifiers(&mut self, inst: &Inst, h: V) -> V {
@@ -9046,16 +9060,19 @@ impl<'a> Lower<'a> {
             return Err("an image result");
         };
         if *d16 {
-            // Two channels per VGPR, low half first (an odd last high half 0).
+            // Two channels per VGPR, low half first.
             let c = self.cur;
             let k16 = self.s.m.i32(16);
             xs = xs
                 .chunks(2)
-                .map(|p| match *p {
+                .enumerate()
+                .map(|(k, p)| match *p {
                     [lo, hi] => {
                         let hi = self.s.m.bin(c, Bin::Shl, hi, k16);
                         self.s.m.bin(c, Bin::Or, lo, hi)
                     }
+                    // An odd image load only writes the last register's low half.
+                    [lo] if op == 66 => self.low_half(inst, reg + k as u8, lo),
                     _ => p[0],
                 })
                 .collect();
