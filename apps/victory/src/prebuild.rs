@@ -26,8 +26,9 @@ use victory_shader::{Container, FourCC, HwStage, native_programs};
 
 use crate::shader::{MAX_FILE, Source, read_warmup_input, sources};
 
-/// Where a native program's container is: file, source, and its stage.
-type Found = (usize, usize, HwStage);
+/// Where a native program's container is: file, source, its stage, and its
+/// 16-char BLAKE3 hex hash (matching `victory_gpu::pipeline::Shader::new`).
+type Found = (usize, usize, HwStage, String);
 
 /// One pipeline to make: a graphics or compute record of the pack.
 #[derive(Clone, Copy, Debug)]
@@ -83,8 +84,26 @@ pub fn run(paths: &[PathBuf], threads: usize) -> Result<()> {
                         let Some(bytes) = source.bytes() else {
                             continue;
                         };
-                        for (id, stage) in program_ids(&bytes) {
-                            lock(&programs).entry(id).or_insert((f, i, stage));
+                        let Some(trimmed) = bytes
+                            .get(0x18..0x1c)
+                            .and_then(|b| b.try_into().ok())
+                            .map(|b| u32::from_le_bytes(b) as usize)
+                            .and_then(|sz| bytes.get(..sz))
+                        else {
+                            continue;
+                        };
+                        if trimmed.is_empty() {
+                            continue;
+                        }
+                        let ids = program_ids(&bytes);
+                        if ids.is_empty() {
+                            continue;
+                        }
+                        let hash = blake3::hash(trimmed).to_hex()[..16].to_owned();
+                        let mut map = lock(&programs);
+                        for (id, stage) in ids {
+                            map.entry(id)
+                                .or_insert_with(|| (f, i, stage, hash.clone()));
                         }
                     }
                 });
@@ -106,11 +125,63 @@ pub fn run(paths: &[PathBuf], threads: usize) -> Result<()> {
     );
 
     let container = |code: &[u8]| -> Option<(Vec<u8>, HwStage)> {
-        let &(f, i, stage) = programs.get(&shaderpack::program_id(code)?)?;
+        let &(f, i, stage, _) = programs.get(&shaderpack::program_id(code)?)?;
         let bytes = sources[f][i].bytes()?;
         // As the title passes it: the container's own size.
         let size = u32::from_le_bytes(bytes.get(0x18..0x1c)?.try_into().ok()?) as usize;
         Some((bytes.get(..size)?.to_vec(), stage))
+    };
+    let lookup_hash = |code: &[u8]| -> Option<(HwStage, &str)> {
+        let (_, _, stage, hash) = programs.get(&shaderpack::program_id(code)?)?;
+        Some((*stage, hash.as_str()))
+    };
+    // A job's pre-build key without inflating, copying, or re-hashing its
+    // shader containers. Matches `prepare(job).map(|p| p.key())` identically.
+    let key_of = |job: Job| -> Result<String, String> {
+        let g = match job {
+            Job::Graphics(i) => &graphics[i],
+            Job::Compute(i) => {
+                let (_, hash) = lookup_hash(compute[i].stage.program).ok_or("shader not found")?;
+                return Ok(Prebuild::compute_key(hash));
+            }
+        };
+        let [ps, vs, gs, ..] = g.stages;
+        if g.stages[3..].iter().any(Option::is_some) {
+            return Err("stages other than vertex, mesh and pixel".into());
+        }
+        let (stage, first_hash) = vs
+            .or(gs)
+            .and_then(|s| lookup_hash(s.program))
+            .ok_or("shader not found")?;
+        let pixel_hash = match ps {
+            Some(ps) => Some(lookup_hash(ps.program).ok_or("shader not found")?.1),
+            None => None,
+        };
+        let (mesh, first_stage) = match stage {
+            HwStage::Ms => (true, "mesh"),
+            HwStage::Vs => (false, "vertex"),
+            _ => return Err("first stage not a vertex or mesh shader".into()),
+        };
+        let stream = pipelines::stream(g, &named, &[], mesh, None).map_err(|u| {
+            match u {
+                Unnamed::DepthStencil => "depth-stencil state not named",
+                Unnamed::Rasterizer => "rasteriser state not named",
+                Unnamed::Blend => "blend state not named",
+                Unnamed::Metadata => "metadata not read",
+            }
+            .to_owned()
+        })?;
+        let mut stages: [(&'static str, &str); 2] = [(first_stage, first_hash), ("pixel", "")];
+        let count = match pixel_hash {
+            Some(h) => {
+                stages[1].1 = h;
+                2
+            }
+            None => 1,
+        };
+        // SAFETY: the stream points at its own live input elements; shader
+        // pointers are not read by `graphics_key`.
+        Ok(unsafe { Prebuild::graphics_key(stream.bytes(), &stages[..count]) })
     };
     // A job's pipeline, or why it has none.
     let prepare = |job: Job| -> Result<Prebuild, String> {
@@ -168,8 +239,8 @@ pub fn run(paths: &[PathBuf], threads: usize) -> Result<()> {
             }
         };
         let names: Vec<String> = (stages.iter())
-            .map(|(stage, code)| match container(code) {
-                Some((c, _)) => format!("{stage} {}", &blake3::hash(&c).to_hex()[..16]),
+            .map(|(stage, code)| match lookup_hash(code) {
+                Some((_, h)) => format!("{stage} {h}"),
                 None => format!("{stage} ?"),
             })
             .collect();
@@ -206,19 +277,21 @@ pub fn run(paths: &[PathBuf], threads: usize) -> Result<()> {
     let lines: Mutex<Vec<String>> = Mutex::new(Vec::new());
     let todo: Mutex<Vec<(bool, Job)>> = Mutex::new(Vec::new());
     let listed = AtomicUsize::new(0);
-    each(&jobs, threads, |job| match prepare(job) {
-        Ok(p) if keys_only.is_some() => {
-            lock(&lines).push(format!("{}\t{job:?}\t{}", p.key(), p.describe()))
-        }
-        Ok(p) if pipeline::prebuilt(&p.key()) => drop(listed.fetch_add(1, Ordering::Relaxed)),
-        Ok(p) => lock(&todo).push((!pipeline::wanted_early(&p.key()), job)),
-        Err(why) => {
-            if keys_only.is_some() {
+    if keys_only.is_some() {
+        each(&jobs, threads, |job| match prepare(job) {
+            Ok(p) => lock(&lines).push(format!("{}\t{job:?}\t{}", p.key(), p.describe())),
+            Err(why) => {
                 lock(&lines).push(format!("-\t{job:?}\t{}\t{why}", shaders_of(job)));
+                skip(why);
             }
-            skip(why);
-        }
-    });
+        });
+    } else {
+        each(&jobs, threads, |job| match key_of(job) {
+            Ok(key) if pipeline::prebuilt(&key) => drop(listed.fetch_add(1, Ordering::Relaxed)),
+            Ok(key) => lock(&todo).push((!pipeline::wanted_early(&key), job)),
+            Err(why) => skip(why),
+        });
+    }
     let listed = listed.into_inner();
     if let Some(file) = keys_only {
         std::fs::write(file, lock(&lines).join("\n"))?;
