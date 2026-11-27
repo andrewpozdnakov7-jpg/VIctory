@@ -843,6 +843,28 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn write_format_views_and_pipeline_agree() {
+        let formats = [67, 86, 115, 28];
+        let stream: Vec<_> = [15u32, 67, 86, 115, 28, 0, 0, 0, 0, 4]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect();
+        let (_, graphics) = read_stream(&stream, |_, _| None);
+        assert_eq!(graphics.targets.NumRenderTargets, 4);
+        for (format, target) in formats.into_iter().zip(graphics.targets.RTFormats) {
+            let mut slot = [0u64; 14];
+            let handle = slot.as_mut_ptr() as u64;
+            let desc = [format, 4, 0, 0, 0, 0]; // TEXTURE2D RTV
+            crate::descriptor::create_rtv(std::ptr::null(), std::ptr::null(), &desc, handle);
+            let view = crate::descriptor::rtv_record(handle).unwrap().desc().unwrap();
+            assert_eq!(view.Format, target, "guest format {format}");
+            assert_eq!(target.0 as u32, crate::resource::target_format(format));
+            eprintln!("guest format {format}, RTV and pipeline format {}", target.0);
+        }
+    }
+
     /// The pre-build reads a stream as the title's creation does: the same
     /// shaders and state, so the same key and the same host pipeline name.
     #[cfg(windows)]

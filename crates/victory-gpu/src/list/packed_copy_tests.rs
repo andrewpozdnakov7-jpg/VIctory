@@ -210,3 +210,68 @@ fn packed_partial_copy_preserves_guest_bytes_in_a_nonzero_mip() {
     check_packed_copy(86, 0x7c00, 1);
     check_packed_copy(115, 0x0f00, 1);
 }
+
+#[test]
+fn rgb9e5_widened_render_target_preserves_hdr_values() {
+    let Some(host) = crate::host::host() else { return };
+    const RGB9E5: u32 = 67;
+    const RGBA16F: u32 = 10;
+    if crate::resource::target_format(RGB9E5) != RGBA16F {
+        return;
+    }
+
+    let allocator = create(|out| create_allocator(null(), 0, &ALLOCATOR_IIDS[0], out));
+    let title = create(|out| {
+        create_list(null(), 0, 0, allocator.as_raw().cast(), null(), &LIST_IIDS[1], out)
+    });
+    let title = title.as_raw().cast();
+    let list = host_list(title).expect("host command list");
+    let heap = D3D12_HEAP_PROPERTIES {
+        Type: D3D12_HEAP_TYPE_DEFAULT,
+        ..Default::default()
+    };
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+        Width: 2,
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        Format: DXGI_FORMAT(RGB9E5 as i32),
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+        ..Default::default()
+    };
+    let texture = create(|out| {
+        crate::resource::create_committed(
+            null(), (&raw const heap).cast(), 0, (&raw const desc).cast(),
+            0, null(), &PAGEABLE_IIDS[0], out,
+        )
+    });
+    let texture = texture.as_raw().cast();
+    let native = crate::resource::host_resource(texture).expect("writable RGBA16F texture");
+    // SAFETY: queries a live texture.
+    assert_eq!(unsafe { native.GetDesc() }.Format.0 as u32, RGBA16F);
+
+    let mut slot = [0u64; 14];
+    let handle = slot.as_mut_ptr() as u64;
+    crate::descriptor::create_rtv(null(), texture, &[RGB9E5, 4, 0, 0, 0, 0], handle);
+    clear_rtv(title, handle, &[2.0, 3.5, 0.5, 1.0], 0, null());
+
+    // SAFETY: test_buffer returns one owned guest reference.
+    let buffer = unsafe { IUnknown::from_raw(crate::resource::test_buffer(256).cast_mut().cast()) };
+    let buffer = buffer.as_raw().cast();
+    let (mapped, _) = crate::resource::buffer_bytes(buffer).expect("mapped guest buffer");
+    let footprint = PlacedFootprint {
+        offset: 0, format: RGBA16F, width: 2, height: 1, depth: 1, row_pitch: 256,
+    };
+    let source = CopyLocation { resource: texture, kind: 0, footprint };
+    let destination = CopyLocation { resource: buffer, kind: 1, footprint };
+    copy_texture_region(title, &destination, 0, 0, 0, &source, null());
+    // SAFETY: the list and referenced resources live until the synchronous submission returns.
+    unsafe { list.list.Close().expect("record HDR clear and readback") };
+    host.execute(&[list]);
+    // SAFETY: submission and deferred readback finished. Both texels fit in the live buffer.
+    let pixels = unsafe { mapped.cast::<[[u16; 4]; 2]>().read_unaligned() };
+    assert_eq!(pixels, [[0x4000, 0x4300, 0x3800, 0x3c00]; 2]);
+    eprintln!("RGB9E5 RTV cleared and read back two RGBA16F pixels above 1.0");
+}

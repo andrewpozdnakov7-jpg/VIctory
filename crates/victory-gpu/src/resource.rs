@@ -272,12 +272,6 @@ pub(crate) fn format_support(format: u32) -> windows::Win32::Graphics::Direct3D1
     flags
 }
 
-/// Packed colour targets use RGBA8 when the device lacks either writable use.
-#[cfg(windows)]
-pub(crate) fn target_format(format: u32) -> u32 {
-    packed_target_format(format, format_support)
-}
-
 #[cfg(windows)]
 fn packed_target_format(
     format: u32,
@@ -292,9 +286,85 @@ fn packed_target_format(
     }
 }
 
+const R9G9B9E5_SHAREDEXP: u32 = 67;
+const RGBA16_FLOAT: u32 = 10;
+
+/// Whether the host GPU supports `R9G9B9E5_SHAREDEXP` as both a render
+/// target and a typed unordered-access store. Hosts that support both
+/// (e.g. AMD RDNA4, WARP) keep format 67 natively so byte-level sharing
+/// and copies stay exact; hosts that refuse either (e.g. NVIDIA) widen
+/// render targets and UAVs of format 67 to `R16G16B16A16_FLOAT`.
+#[cfg(windows)]
+pub(crate) fn rgb9e5_target_supported() -> bool {
+    use std::sync::OnceLock;
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_FEATURE_DATA_FORMAT_SUPPORT, D3D12_FEATURE_FORMAT_SUPPORT,
+        D3D12_FORMAT_SUPPORT1_RENDER_TARGET, D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW,
+        D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE,
+    };
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R9G9B9E5_SHAREDEXP;
+
+    static SUPPORTED: OnceLock<bool> = OnceLock::new();
+    *SUPPORTED.get_or_init(|| {
+        let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+            Format: DXGI_FORMAT_R9G9B9E5_SHAREDEXP,
+            ..Default::default()
+        };
+        let ok = crate::host::host().is_some_and(|h| {
+            // SAFETY: a plain query into a struct of its size.
+            unsafe {
+                h.device.CheckFeatureSupport(
+                    D3D12_FEATURE_FORMAT_SUPPORT,
+                    (&raw mut support).cast(),
+                    size_of_val(&support) as u32,
+                )
+            }
+            .is_ok()
+                && support.Support1.0 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0 != 0
+                && support.Support1.0 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 != 0
+                && support.Support2.0 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE.0 != 0
+        });
+        tracing::debug!(
+            supported = ok,
+            support1 = support.Support1.0,
+            support2 = support.Support2.0,
+            "R9G9B9E5_SHAREDEXP render-target and typed-UAV store support"
+        );
+        ok
+    })
+}
+
+#[cfg(not(windows))]
+pub(crate) fn rgb9e5_target_supported() -> bool {
+    false
+}
+
+pub(crate) fn target_format_with(format: u32, rgb9e5_supported: bool) -> u32 {
+    let format = pc_format(format);
+    if format == R9G9B9E5_SHAREDEXP && !rgb9e5_supported {
+        RGBA16_FLOAT
+    } else {
+        #[cfg(windows)]
+        let format = packed_target_format(format, format_support);
+        format
+    }
+}
+
 /// Whether the host texture contains expanded texels for this packed format.
 fn stand_in_format(guest: u32, host: u32) -> bool {
     matches!(guest, 86 | 115) && host == 28
+}
+
+/// Whether a writable texture uses a host format with a different texel layout.
+fn substituted_format(guest: u32, host: u32) -> bool {
+    stand_in_format(guest, host) || (guest == R9G9B9E5_SHAREDEXP && host == RGBA16_FLOAT)
+}
+
+/// The host format of a render target or unordered-access texture. Sampled-only
+/// textures keep their native format unless they share a writable texture.
+pub(crate) fn target_format(format: u32) -> u32 {
+    let rgb9e5_supported = pc_format(format) == R9G9B9E5_SHAREDEXP && rgb9e5_target_supported();
+    target_format_with(format, rgb9e5_supported)
 }
 
 /// The typeless format of a format's family (itself if it has none).
@@ -336,6 +406,20 @@ pub(crate) fn family(format: u32) -> u32 {
 /// sRGB formats and their linear twins.
 pub(crate) const SRGB: [(u32, u32); 3] = [(29, 28), (91, 87), (93, 88)];
 
+/// The original texture format, before host substitutions.
+#[cfg(windows)]
+pub(crate) fn texture_format(this: This) -> u32 {
+    resource(this).desc.format
+}
+
+/// Whether `this`'s host texture was widened from its console format
+/// (e.g. `R9G9B9E5_SHAREDEXP` -> `R16G16B16A16_FLOAT`), giving it a
+/// different texel size on the host.
+#[cfg(windows)]
+pub(crate) fn is_widened(this: This, host_format: u32) -> bool {
+    pc_format(texture_format(this)) == R9G9B9E5_SHAREDEXP && host_format == RGBA16_FLOAT
+}
+
 /// The format a view of a title texture must name when its host copy is
 /// typeless (see [`DEPTH_FORMATS`], [`SRGB`]): the title's own; `None` if
 /// the host copy is typed.
@@ -344,7 +428,7 @@ pub(crate) fn view_format(this: This) -> Option<u32> {
     let own = pc_format(resource(this).desc.format);
     // SAFETY: a live resource.
     let format = unsafe { host.GetDesc() }.Format.0 as u32;
-    (format != own && !stand_in_format(own, format)).then_some(own)
+    (format != own && !substituted_format(own, format)).then_some(own)
 }
 
 /// The packed format of a live expanded texture.
@@ -1187,10 +1271,11 @@ fn host_desc(desc: &ResourceDesc) -> Option<ResourceDesc> {
     if d.flags & DEPTH != 0 {
         d.flags &= !UNORDERED;
     }
-    d.format = pc_format(d.format);
-    if d.flags & (TARGET | UNORDERED) != 0 {
-        d.format = target_format(d.format);
-    }
+    d.format = if d.flags & (TARGET | UNORDERED) != 0 {
+        target_format(d.format)
+    } else {
+        pc_format(d.format)
+    };
     const DENY_SHADER_RESOURCE: u32 = 8;
     if d.flags & DENY_SHADER_RESOURCE == 0
         && let Some(&(_, typeless)) = DEPTH_FORMATS.iter().find(|&&(f, _)| f == d.format)
@@ -1211,7 +1296,7 @@ const DEPTH: u32 = 2;
 #[cfg(windows)]
 const UNORDERED: u32 = 4;
 /// Render target, depth, unordered access: what a host texture allows.
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 const USES: u32 = 0x7;
 
 /// What a texture memory is, for the one host texture it gets: its address
@@ -1253,7 +1338,8 @@ pub(crate) fn memory_key(address: u64, desc: &ResourceDesc) -> Option<MemoryKey>
         depth: desc.flags & DEPTH != 0,
         // A read-only alias can inherit writable uses later.
         #[cfg(windows)]
-        packed: (target_format(desc.format) != desc.format).then_some(desc.format),
+        packed: stand_in_format(desc.format, packed_target_format(desc.format, format_support))
+            .then_some(desc.format),
     })
 }
 
@@ -1346,17 +1432,38 @@ fn shared_texture(
 }
 
 /// Whether host texture `t` takes a title texture of host description
-/// `d` at its memory: its uses, and a view format of its family or
-/// castable list.
+/// `d` at its memory: its uses, and a view format of its family,
+/// castable list, or substituted target format (so a sampled `R9G9B9E5`
+/// view shares a widened `RGBA16F` host texture).
 #[cfg(windows)]
 fn takes(t: &HostTexture, d: &ResourceDesc) -> bool {
     // SAFETY: a live resource.
     let td = unsafe { t.texture.GetDesc() };
     let (flags, own) = (td.Flags.0 as u32, td.Format.0 as u32);
-    d.flags & USES & !flags == 0
-        && (family(d.format) == family(own)
-            || (stand_in_format(d.format, own) && target_format(d.format) == own)
-            || t.castable.iter().any(|&c| family(c) == family(d.format)))
+    takes_format_with(
+        flags,
+        own,
+        &t.castable,
+        d.flags,
+        d.format,
+        rgb9e5_target_supported(),
+    )
+}
+
+#[cfg(any(windows, test))]
+fn takes_format_with(
+    flags: u32,
+    own: u32,
+    castable: &[u32],
+    want_flags: u32,
+    want_format: u32,
+    rgb9e5_supported: bool,
+) -> bool {
+    want_flags & USES & !flags == 0
+        && (family(want_format) == family(own)
+            || castable.iter().any(|&c| family(c) == family(want_format))
+            || (substituted_format(want_format, own)
+                && target_format_with(want_format, rgb9e5_supported) == own))
 }
 
 /// Whether `this`'s host texture is still its memory's (not replaced by one
@@ -1389,7 +1496,7 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
         // SAFETY: the title passes a whole clear value.
         let mut value = unsafe { clear.cast::<[u32; 5]>().read_unaligned() };
         value[0] = pc_format(value[0]);
-        if stand_in_format(value[0], d.format) {
+        if substituted_format(value[0], d.format) {
             value[0] = d.format;
         }
         value
@@ -3314,5 +3421,73 @@ mod tests {
         // The resource keeps the heap alive.
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 1);
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
+    }
+
+    #[test]
+    fn r9g9b9e5_target_format_substitutes_rgba16f() {
+        assert_eq!(pc_format(67), 67);
+        assert_eq!(target_format_with(67, false), 10);
+        assert_eq!(target_format_with(67, true), 67);
+        assert_eq!(
+            target_format(67),
+            if rgb9e5_target_supported() { 67 } else { 10 }
+        );
+        assert_eq!(target_format(28), 28);
+        assert_eq!(target_format(118), 20);
+    }
+
+    #[test]
+    fn r9g9b9e5_sampled_view_shares_widened_rgba16f_host_texture() {
+        // Widened RGBA16F RT+UAV host texture takes a sampled format-67 view
+        // when the host widens RGB9E5.
+        assert!(takes_format_with(5, 10, &[], 0, 67, false));
+        // When the host supports RGB9E5 natively (no widening), a format-67
+        // view does not alias an unrelated RGBA16F host texture.
+        assert!(!takes_format_with(5, 10, &[], 0, 67, true));
+        // A sampled-only format-67 host texture cannot satisfy RT+UAV uses.
+        assert!(!takes_format_with(0, 67, &[], 5, 10, false));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn r9g9b9e5_render_target_and_uav_textures_create_on_host() {
+        if crate::host::host().is_none() {
+            return;
+        }
+        let tex_desc = |flags: u32| ResourceDesc {
+            dimension: 3, // TEXTURE2D
+            alignment: 0,
+            width: 64,
+            height: 64,
+            depth_or_array_size: 1,
+            mip_levels: 1,
+            format: 67, // DXGI_FORMAT_R9G9B9E5_SHAREDEXP
+            sample_count: 1,
+            sample_quality: 0,
+            layout: 0,
+            flags,
+        };
+        let expected_target = target_format(67);
+        for (flags, expected_host_format) in [(0, 67), (4, expected_target), (5, expected_target)] {
+            let d = tex_desc(flags);
+            let mut out = std::ptr::null();
+            let hr = create_committed(
+                std::ptr::null(),
+                &PROPERTIES,
+                0,
+                &d,
+                0,
+                std::ptr::null(),
+                &RESOURCE_IIDS[0],
+                &mut out,
+            );
+            assert_eq!(hr, S_OK, "flags {flags}");
+            let host = host_resource(out).expect("host texture created");
+            // SAFETY: a live host texture.
+            let got = unsafe { host.GetDesc() }.Format.0 as u32;
+            assert_eq!(got, expected_host_format, "flags {flags}");
+            assert_eq!(view_format(out), None, "flags {flags}");
+            assert_eq!(slot::<Release>(out, 0x10)(out), 0);
+        }
     }
 }
