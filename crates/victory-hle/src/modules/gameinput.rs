@@ -156,15 +156,17 @@ fn merge_pad(base: PadState, extra: PadState) -> PadState {
     }
 }
 
-/// Applies `scripted` keys to the first connected host pad, so `VICTORY_KEYS`
-/// works even when an XInput or virtual controller disables `FALLBACK`.
+/// Applies `scripted` keys to every connected host pad, so `VICTORY_KEYS`
+/// works whichever slot the title listens to: the host may put the real
+/// pad in any slot, and a title that listens to a different slot than
+/// the first would otherwise see nothing.
 #[cfg(any(test, feature = "diagnostics"))]
 fn merge_scripted(pads: &mut [Option<PadState>; PADS], scripted: &[KeyState]) {
     if scripted.is_empty() {
         return;
     }
     let extra = fallback(scripted);
-    if let Some(pad) = pads.iter_mut().flatten().next() {
+    for pad in pads.iter_mut().flatten() {
         *pad = merge_pad(*pad, extra);
     }
 }
