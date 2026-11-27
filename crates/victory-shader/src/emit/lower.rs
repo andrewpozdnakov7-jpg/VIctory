@@ -60,6 +60,9 @@ pub(crate) struct Lowered {
     /// Heap handles written.
     #[cfg(test)]
     pub heap_handles: u32,
+    /// Instructions written to the DXIL function body.
+    #[cfg(test)]
+    pub instructions: usize,
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
@@ -1423,6 +1426,8 @@ impl<'a> Lower<'a> {
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
             heap_handles: self.s.m.written_calls("dx.op.createHandleFromHeap") as u32,
+            #[cfg(test)]
+            instructions: self.s.m.written_instructions(),
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
             #[cfg(test)]
@@ -7802,16 +7807,19 @@ impl<'a> Lower<'a> {
                 let f = self.binary(35, f, zero);
                 let f = self.binary(36, f, max);
                 let x = self.s.m.cast(c, Cast::FpToUi, f, self.s.t.i32);
-                let (three, k3) = (k(self, 3), k(self, 3));
-                let sh = self.s.m.bin(c, Bin::And, b, three);
-                let sh = self.s.m.bin(c, Bin::Shl, sh, k3);
-                let x = self.s.m.bin(c, Bin::Shl, x, sh);
-                let ff = k(self, 0xFF);
-                let hole = self.s.m.bin(c, Bin::Shl, ff, sh);
-                let ones = k(self, u32::MAX);
-                let hole = self.s.m.bin(c, Bin::Xor, hole, ones);
-                let d = self.s.m.bin(c, Bin::And, d, hole);
-                self.s.m.bin(c, Bin::Or, d, x)
+                // Bfi takes the low five offset bits, so (b << 3) selects
+                // byte b[1:0] without a separate mask. x is already in 0..255.
+                let k3 = k(self, 3);
+                let sh = self.s.m.bin(c, Bin::Shl, b, k3);
+                let width = k(self, 8);
+                self.s.op(
+                    c,
+                    "quaternary.i32",
+                    Attr::ReadNone,
+                    self.s.t.i32,
+                    53,
+                    &[width, sh, x, d],
+                )
             }
             "v_ffbl_b32" => {
                 // -1 for zero, as DXIL's first-bit-low.
@@ -11135,6 +11143,33 @@ mod tests {
 
     fn lowers_valu(body: &[u32]) -> Result<(), crate::ShaderError> {
         lower_valu(body).map(|_| ())
+    }
+
+    #[test]
+    fn vector_byte_pack_instruction_count() {
+        // v_cvt_pk_u8_f32 v0, v1, v2, v3: runtime inputs, result stored to a UAV.
+        let words = [0xD55E_0000, 0x101 | 0x102 << 9 | 0x103 << 18];
+        let count = lower_valu(&words).unwrap().instructions;
+        eprintln!("v_cvt_pk_u8_f32 DXIL instruction count: {count}");
+        assert_eq!(count, 25, "v_cvt_pk_u8_f32 DXIL instruction count");
+    }
+
+    #[test]
+    fn vector_byte_pack_keeps_unsupported_modifiers_rejected() {
+        let first = 0xD55E_0000;
+        let second = 0x101 | 0x102 << 9 | 0x103 << 18;
+        for (a, b) in [
+            (1 << 9, 0),
+            (1 << 10, 0), // abs on integer sources
+            (0, 1 << 30),
+            (0, 1 << 31), // neg on integer sources
+            (1 << 15, 0), // clamp
+            (0, 1 << 27),
+            (0, 2 << 27),
+            (0, 3 << 27), // omod
+        ] {
+            assert!(lowers_valu(&[first | a, second | b]).is_err());
+        }
     }
 
     #[test]

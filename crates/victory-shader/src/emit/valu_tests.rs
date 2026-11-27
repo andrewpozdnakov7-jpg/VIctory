@@ -236,6 +236,86 @@ fn run_cases(
 }
 
 #[test]
+fn vector_byte_pack_matches_cpu_reference() {
+    let mut cases = Vec::new();
+    // Signed zeros, subnormals, normals, saturation, infinities and NaNs.
+    let mut floats = vec![
+        0,
+        0x8000_0000,
+        1,
+        0x8000_0001,
+        0x007F_FFFF,
+        0x807F_FFFF,
+        0x0080_0000,
+        0x8080_0000,
+        0x7F7F_FFFF,
+        0xFF7F_FFFF,
+        0x7F80_0000,
+        0xFF80_0000,
+        0x7FC0_0000,
+        0xFFC0_0000,
+        0x7F80_0001,
+        0xFF80_0001,
+    ];
+    floats.extend(
+        [
+            -256.0f32, -2.5, -1.5, -0.5, 0.5, 1.5, 2.5, 127.5, 128.5, 254.5, 255.0, 255.5, 256.0,
+            65536.0,
+        ]
+        .map(f32::to_bits),
+    );
+    for f in floats {
+        for selector in [0, 1, 2, 3, 4, 31, 32, 255, 0x8000_0000, u32::MAX] {
+            for carrier in [0, u32::MAX, 0xAABB_CCDD, 0x55AA_55AA] {
+                cases.push([f, selector, carrier, 0]);
+            }
+        }
+    }
+    // Every byte and rounding tie, with the adjacent floats on both sides.
+    // Exercise all four byte positions with asymmetric untouched bytes.
+    for byte in 0..=255u32 {
+        let tie = (byte as f32 + 0.5).to_bits();
+        for f in [tie - 1, tie, tie + 1] {
+            for selector in 0..4 {
+                cases.push([f, selector, 0xA5C3_7E19, 0]);
+            }
+        }
+    }
+    for (abs, neg) in [(false, false), (true, false), (false, true), (true, true)] {
+        let mut words = vop3(0x15E, 0, vgpr(1), vgpr(2), vgpr(3));
+        words[0] |= u32::from(abs) << 8;
+        words[1] |= u32::from(neg) << 29;
+        let shader = build_valu_cs(&words);
+        run_cases(&shader, &cases, |backend, index, inputs, got| {
+            if index == 0 {
+                eprintln!(
+                    "v_cvt_pk_u8_f32: {} cases on {backend}, abs={abs}, neg={neg}",
+                    cases.len()
+                );
+            }
+            let [mut bits, selector, carrier, _] = inputs;
+            if abs {
+                bits &= 0x7FFF_FFFF;
+            }
+            if neg {
+                bits ^= 0x8000_0000;
+            }
+            // Widen exactly, round on the CPU, then use Rust's saturating
+            // float-to-byte conversion (including NaN -> 0). Replace a byte
+            // in an array rather than repeating the emitter's bitfield math.
+            let byte = f64::from(f32::from_bits(bits)).round_ties_even() as u8;
+            let mut expected = carrier.to_le_bytes();
+            expected[(selector % 4) as usize] = byte;
+            assert_eq!(
+                got,
+                u32::from_le_bytes(expected),
+                "{backend}: v_cvt_pk_u8_f32{inputs:?}, abs={abs}, neg={neg}"
+            );
+        });
+    }
+}
+
+#[test]
 fn scalar_quad_masks_pack_nibbles_and_set_scc() {
     let pack_words = |opcode: u32| {
         [

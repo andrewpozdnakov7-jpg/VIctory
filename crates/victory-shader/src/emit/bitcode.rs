@@ -601,6 +601,24 @@ impl Module {
             .count()
     }
 
+    /// Instructions (including terminators) that [`Module::write`] writes.
+    #[cfg(test)]
+    pub fn written_instructions(&self) -> usize {
+        let plan = self.plan();
+        plan.layout
+            .iter()
+            .map(|&b| {
+                let block = &self.blocks[b];
+                let live = block
+                    .phis
+                    .iter()
+                    .chain(&block.body)
+                    .filter(|&&i| plan.live[i as usize]);
+                live.count() + 1
+            })
+            .sum()
+    }
+
     /// The globals and functions [`Module::write`] declares, each kept
     /// one's new index and their number: functions declared and not called,
     /// and constant globals nothing reads, are left out (the validator
