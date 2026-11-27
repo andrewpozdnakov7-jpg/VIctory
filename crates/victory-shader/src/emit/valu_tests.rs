@@ -1668,7 +1668,7 @@ fn cube_gradients_of_16_bits() {
         let face = face as u32;
         // (1/32, ±1/8) spans sqrt(17) base-level texels. Point sampling
         // selects mip 2. A minimum LOD of 3 selects the last level.
-        let (grad32, grad16) = if face % 2 == 0 {
+        let (grad32, grad16) = if face.is_multiple_of(2) {
             ([1.0 / 32.0, 1.0 / 8.0, 0.0, 0.0], [0x3000_2800, 0])
         } else {
             ([0.0, 0.0, 1.0 / 32.0, -1.0 / 8.0], [0, 0xb000_2800])
