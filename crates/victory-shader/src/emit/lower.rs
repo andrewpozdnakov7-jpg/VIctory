@@ -21,6 +21,7 @@ use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 mod bvh;
+mod sections;
 
 type Why = &'static str;
 
@@ -275,6 +276,10 @@ struct Lower<'a> {
     sections: HashMap<usize, HashMap<usize, super::wave::Section>>,
     /// Values written in a section that code outside it reads.
     section_out: HashSet<Value>,
+    /// Values whole-wave sections leave whose lanes differ: the block and
+    /// start of the section (see [`super::wave::Section::lanes`]).
+    section_lane_reads: HashMap<Value, BTreeSet<u32>>,
+    section_lanes: HashMap<(Value, u32), Result<V, Why>>,
     /// The program's constant table (the code from the first byte read
     /// through `s_getpc_b64` on): global, first byte, dwords.
     code_table: Option<(V, u32, u32)>,
@@ -758,6 +763,8 @@ impl<'a> Lower<'a> {
             cur_ir: 0,
             sections: HashMap::new(),
             section_out: HashSet::new(),
+            section_lane_reads: HashMap::new(),
+            section_lanes: HashMap::new(),
             code_table: None,
             counters: HashMap::new(),
             abort: None,
@@ -1110,62 +1117,6 @@ impl<'a> Lower<'a> {
             self.write(inst, Reg::V(reg), r, guard);
         }
         Ok(())
-    }
-
-    /// Finds the whole-wave sections and the values they leave.
-    fn find_sections(&mut self) {
-        let p = self.x.p;
-        let mut inside: HashMap<Value, (usize, usize, usize)> = HashMap::new();
-        for b in 0..p.blocks.len() {
-            let found = super::wave::sections(p, b);
-            for (&start, sec) in &found {
-                for i in start + 1..sec.end {
-                    for &(_, w) in &p.blocks[b].insts[i].writes {
-                        inside.insert(w, (b, start, sec.end));
-                    }
-                }
-            }
-            if !found.is_empty() {
-                self.sections.insert(b, found);
-            }
-        }
-        if inside.is_empty() {
-            return;
-        }
-        for (b, block) in p.blocks.iter().enumerate() {
-            for phi in &block.phis {
-                self.section_out
-                    .extend(phi.args.iter().filter(|a| inside.contains_key(a)));
-            }
-            for (i, inst) in block.insts.iter().enumerate() {
-                for &(_, r) in &inst.reads {
-                    if let Some(&(sb, start, end)) = inside.get(&r)
-                        && !(sb == b && i > start && i < end)
-                    {
-                        self.section_out.insert(r);
-                    }
-                }
-            }
-        }
-    }
-
-    /// An instruction inside a whole-wave section: the values that leave
-    /// the section are made from what the simulation found them to be.
-    fn section_inst(&mut self, b: usize, i: usize, start: usize) {
-        const UNKNOWN: Why = "a whole-wave section step the simulation does not follow";
-        let inst = &self.x.p.blocks[b].insts[i];
-        for &(_, w) in &inst.writes {
-            let val = if self.section_out.contains(&w) {
-                let shape = self.sections[&b][&start].shapes.get(&w).copied();
-                match shape.ok_or(UNKNOWN).and_then(|sh| self.shape(sh)) {
-                    Ok(x) => Val::I32(x),
-                    Err(why) => Val::Missing(why),
-                }
-            } else {
-                Val::Missing(UNKNOWN)
-            };
-            self.vals.insert(w, val);
-        }
     }
 
     /// A value a whole-wave section leaves, as DXIL wave operations over the
@@ -6721,6 +6672,12 @@ impl<'a> Lower<'a> {
                         .is_some() =>
             {
                 Err("a VGPR of spilled SGPRs read per lane")
+            }
+            // One lane of a value a whole-wave section leaves, its lanes
+            // differing: what that lane holds, seen from any lane.
+            "v_readlane_b32" if self.section_lane(inst).is_some() => {
+                let r = self.section_lane(inst).expect("checked")?;
+                int(self, r)
             }
             "v_readlane_b32" => {
                 let (a, lane) = (s(self, 0)?, s(self, 1)?);

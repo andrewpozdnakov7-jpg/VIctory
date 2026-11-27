@@ -125,6 +125,11 @@ pub(crate) enum Shape {
 pub(crate) struct Section {
     pub end: usize,
     pub shapes: HashMap<Value, Shape>,
+    /// Values whose lanes hold different things, lane by lane: what a read
+    /// of that one lane gets, where it is the same seen from any lane (a
+    /// wave64 reduction that adds its low half's result into the high half
+    /// only, read at lane 63 after the section).
+    pub lanes: HashMap<Value, Vec<Option<Shape>>>,
 }
 
 /// Every whole-wave section of `block`, by start index.
@@ -162,8 +167,8 @@ pub(crate) fn sections(p: &Program, block: usize) -> HashMap<usize, Section> {
         let Some(end) = end else {
             break;
         };
-        let shapes = simulate(&insts[i + 1..end], wave, saved);
-        out.insert(i, Section { end, shapes });
+        let (shapes, lanes) = simulate(&insts[i + 1..end], wave, saved);
+        out.insert(i, Section { end, shapes, lanes });
         i = end + 1;
     }
     out
@@ -312,7 +317,10 @@ fn half(op: Op, a: Sym, b: Option<Sym>, old: Sym) -> Sym {
     }
 }
 
-fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
+/// What a value holds in every lane, and lane by lane where they differ.
+type Shapes = (HashMap<Value, Shape>, HashMap<Value, Vec<Option<Shape>>>);
+
+fn simulate(insts: &[Inst], wave: u32, saved: Value) -> Shapes {
     let all = if wave == 64 {
         u64::MAX
     } else {
@@ -606,12 +614,9 @@ fn constant(inst: &Inst) -> Option<u64> {
     }
 }
 
-/// The shape of each value, where every lane agrees on one.
-fn shapes(
-    vec: HashMap<Value, Vec<Sym>>,
-    uni: HashMap<Value, Sym>,
-    wave: u32,
-) -> HashMap<Value, Shape> {
+/// The shape of each value, where every lane agrees on one; else each
+/// lane's own, where it does not depend on the lane reading it.
+fn shapes(vec: HashMap<Value, Vec<Sym>>, uni: HashMap<Value, Sym>, wave: u32) -> Shapes {
     let all = if wave == 64 {
         u64::MAX
     } else {
@@ -643,12 +648,25 @@ fn shapes(
             out.insert(v, sh);
         }
     }
+    let mut each = HashMap::new();
     for (v, lanes) in vec {
         if let Some(sh) = per_lane(&lanes, all) {
             out.insert(v, sh);
+            continue;
+        }
+        // A lane's own value of a VGPR is no value of another lane.
+        let at: Vec<Option<Shape>> = lanes
+            .iter()
+            .map(|&s| match s {
+                Sym::Own(_) => None,
+                s => single(s),
+            })
+            .collect();
+        if at.iter().any(Option::is_some) {
+            each.insert(v, at);
         }
     }
-    out
+    (out, each)
 }
 
 fn per_lane(lanes: &[Sym], all: u64) -> Option<Shape> {
@@ -1089,5 +1107,36 @@ mod tests {
             let (shape, _, _) = run(c);
             assert_eq!(shape, None, "inline float const {c} was treated as identity");
         }
+    }
+
+    #[test]
+    fn a_wave64_reduction_finished_in_the_high_half_is_known_per_lane() {
+        // Each half's OR reduction (DPP over the rows, v_permlanex16_b32),
+        // then lane 0's result ORed into every lane: only the high half
+        // holds the whole wave's.
+        let mut w = vec![sop1(0, 0x25, 193)]; // s_or_saveexec_b64 s[0:1], -1
+        w.extend(vop3(1, 0x101, 128, 256, 0)); // v_cndmask_b32 v1, 0, v0, s[0:1]
+        for ctrl in [0x00B1u16, 0x004E, 0x0141, 0x0140] {
+            w.push(vop2(1, 0x1C, 0xFA, 1)); // v_or_b32 v1, v1, v1 (DPP16)
+            w.push(dpp16(1, ctrl, 0xF, 0xF, false));
+        }
+        w.extend(vop3(2, 0x378, 257, 128, 128)); // v_permlanex16_b32 v2, v1, 0, 0
+        w.push(vop2(1, 0x1C, 258, 1)); // v_or_b32 v1, v2, v1
+        w.extend(vop3(2, 0x360, 257, 128, 0)); // v_readlane_b32 s2, v1, 0
+        w.push(vop2(1, 0x1C, 2, 1)); // v_or_b32 v1, s2, v1
+        w.push(sop1(EXEC, 0x04, 0)); // s_mov_b64 exec, s[0:1]
+
+        let p = build(&w, true);
+        let insts = &p.blocks[0].insts;
+        let saved = insts[0].write(Reg::S(0)).unwrap();
+        let v0_in = insts[1].read(Reg::V(0)).unwrap();
+        let v1 = insts[insts.len() - 3].write(Reg::V(1)).unwrap();
+        let sec = &sections(&p, 0)[&0];
+        assert_eq!(sec.shapes.get(&v1), None);
+        let lanes = &sec.lanes[&v1];
+        let whole = Some(Shape::Active(Op::Or, v0_in, saved, 0));
+        assert!(lanes[32..].iter().all(|&s| s == whole), "{lanes:?}");
+        // The low half holds only its own lanes' OR.
+        assert!(lanes[..32].iter().all(Option::is_none), "{lanes:?}");
     }
 }
