@@ -429,4 +429,103 @@ mod tests {
         assert_eq!(XDspDeactivate(stream), S_OK);
         assert_eq!(XDspDisconnect(dsp), S_OK);
     }
+
+    #[test]
+    fn stereo_dsp_keeps_distinct_channels_through_the_command_api() {
+        const TOLERANCE: f32 = 0.002;
+        const PLANAR_SAMPLES: u32 = 2;
+        const PER_CHANNEL_IR: u32 = 8;
+        let mut base = vec![0u8; 0x10_0000];
+        let mut dsp = std::ptr::null_mut();
+        assert_eq!(
+            XDspConnectWithMaximumStreamLimit(
+                base.as_mut_ptr().cast(),
+                0x10_0000,
+                24,
+                4,
+                2,
+                &mut dsp
+            ),
+            S_OK
+        );
+
+        let mut cases = Vec::new();
+        for frames in [512usize, 1024] {
+            let per_channel = frames * 2;
+            // A scaled impulse has the same real value in each stored bin.
+            let ir: Vec<_> = [0.5, 0.25]
+                .into_iter()
+                .flat_map(|gain| (0..frames).flat_map(move |_| [gain, 0.0]))
+                .collect();
+            for planar in [false, true] {
+                let desc = StreamDesc {
+                    kind: CONVOLUTION,
+                    options: PER_CHANNEL_IR | if planar { PLANAR_SAMPLES } else { 0 },
+                    frames: frames as u32,
+                    channels: 2,
+                    ir_floats: per_channel as u32,
+                    ir: ir.as_ptr(),
+                };
+                let (mut status, mut stream) = (std::ptr::null(), std::ptr::null_mut());
+                assert_eq!(XDspActivate(dsp, &desc, &mut status, &mut stream), S_OK);
+                for (submission, input_values) in
+                    [[0.5, -0.75], [-0.375, 0.625]].into_iter().enumerate()
+                {
+                    let mut input = vec![0.0; frames * 2];
+                    let mut output = vec![f32::NAN; frames * 2];
+                    let index = |frame, channel| {
+                        if planar {
+                            channel * frames + frame
+                        } else {
+                            frame * 2 + channel
+                        }
+                    };
+                    for frame in 0..frames {
+                        for (channel, value) in input_values.into_iter().enumerate() {
+                            input[index(frame, channel)] = value;
+                        }
+                    }
+                    let command = Command {
+                        gains: [1.0, 1.0],
+                        input: input.as_ptr(),
+                        output: output.as_mut_ptr(),
+                        reserved: 0,
+                    };
+                    let mut ticket = 0;
+                    assert_eq!(XDspSubmitCommand(stream, &command, &mut ticket), S_OK);
+                    assert_eq!(ticket, submission as u32 + 1);
+                    // SAFETY: the active stream owns the status block.
+                    assert_eq!(
+                        unsafe { ((*status).completed, (*status).result) },
+                        (ticket, S_OK)
+                    );
+                    assert!(output.iter().all(|sample| sample.is_finite()));
+                    let expected = [input_values[0] * 0.5, input_values[1] * 0.25];
+                    let mut max_error = [0.0f32; 2];
+                    for frame in 0..frames {
+                        for (channel, error) in max_error.iter_mut().enumerate() {
+                            *error = error
+                                .max((output[index(frame, channel)] - expected[channel]).abs());
+                        }
+                    }
+                    let all_zero = output.iter().all(|&sample| sample == 0.0);
+                    cases.push((frames, planar, ticket, expected, all_zero, max_error));
+                }
+                assert_eq!(XDspDeactivate(stream), S_OK);
+            }
+        }
+        assert_eq!(XDspDisconnect(dsp), S_OK);
+
+        for (frames, planar, ticket, expected, all_zero, max_error) in &cases {
+            println!(
+                "frames={frames} planar={planar} ticket={ticket} expected={expected:?} all_zero={all_zero} max_error={max_error:?}"
+            );
+        }
+        assert!(
+            cases
+                .iter()
+                .all(|case| case.5.iter().all(|&error| error <= TOLERANCE)),
+            "expected distinct filtered output for each channel"
+        );
+    }
 }
