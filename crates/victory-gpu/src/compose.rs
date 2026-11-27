@@ -150,13 +150,13 @@ fn dispatch(width: u32, height: u32) -> (u32, u32, u32) {
 
 /// Records, into the present's `list`, `ui` laid over `game` into a
 /// texture of ours, and gives that texture, left in the copy-source
-/// state. `game` is in the copy-source state (the present put it there);
-/// `ui` is in `ui_state` and is left in it. `None` (nothing recorded) if
+/// state. Both input planes return to their incoming states. `None` if
 /// a format is not 8-bit RGBA or the pass could not be made.
 pub(crate) fn record(
     device: &ID3D12Device,
     list: &ID3D12GraphicsCommandList,
     game: &ID3D12Resource,
+    game_state: u32,
     ui: &ID3D12Resource,
     ui_state: u32,
 ) -> Option<ID3D12Resource> {
@@ -259,25 +259,24 @@ pub(crate) fn record(
         },
     };
     let read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-    let ui_state = D3D12_RESOURCE_STATES(ui_state as i32);
     let t = crate::host::transition;
-    let mut before = vec![
-        t(game, D3D12_RESOURCE_STATE_COPY_SOURCE, read),
-        t(
-            &out,
-            D3D12_RESOURCE_STATE_COPY_SOURCE,
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-        ),
-    ];
-    let mut after = vec![
-        t(game, read, D3D12_RESOURCE_STATE_COPY_SOURCE),
-        t(
-            &out,
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-            D3D12_RESOURCE_STATE_COPY_SOURCE,
-        ),
-    ];
-    if ui_state != read {
+    let mut before = vec![t(
+        &out,
+        D3D12_RESOURCE_STATE_COPY_SOURCE,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+    )];
+    let mut after = vec![t(
+        &out,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        D3D12_RESOURCE_STATE_COPY_SOURCE,
+    )];
+    let game_state = D3D12_RESOURCE_STATES(game_state as i32);
+    if game_state != read {
+        before.push(t(game, game_state, read));
+        after.push(t(game, read, game_state));
+    }
+    let ui_state = D3D12_RESOURCE_STATES(ui_state as i32);
+    if ui != game && ui_state != read {
         before.push(t(ui, ui_state, read));
         after.push(t(ui, read, ui_state));
     }
@@ -322,5 +321,185 @@ mod tests {
         assert!(!flag(Some(OsStr::new("0"))));
         assert!(!flag(Some(OsStr::new("true"))));
         assert!(flag(Some(OsStr::new("1"))));
+    }
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn compute_planes_restore_render_targets_and_scale_the_overlay() {
+        use super::*;
+        use crate::host::{
+            host,
+            tests::{issued, replay},
+        };
+        use windows::Win32::Foundation::RECT;
+        use windows::core::Interface;
+
+        let Some(host) = host() else {
+            eprintln!("no D3D12 device; skipped plane readback");
+            return;
+        };
+        let recorded = host.new_list().unwrap();
+        let list = &recorded.list;
+        let state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        let make_plane = |width, height| {
+            let mut texture: Option<ID3D12Resource> = None;
+            // SAFETY: a live device and storage for one output texture.
+            unsafe {
+                host.device
+                    .CreateCommittedResource(
+                        &D3D12_HEAP_PROPERTIES {
+                            Type: D3D12_HEAP_TYPE_DEFAULT,
+                            ..Default::default()
+                        },
+                        D3D12_HEAP_FLAG_NONE,
+                        &D3D12_RESOURCE_DESC {
+                            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                            Width: width,
+                            Height: height,
+                            DepthOrArraySize: 1,
+                            MipLevels: 1,
+                            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                            SampleDesc: DXGI_SAMPLE_DESC {
+                                Count: 1,
+                                Quality: 0,
+                            },
+                            Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                            ..Default::default()
+                        },
+                        state,
+                        None,
+                        &mut texture,
+                    )
+                    .unwrap();
+            }
+            texture.unwrap()
+        };
+        let (width, height) = (9usize, 7usize);
+        let game = make_plane(width as u64, height as u32);
+        let ui = make_plane(2, 1);
+        let a = 128.0 / 255.0;
+        let rtv = host.rtv(&ui, None);
+        // SAFETY: the lists are open and both textures are render targets.
+        unsafe {
+            list.ClearRenderTargetView(host.rtv(&game, None), &[1.0, 0.0, 0.0, 1.0], None);
+            list.ClearRenderTargetView(
+                rtv,
+                &[0.0, 0.0, 64.0 / 255.0, a],
+                Some(&[RECT {
+                    left: 0,
+                    top: 0,
+                    right: 1,
+                    bottom: 1,
+                }]),
+            );
+            list.ClearRenderTargetView(
+                rtv,
+                &[0.0, 128.0 / 255.0, 0.0, a],
+                Some(&[RECT {
+                    left: 1,
+                    top: 0,
+                    right: 2,
+                    bottom: 1,
+                }]),
+            );
+        }
+        let replay_inputs = |second: &ID3D12Resource| {
+            let game_id = game.as_raw() as usize;
+            let mut states = std::collections::HashMap::from([
+                (game_id, state.0 as u32),
+                (second.as_raw() as usize, state.0 as u32),
+            ]);
+            let barriers = issued();
+            let first = barriers.iter().find(|&&(id, _, _)| id == game_id).unwrap();
+            println!(
+                "plane transitions primary_initial={} declared_before={}",
+                state.0, first.1
+            );
+            assert!(
+                replay(&barriers, &mut states).is_ok(),
+                "input transitions must start in their real states"
+            );
+            assert!(states.values().all(|&current| current == state.0 as u32));
+        };
+        issued();
+        let out = record(
+            &host.device,
+            list,
+            &game,
+            state.0 as u32,
+            &ui,
+            state.0 as u32,
+        )
+        .expect("compute compositor");
+        replay_inputs(&ui);
+        let (pixels, footprint) = crate::capture::read_back(&host.device, list, &out).unwrap();
+
+        // The same resource can be shown as both planes. Its transition is
+        // recorded once, and the two input bindings still sample it.
+        let out = record(
+            &host.device,
+            list,
+            &game,
+            state.0 as u32,
+            &game,
+            state.0 as u32,
+        )
+        .expect("aliased compositor inputs");
+        replay_inputs(&game);
+        let (alias_pixels, alias_footprint) =
+            crate::capture::read_back(&host.device, list, &out).unwrap();
+        recorded.close();
+        host.execute(&[&recorded]);
+
+        let read = |buffer: &ID3D12Resource, footprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT| {
+            assert_eq!(
+                (footprint.Footprint.Width, footprint.Footprint.Height),
+                (9, 7)
+            );
+            let mut data = std::ptr::null_mut();
+            // SAFETY: the copy completed and the footprint contains all
+            // 63 RGBA8 texels; the buffer remains mapped through the reads.
+            unsafe {
+                buffer.Map(0, None, Some(&mut data)).unwrap();
+                let mut rows = Vec::new();
+                for y in 0..height {
+                    let offset =
+                        footprint.Offset as usize + y * footprint.Footprint.RowPitch as usize;
+                    let row = data.cast::<u8>().add(offset);
+                    rows.extend((0..width).map(|x| row.add(x * 4).cast::<[u8; 4]>().read()));
+                }
+                buffer.Unmap(0, None);
+                rows
+            }
+        };
+        let factor = if premultiplied() { 1.0 } else { a };
+        let mut worst = 0u8;
+        for (i, actual) in read(&pixels, footprint).iter().enumerate() {
+            let x = (i % width) as f32 + 0.5;
+            let k = (2.0 * x / width as f32 - 0.5).clamp(0.0, 1.0);
+            let expected = [
+                127,
+                (128.0 * k * factor).round() as u8,
+                (64.0 * (1.0 - k) * factor).round() as u8,
+                255,
+            ];
+            let delta = actual
+                .iter()
+                .zip(expected)
+                .map(|(&a, b)| a.abs_diff(b))
+                .max()
+                .unwrap();
+            worst = worst.max(delta);
+            assert!(delta <= 1, "texel {i}: {actual:?}, expected {expected:?}");
+        }
+        assert!(
+            read(&alias_pixels, alias_footprint)
+                .iter()
+                .all(|p| *p == [255, 0, 0, 255])
+        );
+        println!(
+            "plane readback premultiplied={} texels=63 alias_texels=63 worst={worst}",
+            premultiplied()
+        );
     }
 }

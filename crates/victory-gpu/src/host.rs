@@ -3296,9 +3296,9 @@ impl Host {
             p.copy.reset();
             let list = &p.copy.list;
             let laid = if compose {
-                let (game, _) = shown[0];
+                let (game, game_state) = shown[0];
                 second.and_then(|(ui, ui_state)| {
-                    let out = crate::compose::record(&self.device, list, game, ui, ui_state);
+                    let out = crate::compose::record(&self.device, list, game, game_state, ui, ui_state);
                     if let Some(out) = &out {
                         p.copy.keep(out);
                     }
@@ -3308,10 +3308,9 @@ impl Host {
                 None
             };
             let (capture, probe) = if shown.len() == 1 {
-                let (texture, mut state) = shown[0];
-                if laid.is_some() {
-                    state = D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32;
-                }
+                let (texture, state) = laid.as_ref().map_or(shown[0], |output| {
+                    (output, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32)
+                });
                 let state = D3D12_RESOURCE_STATES(state as i32);
                 let mut before = Vec::with_capacity(2);
                 if state != D3D12_RESOURCE_STATE_COPY_SOURCE {
@@ -3323,7 +3322,7 @@ impl Host {
                     D3D12_RESOURCE_STATE_COPY_DEST,
                 ));
                 list.ResourceBarrier(&before);
-                list.CopyResource(&back, laid.as_ref().unwrap_or(texture));
+                list.CopyResource(&back, texture);
                 #[cfg(all(test, feature = "diagnostics"))]
                 let capture = {
                     // Inspect what reached the swap chain, before Present.
