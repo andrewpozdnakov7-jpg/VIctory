@@ -1727,34 +1727,9 @@ fn try_lower_cs32(
     let st = structure::structure(&p).expect("structure");
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
     let io = io::raise(&p, &native).expect("io::raise");
-    let lowered = lower::lower(&lower::Parts {
-        native: &native,
-        p: &p,
-        st: &st,
-        io: &io,
-        res: &res,
-        inputs: Vec::new(),
-        outputs: Vec::new(),
-        prims: Vec::new(),
-        mesh_stride: 0,
-        view_marks: false,
-    })?;
-    Ok(HostShader {
-        stage: HwStage::Cs,
-        dxil: lowered.dxil,
-        user_data: lowered.user_data,
-        samplers: lowered.samplers,
-        static_samplers: Vec::new(),
-        root_cbvs: lowered.root_cbvs,
-        root_srvs: lowered.root_srvs,
-        root_uavs: lowered.root_uavs,
-        memory: lowered.memory,
-        memory_writes: lowered.memory_writes,
-        view_addresses: lowered.view_addresses,
-        heap: lowered.heap,
-        heap_writes: lowered.heap_writes,
-        view_marks: lowered.view_marks,
-    })
+    let bytes = crate::dxbc::build(&[]);
+    let container = crate::dxbc::Container::parse(&bytes)?;
+    super::emit(&container, &native, &p, &st, &io, &res)
 }
 
 /// User data for [`lower_cs32`]'s programs: the root constant `k`, both
@@ -3228,19 +3203,25 @@ fn comparison_gathers_return_their_four_comparisons() {
     // Descriptors: s[8:15] the 4x4 texture (heap 0), s[16:19] the sampler (0),
     // s[20:23] the raw UAV (1).
     let mut prefix = vec![s_mov_b32(5, 0x80), s_mov_b32(7, 0x80)];
-    for (op, dst, base, offset) in [(3u32, 8u32, 4u32, 0u32), (2, 16, 6, 0), (2, 20, 4, 0x20)] {
-        prefix.extend([
-            0x3D << 26 | op << 18 | dst << 6 | base >> 1,
-            125 << 25 | offset,
-        ]);
-    }
+    prefix.extend(s_load_dwords(3, 8, 4, 0));
     let used = [
         (4, ResourceType::Srv, 0, 8),
         (4, ResourceType::Uav, 8, 4),
         (6, ResourceType::Sampler, 0, 4),
     ];
-    let program = |offset: Option<u32>, reference: f32| {
+    let program = |offset: Option<u32>, reference: f32, reduction: Option<u32>| {
         let mut w = prefix.clone();
+        let used = if let Some(reduction) = reduction {
+            // Clamp all axes and compare with LESS_EQUAL. Set min/max reduction
+            // in the same immediate descriptor the comparison gather uses.
+            w.extend([s_mov_b32(16, 255), (reduction << 29) | 0x3092]);
+            w.extend([s_mov_b32(17, 128), s_mov_b32(18, 128), s_mov_b32(19, 128)]);
+            &used[..2]
+        } else {
+            w.extend(s_load_dwords(2, 16, 6, 0));
+            &used[..]
+        };
+        w.extend(s_load_dwords(2, 20, 4, 0x20));
         // The address dwords: offset (only `_o`), reference, x, y.
         if let Some(packed_offset) = offset {
             w.extend([vop1(0x001, 1, 255), packed_offset]);
@@ -3255,7 +3236,7 @@ fn comparison_gathers_return_their_four_comparisons() {
             w.extend(buffer_store_dword(13 + k, 20, 4 * u16::from(k)));
         }
         w.push(S_ENDPGM);
-        lower_cs32(&w, &used, true)
+        lower_cs32(&w, used, true)
     };
     let samplers = [D3D12_SAMPLER_DESC {
         // The comparison bit in the filter is what makes the sampler a
@@ -3286,14 +3267,19 @@ fn comparison_gathers_return_their_four_comparisons() {
             .collect()
     };
     let base = [(1, 3), (2, 3), (2, 2), (1, 2)];
-    let cases = [
-        (program(None, reference), want(base)),
-        (program(Some(0), reference), want(base)),
-        (
-            program(Some(1), reference),
-            want([(2, 3), (3, 3), (3, 2), (2, 2)]),
-        ),
+    let footprints = [
+        (None, base),
+        (Some(0), base),
+        (Some(1), [(2, 3), (3, 3), (3, 2), (2, 2)]),
     ];
+    let cases: Vec<_> = [None, Some(1), Some(2)]
+        .into_iter()
+        .flat_map(|reduction| {
+            footprints.map(|(offset, area)| {
+                (reduction, offset, program(offset, reference, reduction), want(area))
+            })
+        })
+        .collect();
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let mut ran = 0;
     for (label, warp) in [("hardware", false), ("warp", true)] {
@@ -3301,10 +3287,11 @@ fn comparison_gathers_return_their_four_comparisons() {
             eprintln!("no SM 6.6 {label} device; skipped");
             continue;
         };
-        for (shader, want) in &cases {
+        for (reduction, offset, shader, want) in &cases {
+            let case = format!("{label} reduction={reduction:?} offset={offset:?}");
             let (root, pso) = host
                 .compute_pipeline(shader)
-                .unwrap_or_else(|e| panic!("{label}: {e}"));
+                .unwrap_or_else(|e| panic!("{case} {:?}: {e}", shader.static_samplers));
             let out = host
                 .dispatch(
                     &root,
@@ -3316,14 +3303,25 @@ fn comparison_gathers_return_their_four_comparisons() {
                         groups: [1, 1, 1],
                     },
                 )
-                .unwrap_or_else(|e| panic!("{label}: {e}"));
+                .unwrap_or_else(|e| panic!("{case}: {e}"));
             let got: Vec<f32> = out[0].iter().map(|&x| f32::from_bits(x)).collect();
-            assert_eq!(&got, want, "{label}");
+            assert_eq!(&got, want, "{case}");
         }
         ran += 1;
     }
     if ran == 0 {
         eprintln!("no device ran the comparison gathers (no SM 6.6 device); skipped");
+    }
+    for (reduction, offset, shader, _) in &cases {
+        if reduction.is_some() {
+            let [sampler] = shader.static_samplers.as_slice() else {
+                panic!("expected one static sampler for reduction={reduction:?}");
+            };
+            assert_eq!(
+                sampler.filter, 0x80,
+                "reduction={reduction:?} offset={offset:?}"
+            );
+        }
     }
 }
 

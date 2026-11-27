@@ -522,7 +522,9 @@ pub fn emit_with(
             .map(|(n, &w)| {
                 let mut s = StaticSampler::from_words(w);
                 if l.cmp_samplers >> n & 1 != 0 {
-                    s.filter |= 0x80;
+                    // D3D12_FILTER_REDUCTION_TYPE occupies bits 7..=8 (0x180);
+                    // clear min/max reduction before setting COMPARISON (0x80).
+                    s.filter = (s.filter & !0x180) | 0x80;
                 }
                 s
             })
@@ -977,6 +979,109 @@ mod tests {
         if let Some(path) = super::validator::Validator::default_path() {
             let mut v = super::validator::Validator::load(Some(&path)).unwrap();
             v.validate(&mut out.dxil.clone()).unwrap();
+        }
+    }
+
+    #[test]
+    fn immediate_comparison_sampler_clears_min_max_reduction_bits() {
+        // Test both MINIMUM (reduction = 1 -> 0x100) and MAXIMUM (reduction = 2 -> 0x180)
+        // in SQ_IMG_SAMP_WORD0 bits 29..30: comparison sampling must set
+        // D3D12_FILTER_REDUCTION_TYPE_COMPARISON (0x080), not MAXIMUM (0x180).
+        for (reduction_bits, expected_plain_reduction) in [(1u32 << 29, 0x100u32), (2u32 << 29, 0x180u32)] {
+            let words = [
+                0xBE81_0380u32, // s_mov_b32 s1, 0
+                0xF40C_0000,
+                0xFA00_0000,    // s_load_dwordx8 s[0:7], s[0:1], null
+                0xBE88_03FF,    // s_mov_b32 s8, <literal>
+                reduction_bits, // SQ_IMG_SAMP_WORD0 with min/max reduction
+                0xBE89_0380,    // s_mov_b32 s9, 0
+                0xBE8A_0380,    // s_mov_b32 s10, 0
+                0xBE8B_0380,    // s_mov_b32 s11, 0
+                0x7E00_02F0,    // v_mov_b32 v0, 0.5 (comparison reference)
+                0x7E02_02F0,    // v_mov_b32 v1, 0.5 (u)
+                0x7E04_02F0,    // v_mov_b32 v2, 0.5 (v)
+                0xBF8C_0070,    // s_waitcnt vmcnt(0) lgkmcnt(0)
+                0xF080_0108,
+                0x0040_0301,    // image_sample v3, v[1:2], s[0:7], s[8:11]
+                0xF0BC_0108,
+                0x0040_0400,    // image_sample_c_lz v4, v[0:2], s[0:7], s[8:11]
+                0xBF8C_3F70,    // s_waitcnt vmcnt(0)
+                0xF800_180F,
+                0x0404_0403,    // exp mrt0, v3, v4, v4, v4 done vm
+                0xBF81_0000,
+            ];
+            let native = NativeProgram {
+                stage: HwStage::Ps,
+                wave64: false,
+                vgprs: 5,
+                layout: vec![crate::native::RootParam {
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                }],
+                used: vec![crate::native::UsedResource {
+                    kind: crate::native::ResourceType::Srv,
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    lower_bound: 0,
+                    stride: 0,
+                    dwords: 8,
+                    user_data: 0,
+                    slot: 0,
+                }],
+                io: StageIo::Ps {
+                    inputs: vec![],
+                    input_addr: 0,
+                    db_shader_control: 0,
+                    patches: vec![],
+                },
+                code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            };
+            let output = SigElement {
+                name: "SV_Target".into(),
+                index: 0,
+                kind: 16,
+                comp: 9,
+                interp: 0,
+                row: Some(0),
+                col: 0,
+                cols: 4,
+                usage: 15,
+                half: false,
+            };
+            let osg1 = container::signature(&[output], false);
+            let bytes = crate::dxbc::build(&[(FourCC::OSG1, &osg1)]);
+            let c = Container::parse(&bytes).unwrap();
+            let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+            let st = structure::structure(&p).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            let io = io::raise(&p, &native).unwrap();
+            let out = emit(&c, &native, &p, &st, &io, &res).unwrap();
+
+            assert_eq!(out.static_samplers.len(), 2);
+            assert_eq!(
+                out.static_samplers[0].filter & 0x180,
+                expected_plain_reduction,
+                "plain sample slot keeps its min/max reduction"
+            );
+            assert_eq!(
+                out.static_samplers[1].filter & 0x180,
+                0x80,
+                "comparison sample slot must have D3D12_FILTER_REDUCTION_TYPE_COMPARISON (0x80)"
+            );
+            assert_eq!(
+                out.static_samplers[1].filter & !0x180,
+                out.static_samplers[0].filter & !0x180,
+                "comparison sample slot preserves base filter mode bits"
+            );
+            #[cfg(windows)]
+            if let Some(path) = super::validator::Validator::default_path() {
+                let mut v = super::validator::Validator::load(Some(&path)).unwrap();
+                v.validate(&mut out.dxil.clone()).unwrap();
+            }
         }
     }
 
