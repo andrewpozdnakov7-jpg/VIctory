@@ -2281,6 +2281,7 @@ fn v_mul_legacy_f32_treats_denormals_as_zero() {
         );
     });
 }
+#[test]
 fn ps_sample_coverage_input_reads_coverage_mask() {
     use super::bitcode::{Attr, Term};
     use super::container::{self, SigElement};
