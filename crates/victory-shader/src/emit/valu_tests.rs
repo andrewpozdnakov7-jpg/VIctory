@@ -2250,6 +2250,22 @@ fn relative_moves_reach_only_what_their_clamped_index_can() {
 }
 
 #[test]
+fn relative_source_selects_all_nine_registers() {
+    let mut body = vec![s_mov_b32(124, 0)]; // s_mov_b32 m0, s0
+    for k in 0..9u32 {
+        // v_add_nc_u32 v[7+k], literal(k*37+11), v2
+        body.extend([0x25 << 25 | (7 + k) << 17 | 2 << 9 | 0xff, k * 37 + 11]);
+    }
+    body.push(vop1(0x043, 0, vgpr(7))); // v_movrels_b32 v0, v[7 + m0]
+    let shader = build_valu_cs(&body);
+
+    let cases: Vec<_> = (0..9).map(|k| [k, 0x3142_abcd, 0, 0]).collect();
+    run_cases(&shader, &cases, |backend, _, [k, x, ..], got| {
+        assert_eq!(got, x.wrapping_add(k * 37 + 11), "{backend}: index {k}");
+    });
+}
+
+#[test]
 fn v_mul_legacy_f32_treats_denormals_as_zero() {
     // v_mul_legacy_f32 v0, v1, v2 (VOP2 opcode 0x007 in its VOP3 encoding)
     let shader = build_valu_cs(&vop3(0x107, 0, vgpr(1), vgpr(2), vgpr(0)));

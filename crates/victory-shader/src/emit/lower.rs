@@ -6115,17 +6115,46 @@ impl<'a> Lower<'a> {
                 };
                 let indexed_src = name != "v_movreld_b32";
                 let value = if indexed_src {
-                    let mut r = self.s.m.i32(0);
-                    for k in 0..=255u8.saturating_sub(sreg) {
-                        let Some(x) = inst.read(Reg::V(sreg + k)) else {
+                    let mut sources = Vec::new();
+                    for reg in sreg..=u8::MAX {
+                        let Some(x) = inst.read(Reg::V(reg)) else {
                             break;
                         };
-                        let x = self.i32_of(x)?;
-                        let kk = self.s.m.i32(u32::from(k));
-                        let is = self.s.m.cmp(c, pred::EQ, m0, kk);
-                        r = self.s.m.select(c, is, x, r);
+                        sources.push(self.i32_of(x)?);
                     }
-                    r
+                    let zero = self.s.m.i32(0);
+                    let count = sources.len();
+                    if count < 8 {
+                        let mut r = zero;
+                        for (k, x) in sources.into_iter().enumerate() {
+                            let kk = self.s.m.i32(k as u32);
+                            let is = self.s.m.cmp(c, pred::EQ, m0, kk);
+                            r = self.s.m.select(c, is, x, r);
+                        }
+                        r
+                    } else {
+                        // Each level shares one index-bit test across every pair.
+                        // An unpaired last source already represents its pair.
+                        let mut bit = 1;
+                        while sources.len() > 1 {
+                            let mask = self.s.m.i32(bit);
+                            let masked = self.s.m.bin(c, Bin::And, m0, mask);
+                            let high = self.s.m.cmp(c, pred::NE, masked, zero);
+                            let next_count = sources.len().div_ceil(2);
+                            for i in 0..next_count {
+                                let first = sources[2 * i];
+                                sources[i] = match sources.get(2 * i + 1) {
+                                    Some(&second) => self.s.m.select(c, high, second, first),
+                                    None => first,
+                                };
+                            }
+                            sources.truncate(next_count);
+                            bit <<= 1;
+                        }
+                        let limit = self.s.m.i32(count as u32);
+                        let in_range = self.s.m.cmp(c, pred::IULT, m0, limit);
+                        self.s.m.select(c, in_range, sources[0], zero)
+                    }
                 } else {
                     s(self, 0)?
                 };
