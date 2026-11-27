@@ -31,7 +31,7 @@ pub(crate) struct GraphicsState {
     strip_cut: D3D12_INDEX_BUFFER_STRIP_CUT_VALUE,
     pub(crate) topology: D3D12_PRIMITIVE_TOPOLOGY_TYPE,
     pub(crate) targets: D3D12_RT_FORMAT_ARRAY,
-    depth_format: DXGI_FORMAT,
+    pub(crate) depth_format: DXGI_FORMAT,
     samples: DXGI_SAMPLE_DESC,
 }
 
@@ -151,6 +151,47 @@ fn host_blend(blend: &D3D12_BLEND_DESC, targets: &D3D12_RT_FORMAT_ARRAY) -> D3D1
 }
 
 impl GraphicsState {
+    pub(crate) fn clone_for_variant(&self) -> Self {
+        let names = self.names.clone();
+        let inputs = self
+            .inputs
+            .iter()
+            .zip(&names)
+            .map(|(e, name)| D3D12_INPUT_ELEMENT_DESC {
+                SemanticName: PCSTR(name.as_ptr().cast()),
+                ..*e
+            })
+            .collect();
+        GraphicsState {
+            blend: self.blend,
+            sample_mask: self.sample_mask,
+            rasterizer: self.rasterizer,
+            depth: self.depth,
+            depth_bounds: self.depth_bounds,
+            inputs,
+            names,
+            strip_cut: self.strip_cut,
+            topology: self.topology,
+            targets: self.targets,
+            depth_format: self.depth_format,
+            samples: self.samples,
+        }
+    }
+
+    pub(crate) fn apply_target_formats(&mut self, key: super::make::TargetKey) {
+        self.targets.NumRenderTargets = key.num_render_targets.min(8);
+        self.targets.RTFormats = key.rt_formats.map(DXGI_FORMAT);
+        self.depth_format = DXGI_FORMAT(key.dsv_format);
+    }
+
+    pub(crate) fn matches_target_key(&self, key: &super::make::TargetKey) -> bool {
+        self.target_key() == *key
+    }
+
+    pub(crate) fn target_key(&self) -> super::make::TargetKey {
+        super::make::TargetKey::from_formats(&self.targets, self.depth_format)
+    }
+
     /// Takes in one subobject of a stream: its type, then its data at +4
     /// (+8 for those holding pointers).
     ///
@@ -336,6 +377,7 @@ const RECTANGLES: i32 = 19;
 const QUADS: i32 = 32;
 
 /// One stage of a host pipeline and where its bindings go.
+#[derive(Clone)]
 pub(crate) struct Stage {
     pub(crate) shader: Arc<Shader>,
     /// The root parameter of its user data, and its size in dwords.
@@ -360,6 +402,7 @@ impl Stage {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct HostPipeline {
     /// A compute pipeline (else graphics).
     pub(crate) compute: bool,
@@ -984,6 +1027,7 @@ mod tests {
         t.RTFormats[1] = DXGI_FORMAT_R8_UINT;
         assert_eq!(host_blend(&blending(false), &t), blending(false));
     }
+
     fn element(format: DXGI_FORMAT, offset: u32) -> D3D12_INPUT_ELEMENT_DESC {
         D3D12_INPUT_ELEMENT_DESC {
             SemanticName: PCSTR(c"TEXCOORD".as_ptr().cast()),
@@ -1002,6 +1046,42 @@ mod tests {
             ..GraphicsState::default()
         };
         state.elements().iter().map(|e| e.offset).collect()
+    }
+
+    #[test]
+    fn integer_blend_disable_covers_signed_and_unsigned_formats() {
+        let formats = [
+            DXGI_FORMAT_R32_UINT,
+            DXGI_FORMAT_R32_SINT,
+            DXGI_FORMAT_R16G16_UINT,
+            DXGI_FORMAT_R16G16_SINT,
+            DXGI_FORMAT_R8G8B8A8_UINT,
+            DXGI_FORMAT_R8G8B8A8_SINT,
+        ];
+        for format in formats {
+            assert!(integer_format(format));
+            let host = host_blend(&blending(false), &targets(&[format]));
+            assert!(!host.RenderTarget[0].BlendEnable.as_bool());
+        }
+    }
+
+    #[test]
+    fn target_variant_key_changes_with_bound_formats() {
+        let g = GraphicsState {
+            targets: targets(&[DXGI_FORMAT_R8G8B8A8_UNORM]),
+            depth_format: DXGI_FORMAT_D32_FLOAT,
+            ..GraphicsState::default()
+        };
+        let base = g.target_key();
+        let mut variant = g.clone_for_variant();
+        variant.apply_target_formats(crate::pipeline::make::TargetKey::from_formats(
+            &targets(&[DXGI_FORMAT_R16G16B16A16_FLOAT]),
+            DXGI_FORMAT_D24_UNORM_S8_UINT,
+        ));
+        let changed = variant.target_key();
+        assert_ne!(base, changed);
+        assert_eq!(variant.targets.RTFormats[0], DXGI_FORMAT_R16G16B16A16_FLOAT);
+        assert_eq!(variant.depth_format, DXGI_FORMAT_D24_UNORM_S8_UINT);
     }
 
     /// An appended element after one of 1 or 2 bytes started right after

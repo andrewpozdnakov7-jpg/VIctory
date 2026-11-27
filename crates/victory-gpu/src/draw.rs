@@ -64,6 +64,9 @@ pub(crate) struct State {
     /// Bound render target and depth resources, for their host states.
     targets: Vec<usize>,
     depth: usize,
+    /// The formats of the bound targets, for pipeline variant selection.
+    rt_formats: D3D12_RT_FORMAT_ARRAY,
+    dsv_format: DXGI_FORMAT,
     /// None leaves the host list's default bounds (0..1) in place.
     depth_bounds: Option<(f32, f32)>,
     /// The title's primitive topology (the host's may differ).
@@ -117,6 +120,18 @@ impl Drop for State {
             }
         }
     }
+}
+
+fn normalize_target_formats(
+    mut rt_formats: D3D12_RT_FORMAT_ARRAY,
+    dsv_format: DXGI_FORMAT,
+) -> (D3D12_RT_FORMAT_ARRAY, DXGI_FORMAT) {
+    rt_formats.NumRenderTargets = rt_formats.NumRenderTargets.min(8);
+    let count = rt_formats.NumRenderTargets as usize;
+    for f in &mut rt_formats.RTFormats[count..] {
+        *f = DXGI_FORMAT(0);
+    }
+    (rt_formats, dsv_format)
 }
 
 /// The key of our own view heap (`crate::memory::heap`) among the title's.
@@ -413,6 +428,7 @@ impl State {
         };
         self.targets.clear();
         let mut rtvs = Vec::new();
+        let mut rt_formats = D3D12_RT_FORMAT_ARRAY::default();
         for &h in handles {
             let Some(record) = crate::descriptor::rtv_record(h) else {
                 once!(
@@ -427,16 +443,24 @@ impl State {
             self.targets.push(record.resource as usize);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(list, record.resource);
+            if (rt_formats.NumRenderTargets as usize) < rt_formats.RTFormats.len() {
+                let i = rt_formats.NumRenderTargets as usize;
+                rt_formats.RTFormats[i] = record.format();
+                rt_formats.NumRenderTargets += 1;
+            }
             rtvs.push(host.rtv(&texture, record.desc().as_ref()));
         }
         self.depth = 0;
+        let mut dsv_format = DXGI_FORMAT(0);
         let dsv = crate::descriptor::dsv_record(depth).and_then(|record| {
             let texture = crate::resource::host_resource(record.resource)?;
             self.depth = record.resource as usize;
+            dsv_format = record.format();
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(list, record.resource);
             Some(host.dsv(&texture, record.depth_desc().as_ref()))
         });
+        (self.rt_formats, self.dsv_format) = normalize_target_formats(rt_formats, dsv_format);
         // SAFETY: an open list; the views were just made.
         unsafe {
             list.list.OMSetRenderTargets(
@@ -535,7 +559,11 @@ impl State {
         if crate::pipeline::is_skipped(self.pipeline as This) {
             return false;
         }
-        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+        let Some(p) = crate::pipeline::host_pipeline_for_targets(
+            self.pipeline as This,
+            &self.rt_formats,
+            self.dsv_format,
+        ) else {
             return false;
         };
         if p.compute || p.mesh != mesh {
@@ -1138,7 +1166,7 @@ impl State {
     #[cfg(feature = "diagnostics")]
     fn op_text(&self, kind: String, compute: bool) -> String {
         use std::fmt::Write;
-        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+        let Some(p) = self.current_host_pipeline() else {
             return kind;
         };
         let mut text = format!("{kind} {}", p.name);
@@ -1445,7 +1473,7 @@ impl State {
         if !crate::capture::listed(crate::queue::presented() + 1) {
             return;
         }
-        let (Some(p), Some(host)) = (crate::pipeline::host_pipeline(self.pipeline as This), crate::host::host()) else {
+        let (Some(p), Some(host)) = (self.current_host_pipeline(), crate::host::host()) else {
             return;
         };
         for stage in &p.stages {
@@ -1509,7 +1537,7 @@ impl State {
     /// builds).
     #[cfg(feature = "diagnostics")]
     fn reads(&self, compute: bool) -> Vec<String> {
-        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+        let Some(p) = self.current_host_pipeline() else {
             return vec!["no host pipeline".into()];
         };
         let mut out = Vec::new();
@@ -1595,15 +1623,23 @@ impl State {
         }
     }
 
+    fn current_host_pipeline(&self) -> Option<&'static HostPipeline> {
+        crate::pipeline::host_pipeline_for_targets(
+            self.pipeline as This,
+            &self.rt_formats,
+            self.dsv_format,
+        )
+    }
+
     /// Whether the bound pipeline's geometry shader completes rectangles.
     fn completes_rectangles(&self) -> bool {
-        crate::pipeline::host_pipeline(self.pipeline as This).is_some_and(|p| p.rectangles)
+        self.current_host_pipeline().is_some_and(|p| p.rectangles)
     }
 
     /// Binds vertex buffers holding the rectangles of vertices `first..first
     /// + count` as triangles, made when the list is submitted.
     fn rectangles(&self, list: &HostList, count: u32, first: u32) -> bool {
-        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+        let Some(p) = self.current_host_pipeline() else {
             return false;
         };
         let rects = u64::from(count / 3);
@@ -1731,7 +1767,13 @@ impl State {
         // the arguments and dispatch a compute shader for records nothing
         // reads. Same order as the `is_skipped` check above, for the same
         // reason.
-        if crate::pipeline::host_pipeline(self.pipeline as This).is_none() {
+        let graphics_kind = matches!(kind, DRAW | INDEXED | MESH);
+        let has_pipeline = if graphics_kind {
+            self.current_host_pipeline().is_some()
+        } else {
+            crate::pipeline::host_pipeline(self.pipeline as This).is_some()
+        };
+        if !has_pipeline {
             #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);
             why("no host pipeline");
@@ -1787,17 +1829,24 @@ impl State {
         if !ran {
             crate::indirect::done(list, &clamped);
             #[cfg(feature = "diagnostics")]
-            match crate::pipeline::host_pipeline(self.pipeline as This) {
-                None => {
-                    crate::pipeline::note_drop(self.pipeline as This);
-                    list.note_op(|| format!("DROPPED indirect kind {kind} (no host pipeline) {}", crate::pipeline::shaders_of(pipeline)));
+            {
+                let p = if graphics_kind {
+                    self.current_host_pipeline()
+                } else {
+                    crate::pipeline::host_pipeline(self.pipeline as This)
+                };
+                match p {
+                    None => {
+                        crate::pipeline::note_drop(self.pipeline as This);
+                        list.note_op(|| format!("DROPPED indirect kind {kind} (no host pipeline) {}", crate::pipeline::shaders_of(pipeline)));
+                    }
+                    Some(p) => why(&format!(
+                        "prepare failed (compute {}, mesh {}): {}",
+                        p.compute,
+                        p.mesh,
+                        NOT_RUN.with(|w| w.replace(""))
+                    )),
                 }
-                Some(p) => why(&format!(
-                    "prepare failed (compute {}, mesh {}): {}",
-                    p.compute,
-                    p.mesh,
-                    NOT_RUN.with(|w| w.replace(""))
-                )),
             }
             return false;
         }
