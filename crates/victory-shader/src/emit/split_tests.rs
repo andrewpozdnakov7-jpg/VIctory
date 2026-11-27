@@ -11,6 +11,9 @@ use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
 };
 use crate::{io, ir, resource, structure};
+use windows::Win32::Graphics::Direct3D12::{
+    D3D12_FEATURE_D3D12_OPTIONS1, D3D12_FEATURE_DATA_D3D12_OPTIONS1,
+};
 
 const S_ENDPGM: u32 = 0xBF81_0000;
 const VCC: u8 = 106;
@@ -218,14 +221,28 @@ fn a_split_wave64_gives_the_consoles_lanes_masks_and_reads() {
                 eprintln!("no SM 6.6 {label} device; skipped");
                 continue;
             };
-            let (root, pso) = match host.compute_pipeline(&shader) {
-                Ok(p) => p,
-                // A device without the wave size: the other build covers it.
-                Err(e) => {
-                    eprintln!("{label}, {host_wave_max}-lane host: no pipeline ({e}); skipped");
-                    continue;
-                }
-            };
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+            // SAFETY: the query writes the feature structure of the given size.
+            unsafe {
+                host.device.CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS1,
+                    (&raw mut options).cast(),
+                    size_of_val(&options) as u32,
+                )
+            }
+            .expect("query wave capabilities");
+            if !options.WaveOps.as_bool()
+                || !(options.WaveLaneCountMin..=options.WaveLaneCountMax).contains(&host_wave_max)
+            {
+                eprintln!(
+                    "{label}: Wave{host_wave_max} unavailable (range {}..={}); readback skipped",
+                    options.WaveLaneCountMin, options.WaveLaneCountMax
+                );
+                continue;
+            }
+            let (root, pso) = host
+                .compute_pipeline(&shader)
+                .unwrap_or_else(|e| panic!("{label}, Wave{host_wave_max}: pipeline failed: {e}"));
             let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
             let out = host
                 .dispatch(
@@ -247,10 +264,13 @@ fn a_split_wave64_gives_the_consoles_lanes_masks_and_reads() {
                     "{label}, {host_wave_max}-lane host, lane {lane}"
                 );
             }
+            eprintln!("{label}, Wave{host_wave_max}: all 64 console lanes matched");
             ran += 1;
         }
     }
-    assert!(ran > 0, "no device ran the program");
+    if ran == 0 {
+        eprintln!("no Wave32 or Wave64 device; checked translation only");
+    }
 }
 
 /// Runs `shader` on the hardware GPU, if it makes the pipeline, and
