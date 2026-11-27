@@ -2593,6 +2593,31 @@ fn comparison_gathers_and_offset_samples_lower_and_validate() {
 }
 
 #[test]
+fn comparison_gathers_reject_non_red_channels() {
+    let body = |op, mask| {
+        let mut words = Vec::new();
+        for reg in 1..=4u8 {
+            words.push(vop1(0x001, reg, 0x80));
+        }
+        words.extend_from_slice(&mimg_sample(op, mask, 1, 8, 1, 16, 12));
+        words
+    };
+    for op in [0x04f, 0x05f] {
+        for mask in [2, 4, 8] {
+            let Err(err) = sample_cs(&body(op, mask)) else {
+                panic!("{op:#x}/{mask:#x}: comparison gather lowered");
+            };
+            assert!(
+                err.contains("a comparison gather of a non-red channel"),
+                "{op:#x}/{mask:#x}: {err}"
+            );
+        }
+        assert!(sample_cs(&body(op, 1)).is_ok(), "red comparison {op:#x}");
+    }
+    assert!(sample_cs(&body(0x047, 2)).is_ok(), "green ordinary gather");
+}
+
+#[test]
 fn gathers_of_a_1d_3d_or_offset_cube_image_are_refused() {
     // DXIL gathers are 2D, 2D array and cube only, and a cube gather takes no
     // texel offset: the validator rejects those modules, so the translator
