@@ -47,6 +47,43 @@ const fn vop1(op: u16, vdst: u8, src0: u16) -> u32 {
     0x7E00_0000 | (vdst as u32) << 17 | (op as u32) << 9 | (src0 as u32 & 0x1FF)
 }
 
+/// VOP1 SDWA `op_sdwa vdst, vsrc0 dst_sel dst_unused src0_sel`.
+const fn vop1_sdwa(
+    op: u16,
+    vdst: u8,
+    vsrc0: u8,
+    dst_sel: u8,
+    dst_unused: u8,
+    src0_sel: u8,
+) -> [u32; 2] {
+    [
+        vop1(op, vdst, 0xF9),
+        vsrc0 as u32
+            | (dst_sel as u32 & 7) << 8
+            | (dst_unused as u32 & 3) << 11
+            | (src0_sel as u32 & 7) << 16,
+    ]
+}
+
+/// VOP2 SDWA `op_sdwa vdst, vsrc0, vsrc1 dst_sel dst_unused src0_sel src1_sel`.
+const fn vop2_sdwa(
+    op: u8,
+    vdst: u8,
+    vsrc0: u8,
+    vsrc1: u8,
+    dst: (u8, u8),
+    src_sel: [u8; 2],
+) -> [u32; 2] {
+    [
+        (op as u32) << 25 | (vdst as u32) << 17 | (vsrc1 as u32) << 9 | 0xF9,
+        vsrc0 as u32
+            | (dst.0 as u32 & 7) << 8
+            | (dst.1 as u32 & 3) << 11
+            | (src_sel[0] as u32 & 7) << 16
+            | (src_sel[1] as u32 & 7) << 24,
+    ]
+}
+
 /// VOP3 `op vdst, src0, src1, src2` (no modifiers).
 const fn vop3(op: u16, vdst: u8, src0: u16, src1: u16, src2: u16) -> [u32; 2] {
     [
@@ -801,6 +838,38 @@ fn half_fma_clamps_in_both_rounding_modes() {
                 got & 0xffff,
                 cases[case].1[i],
                 "{backend}: {label} clamped case {case}, inputs {input:x?}"
+            );
+        });
+    }
+}
+
+#[test]
+fn clamped_fma_keeps_the_high_half_from_sdwa_sign_extension() {
+    // v_add_f16_sdwa v0, v3, v4 dst_sel:WORD_0 dst_unused:UNUSED_SEXT
+    // src0_sel:WORD_0 src1_sel:WORD_0. The raw words also build on both controls.
+    let add_seed = [0x6400_08f9, 0x0404_0c03];
+    let [op, src] = vop3(0x34b, 0, vgpr(1), vgpr(2), vgpr(0));
+    let cases = [
+        ([0x4200, 0x3c00, 0xbc00, 0], [0xffff_3c00; 2]), // 3*1 - 1 = 2
+        ([0, 0x3c00, 0xbc00, 0], [0xffff_0000; 2]),      // 0*1 - 1 = -1
+        ([0x3c00, 0x3c00, 0xb800, 0], [0xffff_3800; 2]), // 1*1 - 0.5 = 0.5
+        ([0x0001, 0x8001, 0x3c00, 0], [0x3c00, 0x3bff]), // 1 - 2^-48
+    ];
+    let inputs = cases.map(|(input, _)| input);
+    for (i, mode) in [0, 3].into_iter().enumerate() {
+        let shader = build_valu_cs(&[
+            0xba80_0881,
+            mode,
+            add_seed[0],
+            add_seed[1],
+            op | 1 << 15,
+            src,
+        ]);
+        run_cases(&shader, &inputs, |backend, case, input, got| {
+            assert_eq!(
+                got,
+                cases[case].1[i],
+                "{backend}: mode={mode}, case {case}, inputs {input:x?}"
             );
         });
     }
@@ -2421,4 +2490,94 @@ fn v_mul_legacy_f32_treats_denormals_as_zero() {
             inp[0], inp[1],
         );
     });
+}
+
+#[test]
+fn sdwa_16bit_dst_unused_sext_sign_extends_word0() {
+    // SDWA dst_sel: 4 = WORD_0, 5 = WORD_1.
+    // SDWA dst_unused: 0 = UNUSED_PAD, 1 = UNUSED_SEXT, 2 = UNUSED_PRESERVE.
+    // Pre-seed v0 from v4 (0xABCD_1234) so UNUSED_SEXT/UNUSED_PAD/UNUSED_PRESERVE
+    // are distinguishable from each other.
+    let seed = 0xABCD_1234u32;
+
+    // v_cvt_i16_f16_sdwa v0, v1 dst_sel:WORD_0 dst_unused:UNUSED_SEXT src0_sel:WORD_0
+    let mut body = vec![vop1(0x001, 0, vgpr(4))];
+    body.extend_from_slice(&vop1_sdwa(0x053, 0, 1, 4, 1, 4));
+    let cvt_sext = build_valu_cs(&body);
+    let cvt_cases: &[(u32, u32)] = &[
+        (0xBC00, 0xFFFF_FFFF), // -1.0 -> -1i16 sign-extended to -1i32
+        (0xF800, 0xFFFF_8000), // -32768.0 -> -32768i16 sign-extended
+        (0x3C00, 0x0000_0001), // +1.0 -> +1i16 zero-extended (old v0 upper bits cleared)
+        (0x7BFF, 0x0000_7FFF), // +65504.0 -> saturated +32767i16
+        (0x0000, 0x0000_0000), // 0.0 -> 0
+    ];
+    let cvt_in: Vec<[u32; 4]> = cvt_cases.iter().map(|&(x, _)| [x, 0, 0, seed]).collect();
+    run_cases(&cvt_sext, &cvt_in, |backend, i, inp, got| {
+        let want = cvt_cases[i].1;
+        assert_eq!(
+            got, want,
+            "{backend}: v_cvt_i16_f16_sdwa({:#06x}, WORD_0, UNUSED_SEXT) = {got:#010x}, want {want:#010x}",
+            inp[0],
+        );
+    });
+
+    // v_cvt_norm_i16_f16_sdwa v0, v1 dst_sel:WORD_0 dst_unused:UNUSED_SEXT src0_sel:WORD_1
+    let mut body = vec![vop1(0x001, 0, vgpr(4))];
+    body.extend_from_slice(&vop1_sdwa(0x063, 0, 1, 4, 1, 5));
+    let norm_sext = build_valu_cs(&body);
+    let norm_cases: &[(u32, u32)] = &[
+        (0xBC00_3C00, 0xFFFF_8001), // high half -1.0 -> -32767i16 sign-extended
+        (0x3C00_BC00, 0x0000_7FFF), // high half +1.0 -> +32767i16
+    ];
+    let norm_in: Vec<[u32; 4]> = norm_cases.iter().map(|&(x, _)| [x, 0, 0, seed]).collect();
+    run_cases(&norm_sext, &norm_in, |backend, i, inp, got| {
+        let want = norm_cases[i].1;
+        assert_eq!(
+            got, want,
+            "{backend}: v_cvt_norm_i16_f16_sdwa({:#010x}, WORD_0, UNUSED_SEXT) = {got:#010x}, want {want:#010x}",
+            inp[0],
+        );
+    });
+
+    // v_add_f16_sdwa v0, v1, v2 dst_sel:WORD_0 dst_unused:UNUSED_SEXT src0_sel:WORD_0 src1_sel:WORD_0
+    let mut body = vec![vop1(0x001, 0, vgpr(4))];
+    body.extend_from_slice(&vop2_sdwa(0x32, 0, 1, 2, (4, 1), [4, 4]));
+    let add_sext = build_valu_cs(&body);
+    let add_cases: &[(u32, u32, u32)] = &[
+        (0xBC00, 0xC000, 0xFFFF_C200), // -1.0 + -2.0 = -3.0 (0xC200, bit 15 set -> sign-extended)
+        (0x3C00, 0x4000, 0x0000_4200), // +1.0 + +2.0 = +3.0 (0x4200, bit 15 clear)
+    ];
+    let add_in: Vec<[u32; 4]> = add_cases.iter().map(|&(a, b, _)| [a, b, 0, seed]).collect();
+    run_cases(&add_sext, &add_in, |backend, i, inp, got| {
+        let want = add_cases[i].2;
+        assert_eq!(
+            got, want,
+            "{backend}: v_add_f16_sdwa({:#06x}, {:#06x}, WORD_0, UNUSED_SEXT) = {got:#010x}, want {want:#010x}",
+            inp[0], inp[1],
+        );
+    });
+
+    // Regression check for the other dst_sel / dst_unused modes on v_cvt_i16_f16_sdwa(-1.0):
+    // WORD_0 + UNUSED_PAD -> 0x0000_FFFF, WORD_0 + UNUSED_PRESERVE -> 0xABCD_FFFF,
+    // WORD_1 + UNUSED_PAD / UNUSED_SEXT -> 0xFFFF_0000 (bits below WORD_1 pad with 0),
+    // WORD_1 + UNUSED_PRESERVE -> 0xFFFF_1234, DWORD -> 0x0000_FFFF.
+    let modes: &[(u8, u8, u32)] = &[
+        (4, 0, 0x0000_FFFF),
+        (4, 2, 0xABCD_FFFF),
+        (5, 0, 0xFFFF_0000),
+        (5, 1, 0xFFFF_0000),
+        (5, 2, 0xFFFF_1234),
+        (6, 0, 0x0000_FFFF),
+    ];
+    for &(dst_sel, dst_unused, want) in modes {
+        let mut body = vec![vop1(0x001, 0, vgpr(4))];
+        body.extend_from_slice(&vop1_sdwa(0x053, 0, 1, dst_sel, dst_unused, 4));
+        let shader = build_valu_cs(&body);
+        run_cases(&shader, &[[0xBC00, 0, 0, seed]], |backend, _, _, got| {
+            assert_eq!(
+                got, want,
+                "{backend}: v_cvt_i16_f16_sdwa(-1.0, dst_sel={dst_sel}, dst_unused={dst_unused}) = {got:#010x}, want {want:#010x}",
+            );
+        });
+    }
 }
