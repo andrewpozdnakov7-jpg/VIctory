@@ -1320,6 +1320,57 @@ fn min_max_and_clamp_match_the_hardware() {
     assert_clean(check(&passing(min_max_probes())));
 }
 
+/// The integer-ordered med3 path must match the float CPU model, including
+/// NaNs in every source, signed zeros, denormals and VOP3 modifiers. Each
+/// probe runs across lanes on both the hardware adapter and WARP.
+#[test]
+fn med3_f32_ordered_keys_match_the_reference() {
+    let inputs = triples(F32_EDGES, F32_EDGES, F32_EDGES);
+    let modifiers = source_mods().into_iter().chain(output_mods()).chain([
+        M {
+            abs: 0b101,
+            neg: 0b110,
+            clamp: true,
+            omod: 1,
+            ..NONE
+        },
+        M {
+            abs: 0b110,
+            neg: 0b011,
+            clamp: false,
+            omod: 2,
+            ..NONE
+        },
+        M {
+            abs: 0b011,
+            neg: 0b101,
+            clamp: true,
+            omod: 3,
+            ..NONE
+        },
+    ]);
+    let probes: Vec<_> = modifiers
+        .map(|m| {
+            probe(
+                vop3(0x157, 5, [v(1), v(2), v(3)], m),
+                inputs.clone(),
+                tolerant(0, m),
+                move |i| {
+                    vec![mods_out(
+                        med3(
+                            mods_in(i[0], 0, m),
+                            mods_in(i[1], 1, m),
+                            mods_in(i[2], 2, m),
+                        ),
+                        m,
+                    )]
+                },
+            )
+        })
+        .collect();
+    assert_clean(check(&probes));
+}
+
 /// `v_cubeid_f32`, `v_cubesc_f32`, `v_cubetc_f32` and `v_cubema_f32` of
 /// (x, y, z) (RDNA2 ISA: the major axis is z when |z| >= |x| and |z| >= |y|,
 /// else y when |y| >= |x|, else x), with the coordinates' denormals read as

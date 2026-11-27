@@ -21,6 +21,7 @@ use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 mod bvh;
+mod med3;
 
 type Why = &'static str;
 
@@ -60,6 +61,9 @@ pub(crate) struct Lowered {
     /// Heap handles written.
     #[cfg(test)]
     pub heap_handles: u32,
+    /// Instructions written to the DXIL function body.
+    #[cfg(test)]
+    pub instructions: usize,
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
@@ -1404,6 +1408,8 @@ impl<'a> Lower<'a> {
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
             heap_handles: self.s.m.written_calls("dx.op.createHandleFromHeap") as u32,
+            #[cfg(test)]
+            instructions: self.s.m.written_instructions(),
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
             #[cfg(test)]
@@ -6302,7 +6308,7 @@ impl<'a> Lower<'a> {
                         let t = self.max_min(false, a, bb);
                         self.max_min(false, t, cc)
                     }
-                    _ => self.med3(a, bb, cc),
+                    _ => self.med3_f32(a, bb, cc),
                 };
                 float(self, r)
             }
@@ -11099,6 +11105,15 @@ mod tests {
 
     fn lowers_valu(body: &[u32]) -> Result<(), crate::ShaderError> {
         lower_valu(body).map(|_| ())
+    }
+
+    #[test]
+    fn v_med3_f32_instruction_count() {
+        // Dynamic root constants feed all three sources; the result is
+        // stored to a UAV. Counts include loads, the store and terminators.
+        // The old float min/max network needed 89 instructions.
+        let words = [0xD557_0000, 0x101 | 0x102 << 9 | 0x103 << 18];
+        assert_eq!(lower_valu(&words).unwrap().instructions, 65);
     }
 
     #[test]
