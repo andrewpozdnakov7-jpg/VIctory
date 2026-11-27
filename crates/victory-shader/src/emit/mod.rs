@@ -210,6 +210,11 @@ mod flow_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 mod lower;
+#[cfg(test)]
+#[path = "../../../../tests/fixtures/mesh_triangle.rs"]
+mod mesh_triangle;
+#[cfg(test)]
+use crate as shader_api;
 mod rect;
 pub use rect::{rectangle_gs, right_angle};
 #[cfg(all(test, windows))]
@@ -1127,89 +1132,16 @@ mod tests {
         assert_eq!(c[4..20], ours[..], "our hash differs from the validator's");
     }
 
-    /// Triangle (0, 1, 2), each corner's 9-bit index in its 10-bit field.
-    const TRIANGLE: u32 = 1 << 10 | 2 << 20;
+    use super::mesh_triangle::{TRIANGLE, triangle_mesh};
     /// The edge flags of the three corners (bits 9, 19 and 29).
     const EDGE_FLAGS: u32 = 1 << 9 | 1 << 19 | 1 << 29;
     /// The culling bit.
     const CULL: u32 = 1 << 31;
 
-    /// A one-wave (32-lane) triangle mesh program whose lanes all export
-    /// primitive `prim` and, as vertex `lane`, the position
-    /// (lane & 1 ? 3 : -1, lane & 2 ? 3 : -1, 0.5, 1): triangle (0, 1, 2)
-    /// covers the whole target.
-    fn triangle_mesh(prim: u32, whole_wave: bool) -> Result<HostShader, ShaderError> {
-        let mut words = vec![
-            0xD765_0001u32, // v_mbcnt_lo_u32_b32 v1, -1, 0
-            0x0001_00C1,
-            0x3604_0281, // v_and_b32 v2, 1, v1
-            0x3606_0282, // v_and_b32 v3, 2, v1
-            0x7E04_0D02, // v_cvt_f32_u32 v2, v2
-            0x7E06_0D03, // v_cvt_f32_u32 v3, v3
-            0x1008_04F6, // v_mul_f32 v4, 4.0, v2
-            0x0608_08F3, // v_add_f32 v4, -1.0, v4
-            0x100A_06F4, // v_mul_f32 v5, 2.0, v3
-            0x060A_0AF3, // v_add_f32 v5, -1.0, v5
-            0x7E0C_02F0, // v_mov_b32 v6, 0.5
-            0x7E0E_02F2, // v_mov_b32 v7, 1.0
-            0x7E12_02FF, // v_mov_b32 v9, prim
-            prim,
-        ];
-        if whole_wave {
-            words.push(0xBE80_3DC1); // s_or_saveexec_b32 s0, -1
-        }
-        words.extend([0xF800_0941, 0x0000_0009]); // exp prim v9, off, off, off done
-        if whole_wave {
-            words.push(0xBEFE_0300); // s_mov_b32 exec_lo, s0
-        }
-        words.extend([
-            0xF800_08CF, // exp pos0 v4, v5, v6, v7 done
-            0x0706_0504,
-            0xBF81_0000, // s_endpgm
-        ]);
-        let native = NativeProgram {
-            stage: HwStage::Ms,
-            wave64: false,
-            vgprs: 10,
-            layout: vec![],
-            used: vec![],
-            io: StageIo::Ms(crate::native::MeshIo {
-                outputs: vec![],
-                clip_cntl: 0,
-                threads: 32,
-                max_vertices: 32,
-                max_primitives: 32,
-                topology: 2,
-                lds_bytes: 0,
-            }),
-            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
-        };
-        let position = SigElement {
-            name: "SV_Position".into(),
-            index: 0,
-            kind: 3,
-            comp: 9,
-            interp: 0,
-            row: Some(0),
-            col: 0,
-            cols: 4,
-            usage: 0xF,
-            half: false,
-        };
-        let osg1 = container::signature(&[position], false);
-        let bytes = crate::dxbc::build(&[(FourCC::OSG1, &osg1)]);
-        let c = Container::parse(&bytes)?;
-        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs)?;
-        let st = structure::structure(&p)?;
-        let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
-        let io = io::raise(&p, &native)?;
-        emit(&c, &native, &p, &st, &io, &res)
-    }
-
     #[test]
     #[cfg(windows)]
     fn whole_wave_primitive_export_emits_indices() {
-        let ms = triangle_mesh(TRIANGLE | EDGE_FLAGS, true).unwrap();
+        let ms = triangle_mesh(TRIANGLE | EDGE_FLAGS, 0.5, true).unwrap();
         if let Some(dxil) = dump_dxil(&ms.dxil, "mesh") {
             assert_eq!(
                 dxil.lines()
@@ -1239,7 +1171,7 @@ mod tests {
             TRIANGLE | EDGE_FLAGS,
             TRIANGLE | EDGE_FLAGS | CULL,
         ] {
-            let ms = triangle_mesh(prim, false).unwrap_or_else(|e| panic!("{prim:#x}: {e}"));
+            let ms = triangle_mesh(prim, 0.5, false).unwrap_or_else(|e| panic!("{prim:#x}: {e}"));
             #[cfg(windows)]
             if let Some(v) = validator.as_mut() {
                 v.validate(&mut ms.dxil.clone())
@@ -1288,7 +1220,7 @@ mod tests {
                 (TRIANGLE | EDGE_FLAGS | CULL, true, false),
                 (TRIANGLE | EDGE_FLAGS, false, true),
             ] {
-                let ms = triangle_mesh(prim, whole_wave).unwrap();
+                let ms = triangle_mesh(prim, 0.5, whole_wave).unwrap();
                 let root = host
                     .root_signature_for(&[(&ms, D3D12_SHADER_VISIBILITY_MESH)])
                     .unwrap();

@@ -2,6 +2,10 @@
 //! draws that go through the title entry points.
 
 use super::*;
+use victory_shader as shader_api;
+
+#[path = "../../../../tests/fixtures/mesh_triangle.rs"]
+mod mesh_triangle;
 use crate::object::{S_OK, slot};
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D::{Fxc::D3DCompile, ID3DBlob};
@@ -102,6 +106,54 @@ fn depth_bounds_control_a_title_draw() {
     render_with_depth_bounds(host, fullscreen_vertex_shader(), None);
 }
 
+#[test]
+fn depth_bounds_control_a_mesh_dispatch() {
+    let Some(host) = crate::host::host() else {
+        eprintln!("skipped mesh depth bounds render: no host D3D12 device");
+        return;
+    };
+    if !host.mesh_shaders() {
+        eprintln!("skipped mesh depth bounds render: no mesh shaders");
+        return;
+    }
+    // The WARP mesh path needs a pixel stage even when only depth is written.
+    let words = [
+        0xF800_1890u32, // exp null off, off, off, off done vm
+        0x0000_0000,
+        0xBF81_0000, // s_endpgm
+    ];
+    let ps = mesh_triangle::emit_program(
+        &shader_api::Container {
+            digest: [0; 16],
+            version: (1, 0),
+            parts: Vec::new(),
+        },
+        &shader_api::NativeProgram {
+            stage: shader_api::HwStage::Ps,
+            wave64: false,
+            vgprs: 1,
+            layout: Vec::new(),
+            used: Vec::new(),
+            io: shader_api::native::StageIo::Ps {
+                inputs: Vec::new(),
+                input_addr: 0,
+                db_shader_control: 0,
+                patches: Vec::new(),
+            },
+            code: words.into_iter().flat_map(u32::to_le_bytes).collect(),
+        },
+    )
+    .unwrap();
+    for whole_wave in [false, true] {
+        let mesh = mesh_triangle::triangle_mesh(mesh_triangle::TRIANGLE, 0.25, whole_wave).unwrap();
+        render_with_depth_bounds(
+            host,
+            host_shader("mesh", mesh.stage, &mesh.dxil),
+            Some(host_shader("pixel", ps.stage, &ps.dxil)),
+        );
+    }
+}
+
 fn render_with_depth_bounds(host: &crate::host::Host, shader: Arc<Shader>, ps: Option<Arc<Shader>>) {
     let device = &host.device;
     // SAFETY: plain adapter queries on a live device.
@@ -115,12 +167,16 @@ fn render_with_depth_bounds(host: &crate::host::Host, shader: Arc<Shader>, ps: O
     let mesh = shader.stage == "mesh";
     eprintln!("{} depth bounds on {}: {supported}", shader.stage, name.trim_end_matches('\0'));
 
+    #[repr(C, align(8))]
+    struct Rasterizer(u32, D3D12_RASTERIZER_DESC);
+
     #[repr(C)]
     struct Stream {
         shader_kind: u64,
         shader: Bytecode,
         ps_kind: u64,
         ps: Bytecode,
+        rasterizer: Rasterizer,
         depth: Depth1,
         topology: [u32; 2],
         dsv: [u32; 2],
@@ -132,6 +188,16 @@ fn render_with_depth_bounds(host: &crate::host::Host, shader: Arc<Shader>, ps: O
         ps: ps.as_ref().map_or(
             Bytecode { code: std::ptr::null(), size: 0 },
             |ps| Bytecode { code: ps.container.as_ptr(), size: ps.container.len() },
+        ),
+        // Keep both fixtures independent of triangle winding.
+        rasterizer: Rasterizer(
+            10,
+            D3D12_RASTERIZER_DESC {
+                FillMode: D3D12_FILL_MODE_SOLID,
+                CullMode: D3D12_CULL_MODE_NONE,
+                DepthClipEnable: true.into(),
+                ..Default::default()
+            },
         ),
         depth: Depth1(21, D3D12_DEPTH_STENCIL_DESC1 {
             DepthEnable: true.into(),
