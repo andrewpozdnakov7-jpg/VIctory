@@ -957,6 +957,8 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
         let m = marks();
         marked.iter().filter_map(|&n| page_of(&m, n)).collect()
     };
+    #[cfg(feature = "diagnostics")]
+    let mut compared = 0;
     for (copy, page) in pages {
         if withheld
             .iter()
@@ -967,12 +969,14 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
         let written = copy.copy_back_marked(page);
         #[cfg(feature = "diagnostics")]
         {
-            crate::copystat::add(crate::copystat::C::MarkedPages, 1);
+            compared += 1;
             crate::copystat::add(crate::copystat::C::MarkedBytes, written as u64);
         }
         #[cfg(not(feature = "diagnostics"))]
         let _ = written;
     }
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::marked_page_batch(compared);
 }
 
 struct Entry {

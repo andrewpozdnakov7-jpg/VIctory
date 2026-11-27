@@ -112,6 +112,21 @@ pub(crate) fn add(c: C, n: u64) {
     COUNT[c as usize].fetch_add(n, Relaxed);
 }
 
+/// Number of nonempty copy-back calls by the number of marked pages compared.
+static MARKED_BATCHES: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+pub(crate) fn marked_page_batch(pages: u64) {
+    let bucket = match pages {
+        0 => return,
+        1 => 0,
+        2..=15 => 1,
+        16..=255 => 2,
+        _ => 3,
+    };
+    add(C::MarkedPages, pages);
+    MARKED_BATCHES[bucket].fetch_add(1, Relaxed);
+}
+
 /// How copies run: 0 guarded (as always), 1 plain, 2 not at all.
 pub(crate) fn mode() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
@@ -305,6 +320,14 @@ pub(crate) fn log(frames: f64) {
             (hard - HARD.swap(hard, Relaxed).min(hard)) as f64 / frames
         },
     );
+    let [one, small, medium, large] =
+        std::array::from_fn(|i| MARKED_BATCHES[i].swap(0, Relaxed));
+    if [one, small, medium, large].into_iter().any(|n| n != 0) {
+        tracing::info!(
+            "marked-page batches since last report (calls by compared pages): \
+             1={one}, 2-15={small}, 16-255={medium}, 256+={large}"
+        );
+    }
     let held: Vec<String> = crate::watch::held_times()
         .iter()
         .map(|(line, total, longest)| format!("watch.rs:{line} {:.1} ms (longest {longest:.1})", total / frames))
