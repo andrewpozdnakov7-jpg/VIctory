@@ -44,8 +44,10 @@ fn main() {
         return;
     }
     println!("cargo:rustc-cfg=victory_agility");
-    println!("cargo:rustc-link-arg=/EXPORT:D3D12SDKVersion");
-    println!("cargo:rustc-link-arg=/EXPORT:D3D12SDKPath");
+    // The victory binary target defines these exports.
+    // Integration tests link separately.
+    println!("cargo:rustc-link-arg-bin=victory=/EXPORT:D3D12SDKVersion,DATA");
+    println!("cargo:rustc-link-arg-bin=victory=/EXPORT:D3D12SDKPath,DATA");
     println!(
         "cargo:warning=opting the host D3D12 runtime into Agility SDK {SDK_VERSION} ({})",
         runtime.display()
