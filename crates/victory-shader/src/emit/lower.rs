@@ -7278,11 +7278,10 @@ impl<'a> Lower<'a> {
         };
         let op = if k == 2 { v.dst } else { v.src.get(k).copied() };
         let op = op.ok_or("a missing operand")?;
-        if matches!(op, Operand::Const(_) | Operand::Literal(_)) {
-            // shortcut: no constant operand seen; its high half is not known.
-            return Err("a constant operand of v_pk_fmac_f16");
+        if matches!(op, Operand::Literal(_)) {
+            return Err("a literal operand of v_pk_fmac_f16");
         }
-        let x = self.operand(inst, &op)?;
+        let x = self.f16_operand(inst, &op)?;
         let c = self.cur;
         let x = if high {
             let k16 = self.s.m.i32(16);
