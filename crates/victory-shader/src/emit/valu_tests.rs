@@ -2337,3 +2337,177 @@ fn v_mul_legacy_f32_treats_denormals_as_zero() {
         );
     });
 }
+
+#[test]
+fn vector_masked_sad_in_pixel_shader() {
+    use super::container::{SigElement, signature};
+    use super::host::Draw;
+    use crate::native::{Usage, VsInput};
+    use crate::{Container, FourCC};
+
+    let Ok(host) = Host::new(true) else {
+        eprintln!("no WARP SM 6.6 device; skipped");
+        return;
+    };
+    let path = validator::Validator::default_path();
+    let mut validator = validator::Validator::load(path.as_deref()).ok();
+    let signature_element = |name: &str, kind, interp| SigElement {
+        name: name.into(),
+        index: 0,
+        kind,
+        comp: 9,
+        interp,
+        row: Some(0),
+        col: 0,
+        cols: 4,
+        usage: 0xF,
+        half: false,
+    };
+    let emit_stage = |native: &NativeProgram, input, output| {
+        let isg = signature(&[input], true);
+        let osg = signature(&[output], false);
+        let bytes = crate::dxbc::build(&[(FourCC::ISG1, &isg), (FourCC::OSG1, &osg)]);
+        let container = Container::parse(&bytes).unwrap();
+        let program = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+        let structured = structure::structure(&program).unwrap();
+        let resources =
+            resource::track(&program, &native.layout, native.stage, Some(&structured)).unwrap();
+        let io = io::raise(&program, native).unwrap();
+        super::emit(&container, native, &program, &structured, &io, &resources).unwrap()
+    };
+    let position = || signature_element("SV_Position", 3, 4);
+    let vs = emit_stage(
+        &NativeProgram {
+            stage: HwStage::Vs,
+            wave64: false,
+            vgprs: 8,
+            layout: Vec::new(),
+            used: Vec::new(),
+            io: StageIo::Vs {
+                inputs: vec![VsInput {
+                    usage: Usage::Generic,
+                    row: 0,
+                    mask: 0xF,
+                    vgpr: 4,
+                }],
+                outputs: Vec::new(),
+            },
+            code: [0xF800_08CF, 0x0706_0504, S_ENDPGM]
+                .into_iter()
+                .flat_map(u32::to_le_bytes)
+                .collect(),
+        },
+        signature_element("POSITION", 0, 0),
+        position(),
+    );
+    if let Some(v) = &mut validator {
+        v.validate(&mut vs.dxil.clone()).expect("vertex DXIL");
+    }
+
+    let mut checked = 0;
+    let mut msad_flags = 0;
+    for mask in 0..16 {
+        let reference_bytes = [7, 128, 2, 254];
+        let reference = u32::from_le_bytes(std::array::from_fn(|byte| {
+            if mask & (1 << byte) != 0 {
+                reference_bytes[byte]
+            } else {
+                0
+            }
+        }));
+        for accumulator in [0, u32::MAX - 127] {
+            let mut words = vec![
+                vop1(0x007, 0, vgpr(0)), // v_cvt_u32_f32 v0, SV_Position.x
+                0x3802_00FF,             // v_or_b32 v1, source prefix, v0
+                0xFF00_0180,
+                vop1(0x001, 2, 0xFF), // v_mov_b32 v2, reference
+                reference,
+                vop1(0x001, 3, 0xFF), // v_mov_b32 v3, accumulator
+                accumulator,
+            ];
+            words.extend(vop3(0x171, 4, vgpr(1), vgpr(2), vgpr(3)));
+            // Export each 16-bit half as an exact f32.
+            words.extend([
+                0x360A_08FF, // v_and_b32 v5, 0xffff, v4
+                0xFFFF,
+                0x2C0C_0890, // v_lshrrev_b32 v6, 16, v4
+                vop1(0x006, 5, vgpr(5)),
+                vop1(0x006, 6, vgpr(6)),
+                0xF800_180F, // exp mrt0, v5, v6, v5, v6 done vm
+                0x0605_0605,
+                S_ENDPGM,
+            ]);
+            let ps = emit_stage(
+                &NativeProgram {
+                    stage: HwStage::Ps,
+                    wave64: false,
+                    vgprs: 8,
+                    layout: Vec::new(),
+                    used: Vec::new(),
+                    io: StageIo::Ps {
+                        inputs: Vec::new(),
+                        input_addr: 1 << 8,
+                        db_shader_control: 0,
+                        patches: Vec::new(),
+                    },
+                    code: words.into_iter().flat_map(u32::to_le_bytes).collect(),
+                },
+                position(),
+                signature_element("SV_Target", 16, 0),
+            );
+            if let Some(v) = &mut validator {
+                v.validate(&mut ps.dxil.clone()).expect("pixel DXIL");
+            }
+            let container = Container::parse(&ps.dxil).unwrap();
+            let flags = container.part(FourCC::SFI0).unwrap().data;
+            // An all-zero reference can be folded to the accumulator.
+            if reference != 0 {
+                msad_flags +=
+                    usize::from(u64::from_le_bytes(flags.try_into().unwrap()) & 0x40 != 0);
+            }
+            let (root, pipeline) = host.pipeline(&vs, &ps).expect("pixel MSAD pipeline");
+            let texels = host
+                .draw(
+                    &root,
+                    &pipeline,
+                    &Draw {
+                        roots: Vec::new(),
+                        textures: &[],
+                        samplers: &[],
+                        vertices: &[
+                            -1.0, -1.0, 0.5, 1.0, -1.0, 3.0, 0.5, 1.0, 3.0, -1.0, 0.5, 1.0,
+                        ],
+                        stride: 16,
+                        size: (16, 1),
+                        mesh_groups: 0,
+                    },
+                )
+                .expect("pixel MSAD draw");
+            assert_eq!(texels.len(), 16);
+            for (x, texel) in texels.into_iter().enumerate() {
+                let source = 0xFF00_0180u32 | x as u32;
+                let sad: u32 = source
+                    .to_le_bytes()
+                    .into_iter()
+                    .zip(reference.to_le_bytes())
+                    .filter(|&(_, byte)| byte != 0)
+                    .map(|(src, byte)| u32::from(src.abs_diff(byte)))
+                    .sum();
+                let result = accumulator.wrapping_add(sad);
+                let low = (result & 0xFFFF) as f32;
+                let high = (result >> 16) as f32;
+                assert_eq!(
+                    texel.map(f32::to_bits),
+                    [low, high, low, high].map(f32::to_bits),
+                    "pixel x={x}, mask {mask:#06b}, accumulator {accumulator:#010x}",
+                );
+                checked += 1;
+            }
+        }
+    }
+    eprintln!(
+        "pixel MSAD: {checked} comparisons, {msad_flags} SFI0 MSAD variants, DXIL validation: {}",
+        validator.is_some(),
+    );
+    assert_eq!(msad_flags, 30, "SFI0 MSAD must be set for nonzero masks");
+}
