@@ -484,11 +484,12 @@ impl Shadow {
     /// submission: title memory where the title has not written the page
     /// since the copy took it, else what the page held when the title first
     /// wrote it ([`crate::watch::Tracked::saved`], if the page was armed).
-    /// Returns the bytes written.
+    /// Returns the bytes written. The caller reuses the scratch buffer
+    /// across the marked pages it processes.
     // shortcut: a page the title wrote that was not armed (a write through
     // the heap's views no list declared) keeps the title's bytes, losing
     // the shaders' there (counted).
-    pub(crate) fn copy_back_marked(&self, page: usize) -> usize {
+    pub(crate) fn copy_back_marked(&self, page: usize, scratch: &mut Vec<u8>) -> usize {
         let Some(t) = &self.tracked else {
             return 0;
         };
@@ -508,8 +509,11 @@ impl Shadow {
         let n = to - from;
         // SAFETY: inside the mapping; only the submitting thread writes it.
         let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(from - start), n) };
-        let mut title = vec![0u8; n];
-        if !crate::host::read_into(from as *const u8, &mut title) {
+        if scratch.len() < n {
+            scratch.resize(n, 0);
+        }
+        let title = &mut scratch[..n];
+        if !crate::host::read_into(from as *const u8, title) {
             return 0;
         }
         let written = match &saved {
@@ -518,7 +522,7 @@ impl Shadow {
             None => (*host != title[..]).then_some(host.as_ptr()),
             Some(before) => {
                 let before = &before[from - page..to - page];
-                merge_writeback(&mut title, host, before).then_some(title.as_ptr())
+                merge_writeback(title, host, before).then_some(title.as_ptr())
             }
         };
         if let Some(bytes) = written {
@@ -901,11 +905,15 @@ const PAGES_PER_THREAD: usize = 8;
 /// the same physical memory elsewhere ([`crate::watch::alias_roots`]): the
 /// first one's write saves the other's bytes for the second ([`crate::
 /// watch::writing`]), which two threads at once would race.
-fn for_each_by_page(pages: Vec<(Arc<Shadow>, usize)>, f: impl Fn(&Arc<Shadow>, usize) + Sync) {
+fn for_each_by_page(
+    pages: Vec<(Arc<Shadow>, usize)>,
+    f: impl Fn(&Arc<Shadow>, usize, &mut Vec<u8>) + Sync,
+) {
     let threads = (pages.len() / PAGES_PER_THREAD).min(PAGE_THREADS);
     if threads < 2 {
+        let mut scratch = Vec::new();
         for (copy, page) in &pages {
-            f(copy, *page);
+            f(copy, *page, &mut scratch);
         }
         return;
     }
@@ -917,9 +925,10 @@ fn for_each_by_page(pages: Vec<(Arc<Shadow>, usize)>, f: impl Fn(&Arc<Shadow>, u
     let groups: Vec<&[(usize, Arc<Shadow>, usize)]> = pages.chunk_by(|a, b| a.0 == b.0).collect();
     let next = std::sync::atomic::AtomicUsize::new(0);
     let work = || {
+        let mut scratch = Vec::new();
         while let Some(group) = groups.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed)) {
             for (_, copy, page) in *group {
-                f(copy, *page);
+                f(copy, *page, &mut scratch);
             }
         }
     };
@@ -989,14 +998,14 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
         let m = marks();
         marked.iter().filter_map(|&n| page_of(&m, n)).collect()
     };
-    for_each_by_page(pages, |copy, page| {
+    for_each_by_page(pages, |copy, page, scratch| {
         if withheld
             .iter()
             .any(|(c, a, n)| Arc::ptr_eq(c, copy) && *a < page + PAGE && page < a + n)
         {
             return;
         }
-        let written = copy.copy_back_marked(page);
+        let written = copy.copy_back_marked(page, scratch);
         #[cfg(feature = "diagnostics")]
         {
             crate::copystat::add(crate::copystat::C::MarkedPages, 1);
@@ -1672,8 +1681,9 @@ pub(crate) mod tests {
         copy.write_host((p + PAGE + 10) as u64, &[0xbb]);
         write(20, 0x66);
         write(PAGE + 20, 0x77);
-        copy.copy_back_marked(p);
-        copy.copy_back_marked(p + PAGE);
+        let mut scratch = Vec::new();
+        copy.copy_back_marked(p, &mut scratch);
+        copy.copy_back_marked(p + PAGE, &mut scratch);
         // SAFETY: bytes of our pool.
         let read = |at: usize| unsafe { ((p + at) as *const u8).read_volatile() };
         assert_eq!(
@@ -1756,7 +1766,7 @@ pub(crate) mod tests {
             .flat_map(|k| [(high.clone(), hi + k * PAGE), (low.clone(), lo + k * PAGE)])
             .collect();
         let calls = Mutex::new(Vec::new());
-        for_each_by_page(pages, |_, page| {
+        for_each_by_page(pages, |_, page, _| {
             calls.lock().unwrap().push((std::thread::current().id(), page));
         });
         let calls = calls.into_inner().unwrap();
