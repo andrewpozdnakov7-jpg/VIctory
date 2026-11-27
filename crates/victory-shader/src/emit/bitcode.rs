@@ -717,6 +717,32 @@ impl Module {
         plan
     }
 
+    /// Live calls and integer binops, one per line, so tests can inspect
+    /// what lowering emitted without decoding the bitcode.
+    #[cfg(test)]
+    pub(crate) fn ops_text(&self) -> String {
+        use std::fmt::Write;
+        let plan = self.plan();
+        let mut out = String::new();
+        let written = plan.layout.iter().flat_map(|&b| &self.blocks[b].body);
+        for &i in written.filter(|&&i| plan.live[i as usize]) {
+            let inst = &self.insts[i as usize];
+            match &inst.op {
+                Op::Call(f, _) => {
+                    let _ = writeln!(out, "call {}", self.funcs[*f as usize].name);
+                }
+                Op::Bin(op, a, b) => {
+                    if let Some(k) = self.int_value(*b).or_else(|| self.int_value(*a)) {
+                        let name = format!("{op:?}").to_ascii_lowercase();
+                        let _ = writeln!(out, "{name} {k:#x}");
+                    }
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
     pub fn write(&self) -> Vec<u8> {
         let plan = self.plan();
         let (live, layout) = (&plan.live, &plan.layout);

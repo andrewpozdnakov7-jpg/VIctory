@@ -21,6 +21,8 @@ use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 mod bvh;
+#[cfg(test)]
+mod vertex_input_tests;
 
 type Why = &'static str;
 
@@ -72,6 +74,9 @@ pub(crate) struct Lowered {
     /// Whether the module contains the 32-lane half mask (`!31`).
     #[cfg(test)]
     pub has_half_wave_mask: bool,
+    /// Live calls and integer binops, for tests that inspect lowering.
+    #[cfg(test)]
+    pub ops: String,
 }
 
 pub(crate) struct Parts<'a> {
@@ -1412,6 +1417,8 @@ impl<'a> Lower<'a> {
             uses_lane_index: self.s.m.has_function("dx.op.waveGetLaneIndex"),
             #[cfg(test)]
             has_half_wave_mask: self.s.m.has_i32_const(!31),
+            #[cfg(test)]
+            ops: self.s.m.ops_text(),
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -1578,12 +1585,27 @@ impl<'a> Lower<'a> {
     }
 
     fn load_input(&mut self, id: usize, col: u8) -> Val {
-        if self.s.inputs[id].half {
-            // shortcut: 16-bit vertex inputs (the fetch routine's) are not
-            // unpacked; pixel inputs are (`interp`).
-            return Val::Missing("a 16-bit input");
+        let v = self.load_any_input(id, col);
+        if !self.s.inputs[id].half {
+            return v;
         }
-        self.load_any_input(id, col)
+        // 16-bit vertex inputs (the fetch routine's) arrive as 32-bit host
+        // values; the console keeps them in the low half of the VGPR.
+        // shortcut: packed fetch (two values per dword) is not unpacked;
+        // add it when VsInput carries pack flags.
+        let Val::I32(x) = v else {
+            return v;
+        };
+        let c = self.s.entry;
+        let bits = if self.s.inputs[id].comp == 9 {
+            let f = self.s.m.cast(c, Cast::Bitcast, x, self.s.t.f32);
+            self.s
+                .op(c, "legacyF32ToF16", Attr::ReadNone, self.s.t.i32, 130, &[f])
+        } else {
+            let m = self.s.m.i32(0xFFFF);
+            self.s.m.bin(c, Bin::And, x, m)
+        };
+        Val::I32(bits)
     }
 
     /// An input element's channel as declared (16-bit ones as 32-bit floats).
