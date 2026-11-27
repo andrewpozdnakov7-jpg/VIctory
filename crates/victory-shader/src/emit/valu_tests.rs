@@ -1009,6 +1009,131 @@ fn v_min3_max3_med3_integer_forms_match_rdna2() {
     }
 }
 
+fn ldexp_f64_cases(
+    setup: &[u32],
+    source: u16,
+    power: u16,
+    cases: &[(u64, i32, u64)],
+) {
+    let inputs = cases.iter()
+        .map(|&(bits, exp, _)| [bits as u32, (bits >> 32) as u32, exp as u32, 0])
+        .collect::<Vec<_>>();
+    for (word, shift) in [(6, 0), (7, 32)] {
+        let mut body = setup.to_vec();
+        body.extend(vop3(0x168, 6, source, power, 0));
+        body.push(vop1(0x001, 0, vgpr(word)));
+        let shader = build_valu_cs(&body);
+        let container = crate::Container::parse(&shader.dxil).unwrap();
+        let features = container.part(crate::FourCC::SFI0).unwrap();
+        let bits = u64::from_le_bytes(features.data.try_into().unwrap());
+        assert_eq!(bits & 0x8001, 0, "SFI0 doubles and int64 feature bits");
+        run_cases(&shader, &inputs, |backend, index, _, got| {
+            let (input, exp, expected) = cases[index];
+            assert_eq!(got, (expected >> shift) as u32, "{backend}: {input:#018x} with exponent {exp}, v{word}");
+        });
+    }
+}
+
+#[test]
+fn ldexp_f64_scales_normal_and_subnormal_values() {
+    const SIGN: u64 = 1 << 63;
+    const NORMAL: u64 = 1 << 52;
+    let cases = [
+        (0, i32::MAX, 0),
+        (SIGN, i32::MIN, SIGN),
+        (1.25f64.to_bits(), 3, 10.0f64.to_bits()),
+        ((-6.0f64).to_bits(), -3, (-0.75f64).to_bits()),
+        (1, 1074, 1.0f64.to_bits()),
+        (SIGN | 1, 1074, (-1.0f64).to_bits()),
+        (1.0f64.to_bits(), -1074, 1),
+        (1.0f64.to_bits(), -1075, 0),
+        (1.0f64.to_bits() + 1, -1075, 1),
+        (3, -1, 2),
+        (5, -1, 2),
+        (SIGN | 5, -1, SIGN | 2),
+        (NORMAL - 1, 1, NORMAL * 2 - 2),
+        (NORMAL * 2 - 1, -1, NORMAL),
+        (NORMAL | 0x1_ffff_ffff, -1, 0x0008_0001_0000_0000),
+        (f64::MAX.to_bits(), -1, f64::MAX.to_bits() - NORMAL),
+        (f64::MAX.to_bits(), 1, f64::INFINITY.to_bits()),
+        (1, i32::MAX, f64::INFINITY.to_bits()),
+        (SIGN | 1, i32::MIN, SIGN),
+        (f64::INFINITY.to_bits(), i32::MIN, f64::INFINITY.to_bits()),
+        (f64::NEG_INFINITY.to_bits(), i32::MAX, f64::NEG_INFINITY.to_bits()),
+        (0xfff8_0000_0000_0001, 22, 0xfff8_0000_0000_0001),
+    ];
+    ldexp_f64_cases(&[], vgpr(1), vgpr(3), &cases);
+    ldexp_f64_cases(&[], sgpr(0), sgpr(2), &cases);
+}
+
+#[test]
+fn ldexp_f64_uses_the_round_mode_for_underflow_and_overflow() {
+    const SIGN: u64 = 1 << 63;
+    for (mode, up, down, pos_over, neg_over) in [
+        (0, 0, 0, f64::INFINITY, f64::NEG_INFINITY),
+        (1, 1, 0, f64::INFINITY, -f64::MAX),
+        (2, 0, 1, f64::MAX, f64::NEG_INFINITY),
+        (3, 0, 0, f64::MAX, -f64::MAX),
+    ] {
+        let cases = [
+            (1.0f64.to_bits(), -1075, up),
+            ((-1.0f64).to_bits(), -1075, SIGN | down),
+            (1.0f64.to_bits(), i32::MIN, up),
+            ((-1.0f64).to_bits(), i32::MIN, SIGN | down),
+            (f64::MAX.to_bits(), 1, pos_over.to_bits()),
+            ((-f64::MAX).to_bits(), 1, neg_over.to_bits()),
+        ];
+        ldexp_f64_cases(&[0xbfa4_0000 | mode << 2], vgpr(1), vgpr(3), &cases);
+    }
+}
+
+#[test]
+fn ldexp_f64_uses_the_denormal_mode_for_both_operands_and_results() {
+    const SIGN: u64 = 1 << 63;
+    const NORMAL: u64 = 1 << 52;
+    for mode in 0..4 {
+        let denorm_in = if mode & 1 != 0 { NORMAL } else { 0 };
+        let denorm_out = if mode & 2 != 0 { NORMAL / 2 } else { 0 };
+        let cases = [
+            (1, 52, denorm_in),
+            (SIGN | 1, 52, SIGN | denorm_in),
+            (NORMAL, -1, denorm_out),
+            (SIGN | NORMAL, -1, SIGN | denorm_out),
+        ];
+        let setup = if mode & 1 == 0 {
+            vec![0xbfa5_0000 | mode << 2] // s_denorm_mode
+        } else {
+            vec![0xba80_0981, mode] // s_setreg_imm32_b32 hwreg(MODE, 6, 2)
+        };
+        ldexp_f64_cases(&setup, vgpr(1), vgpr(3), &cases);
+    }
+}
+
+#[test]
+fn ldexp_f64_keeps_the_other_denormal_bit_after_a_partial_write() {
+    const SIGN: u64 = 1 << 63;
+    const NORMAL: u64 = 1 << 52;
+    let flush_outputs = [0xBA80_01C1, 0]; // hwreg(MODE, 7, 1)
+    let flush_inputs = [
+        0xBE8D_3DC1, // s_or_saveexec_b32 s13, -1
+        0xBA80_0181, // s_setreg_imm32_b32 hwreg(MODE, 6, 1), 0
+        0,
+        s_mov_b32(ir::EXEC, 13), // restore exec_lo
+    ];
+    for (setup, input, output) in [
+        (&flush_outputs[..], NORMAL, 0),
+        (&flush_inputs[..], 0, NORMAL / 2),
+    ] {
+        let cases = [
+            (1, 52, input),
+            (SIGN | 1, 52, SIGN | input),
+            (NORMAL, -1, output),
+            (SIGN | NORMAL, -1, SIGN | output),
+        ];
+        ldexp_f64_cases(setup, vgpr(1), vgpr(3), &cases);
+    }
+}
+
 #[test]
 fn v_med3_f16_matches_rdna2_with_nan() {
     // v_med3_f16 v0, v1, v2, v3 (VOP3 opcode 0x357)

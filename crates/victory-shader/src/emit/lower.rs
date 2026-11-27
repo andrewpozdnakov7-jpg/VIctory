@@ -21,6 +21,7 @@ use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 mod bvh;
+mod ldexp;
 mod sqrt;
 
 type Why = &'static str;
@@ -304,6 +305,7 @@ struct Lower<'a> {
 struct FpMode16 {
     round: Option<u8>,
     denorm_input: Option<bool>,
+    denorm_output: Option<bool>,
 }
 
 impl FpMode16 {
@@ -312,6 +314,7 @@ impl FpMode16 {
     const INITIAL: Self = Self {
         round: Some(0),
         denorm_input: Some(true),
+        denorm_output: Some(true),
     };
 
     fn after(self, inst: &Inst) -> Self {
@@ -322,6 +325,7 @@ impl FpMode16 {
             },
             ("s_denorm_mode", Fields::Sopp { imm }) => Self {
                 denorm_input: Some(imm & 4 != 0),
+                denorm_output: Some(imm & 8 != 0),
                 ..self
             },
             (
@@ -343,14 +347,17 @@ impl FpMode16 {
                 } else {
                     None
                 };
-                let denorm_input = if (offset..end).contains(&6) {
-                    literal.map(|bits| bits >> (6 - offset) & 1 != 0)
-                } else {
-                    self.denorm_input
+                let denorm_bit = |bit, old| {
+                    if (offset..end).contains(&bit) {
+                        literal.map(|bits| bits >> (bit - offset) & 1 != 0)
+                    } else {
+                        old
+                    }
                 };
                 Self {
                     round,
-                    denorm_input,
+                    denorm_input: denorm_bit(6, self.denorm_input),
+                    denorm_output: denorm_bit(7, self.denorm_output),
                 }
             }
             _ => self,
@@ -363,12 +370,15 @@ impl FpMode16 {
             denorm_input: self
                 .denorm_input
                 .filter(|_| self.denorm_input == other.denorm_input),
+            denorm_output: self
+                .denorm_output
+                .filter(|_| self.denorm_output == other.denorm_output),
         }
     }
 }
 
-/// Track MODE bits 3:2 and the input-denormal bit 6 independently. A field
-/// is unknown after a dynamic write or a join between paths that disagree.
+/// Track MODE rounding bits 3:2 and each denormal bit (6 and 7) separately.
+/// A field is unknown after a dynamic write or a join that disagrees on it.
 fn fp_modes16(p: &crate::ir::Program) -> Vec<FpMode16> {
     let mut entry = vec![None; p.blocks.len()];
     entry[0] = Some(FpMode16::INITIAL);
@@ -6598,6 +6608,7 @@ impl<'a> Lower<'a> {
                 let r = self.s.m.bin(c, Bin::Or, halves[0], hi);
                 int(self, r)
             }
+            "v_ldexp_f64" => self.ldexp_f64(inst, guard),
             "v_cndmask_b32" => {
                 let cond = match v.src.get(2) {
                     Some(&Operand::Scalar { code, .. }) => {
