@@ -28,9 +28,9 @@ static HITS: AtomicU64 = AtomicU64::new(0);
 static MISSES: AtomicU64 = AtomicU64::new(0);
 
 /// Keeps translated shaders in a folder of `dir` from now on: the folder
-/// of this translator, `None` if it cannot be opened.
+/// of this translator's default settings, `None` if it cannot be opened.
 pub fn use_shader_cache(dir: PathBuf) -> Option<PathBuf> {
-    let dir = dir.join(&blake3::Hash::from(*build()).to_hex()[..16]);
+    let dir = dir.join(&blake3::Hash::from(*build(false)).to_hex()[..16]);
     match Cache::open(&dir) {
         Ok(cache) => {
             tracing::info!(dir = %dir.display(), "shader cache");
@@ -52,11 +52,10 @@ pub fn counts() -> (u64, u64) {
 /// What a translation depends on besides its container: the translator
 /// (`victory_shader::SOURCE_HASH`: its sources, manifest, the lock file and
 /// the compiler), the entry's encoding (this file's text) and the
-/// translation settings (the loop limit, which a diagnostics build can
-/// change at run time, and [`OPTIONS`]).
-fn build() -> &'static [u8; 32] {
-    static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
-    BUILD.get_or_init(|| {
+/// translation settings (the loop limit and the cached translation options).
+fn build(warp_permute: bool) -> &'static [u8; 32] {
+    static BUILDS: [OnceLock<[u8; 32]>; 2] = [const { OnceLock::new() }; 2];
+    BUILDS[usize::from(warp_permute)].get_or_init(|| {
         let limit = victory_shader::emit::loop_limit();
         if limit != victory_shader::emit::DEFAULT_LOOP_LIMIT {
             tracing::warn!(
@@ -64,25 +63,37 @@ fn build() -> &'static [u8; 32] {
                 "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"
             );
         }
-        key(victory_shader::SOURCE_HASH, ENCODING, limit, OPTIONS)
+        key(
+            victory_shader::SOURCE_HASH,
+            ENCODING,
+            limit,
+            cached_options(warp_permute),
+        )
     })
 }
 
 /// This file, whose `encode` and `decode` define the entries.
 const ENCODING: &[u8] = include_bytes!("shader_cache.rs");
 
-/// Options used for every cached translation. `view_marks` changes the
-/// emitted DXIL and root-signature bindings, so it is part of [`build`].
-const OPTIONS: Options = Options { view_marks: true };
+/// Shared by the cache key and the translation that produces its entry.
+const fn cached_options(warp_permute: bool) -> Options {
+    Options {
+        view_marks: true,
+        warp_permute,
+    }
+}
 
 fn key(translator: &str, encoding: &[u8], limit: u32, options: Options) -> [u8; 32] {
-    // Destructure without `..`: a future option must be added to the key too.
-    let Options { view_marks } = options;
+    // Destructure without `..` so new translation options must be keyed too.
+    let Options {
+        view_marks,
+        warp_permute,
+    } = options;
     let mut h = blake3::Hasher::new();
     h.update(translator.as_bytes());
     h.update(blake3::hash(encoding).as_bytes());
     h.update(&limit.to_le_bytes());
-    h.update(&[u8::from(view_marks)]);
+    h.update(&[u8::from(view_marks), u8::from(warp_permute)]);
     *h.finalize().as_bytes()
 }
 
@@ -90,11 +101,16 @@ fn key(translator: &str, encoding: &[u8], limit: u32, options: Options) -> [u8; 
 /// there is one, and whether it came from there.
 pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
     // Writes through views mark their pages: copy-backs compare only those
-    // (`crate::shadow::copy_back_marks`). The same options are in [`build`].
+    // (`crate::shadow::copy_back_marks`).
+    #[cfg(windows)]
+    let warp_permute = crate::host::uses_software_adapter();
+    #[cfg(not(windows))]
+    let warp_permute = false;
+    let options = cached_options(warp_permute);
     let translate =
-        |c: &[u8]| victory_shader::emit::translate_with(c, OPTIONS).map_err(|e| e.to_string());
+        |c: &[u8]| victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());
     match CACHE.get() {
-        Some(cache) => cached(cache, build(), container, translate),
+        Some(cache) => cached(cache, build(warp_permute), container, translate),
         None => (translate(container), false),
     }
 }
@@ -483,33 +499,48 @@ mod tests {
     }
 
     /// The key's parts: a change to any of them (the translator's sources,
-    /// this file's encoding, the loop limit, the translation options) makes
-    /// another key, so no entry written before it is read.
+    /// this file's encoding, the loop limit, or the translation options) makes
+    /// another key, so entries made with older settings are missed.
     #[test]
     fn the_key_covers_translator_encoding_and_settings() {
-        let k = key("0123456789abcdef", b"encoding", 1 << 20, OPTIONS);
-        assert_eq!(k, key("0123456789abcdef", b"encoding", 1 << 20, OPTIONS));
-        assert_ne!(k, key("0123456789abcdee", b"encoding", 1 << 20, OPTIONS));
-        assert_ne!(k, key("0123456789abcdef", b"encoding.", 1 << 20, OPTIONS));
-        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 19, OPTIONS));
+        let options = cached_options(false);
+        let k = key("0123456789abcdef", b"encoding", 1 << 20, options);
+        assert_eq!(k, key("0123456789abcdef", b"encoding", 1 << 20, options));
+        assert_ne!(k, key("0123456789abcdee", b"encoding", 1 << 20, options));
+        assert_ne!(k, key("0123456789abcdef", b"encoding.", 1 << 20, options));
+        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 19, options));
         assert_ne!(
             k,
             key(
                 "0123456789abcdef",
                 b"encoding",
                 1 << 20,
-                Options { view_marks: false }
+                cached_options(true)
             )
         );
-        assert_eq!(
-            *build(),
+        assert_ne!(
+            k,
             key(
-                victory_shader::SOURCE_HASH,
-                ENCODING,
-                victory_shader::emit::loop_limit(),
-                OPTIONS
+                "0123456789abcdef",
+                b"encoding",
+                1 << 20,
+                Options {
+                    view_marks: false,
+                    ..options
+                },
             )
         );
+        for warp in [false, true] {
+            assert_eq!(
+                *build(warp),
+                key(
+                    victory_shader::SOURCE_HASH,
+                    ENCODING,
+                    victory_shader::emit::loop_limit(),
+                    cached_options(warp),
+                )
+            );
+        }
         // The encoding part is this file as built.
         assert!(
             std::str::from_utf8(ENCODING)
