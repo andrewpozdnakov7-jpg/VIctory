@@ -376,7 +376,8 @@ impl RtvRecord {
             };
             crate::resource::view_format(self.resource).unwrap_or_else(host_format)
         };
-        windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(crate::resource::pc_format(raw) as i32)
+        let pc = crate::resource::pc_format(raw);
+        windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(crate::resource::target_format(pc) as i32)
     }
 
     /// The description words as a host type, the format as the host has it.
@@ -866,6 +867,21 @@ pub(crate) mod tests {
 
     use super::*;
     use crate::object::{S_OK, slot};
+
+    #[cfg(windows)]
+    #[test]
+    fn bound_rtv_key_uses_the_effective_packed_target_format() {
+        for guest_format in [28, 86, 115] {
+            let record = RtvRecord {
+                tag: RTV_TAG,
+                described: 1,
+                resource: std::ptr::null(),
+                desc: [guest_format, 4, 0, 0, 0, 0],
+            };
+            let bound_format = record.desc().unwrap().Format;
+            assert_eq!(record.format(), bound_format, "guest format {guest_format}");
+        }
+    }
 
     /// What newer titles pass; tests use it throughout, so that reading the
     /// placement stays inside the value.
