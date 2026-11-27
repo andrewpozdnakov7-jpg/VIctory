@@ -324,26 +324,56 @@ mod tests {
             }
         }
     }
-    /// A pixel shader writing `SV_PrimitiveID + 1` to target 0's red.
+    /// Translates a console pixel program that writes the flat primitive ID plus one.
     fn primitive_id_ps() -> Vec<u8> {
-        use super::super::bitcode::{Bin, Cast};
-        let mut s = Shader::new(true);
-        let b = s.entry;
+        use crate::native::{HwStage, NativeProgram, PsInput, StageIo, Usage};
+
+        let words = [
+            0xC80E_0002u32, // v_interp_mov_f32 v3, p0, attr0.x
+            0x7E06_0D03,    // v_cvt_f32_u32 v3, v3
+            0x0606_06F2,    // v_add_f32 v3, 1.0, v3
+            0xF800_180F,
+            0x0303_0303, // exp mrt0, v3, v3, v3, v3 done vm
+            0xBF81_0000, // s_endpgm
+        ];
+        let native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: false,
+            vgprs: 4,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ps {
+                inputs: vec![PsInput {
+                    usage: Usage::Generic,
+                    row: 2,
+                    mask: 1,
+                    attr: 0,
+                    flat: true,
+                    fp16: false,
+                    pack2: false,
+                    row2: 0,
+                }],
+                input_addr: 0,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
         let mut id = element("SV_PrimitiveID", 10, 1, 2, 1);
-        id.comp = 5; // uint
-        let args = [s.m.i32(1), s.m.i32(0), s.m.i8(0), s.m.undef(s.t.i32)];
-        let n = s.op(b, "loadInput.i32", Attr::ReadNone, s.t.i32, 4, &args);
-        let n = s.m.cast(b, Cast::UiToFp, n, s.t.f32);
-        let one = s.m.f32(1f32.to_bits());
-        let red = s.m.bin(b, Bin::Add, n, one);
-        for (col, v) in [red, one, one, one].into_iter().enumerate() {
-            let args = [s.m.i32(0), s.m.i32(0), s.m.i8(col as u8), v];
-            s.op(b, "storeOutput.f32", Attr::NoUnwind, s.t.void, 5, &args);
-        }
-        s.inputs = vec![element("SV_Position", 3, 4, 0, 4), id];
-        s.outputs = vec![element("SV_Target", 16, 0, 0, 4)];
-        s.m.terminate(b, Term::Ret);
-        s.finish()
+        id.comp = 5;
+        let isg1 = super::super::container::signature(&[id], true);
+        let osg1 = super::super::container::signature(&[element("SV_Target", 16, 0, 0, 4)], false);
+        let bytes =
+            crate::dxbc::build(&[(super::FourCC::ISG1, &isg1), (super::FourCC::OSG1, &osg1)]);
+        let container = super::Container::parse(&bytes).unwrap();
+        let (p, st) =
+            crate::range::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let res =
+            crate::resource::track(&p, &native.layout, native.stage, st.as_ref().ok()).unwrap();
+        let io = crate::io::raise(&p, &native).unwrap();
+        super::super::emit(&container, &native, &p, &st.unwrap(), &io, &res)
+            .unwrap()
+            .dxil
     }
 
     /// A pixel shader reading `SV_PrimitiveID` behind the rectangle stage
@@ -387,13 +417,18 @@ mod tests {
                 mesh_groups: 0,
             };
             let texels = host.draw(&root, &pso, &draw).unwrap();
-            // Inside the left rectangle, inside the right one, between them.
-            let at = |x: usize, y: usize| texels[y * 32 + x][0];
-            assert_eq!(
-                (at(6, 16), at(26, 16), at(16, 16)),
-                (1.0, 2.0, 0.0),
-                "warp {warp}"
-            );
+            assert_eq!(texels.len(), 32 * 32);
+            for (i, texel) in texels.iter().enumerate() {
+                let (x, y) = (i % 32, i / 32);
+                let want = if (8..24).contains(&y) && (4..12).contains(&x) {
+                    1.0
+                } else if (8..24).contains(&y) && (20..28).contains(&x) {
+                    2.0
+                } else {
+                    0.0
+                };
+                assert_eq!(texel[0], want, "warp {warp} at ({x}, {y})");
+            }
             ran += 1;
         }
         if ran == 0 {
