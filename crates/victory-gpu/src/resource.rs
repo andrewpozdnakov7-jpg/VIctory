@@ -275,7 +275,15 @@ pub(crate) fn format_support(format: u32) -> windows::Win32::Graphics::Direct3D1
 /// Packed colour targets use RGBA8 when the device lacks either writable use.
 #[cfg(windows)]
 pub(crate) fn target_format(format: u32) -> u32 {
-    packed_target_format(format, format_support)
+    let host_format = packed_target_format(format, format_support);
+    if matches!(format, 86 | 115) {
+        use std::sync::OnceLock;
+        static LOGGED: [OnceLock<()>; 2] = [const { OnceLock::new() }; 2];
+        LOGGED[usize::from(format == 115)].get_or_init(|| {
+            tracing::info!(guest_format = format, host_format, "packed target format");
+        });
+    }
+    host_format
 }
 
 #[cfg(windows)]
