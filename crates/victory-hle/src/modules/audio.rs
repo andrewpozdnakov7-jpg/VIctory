@@ -1237,6 +1237,83 @@ mod tests {
     }
 
     #[test]
+    fn refilled_xma_voice_pumps_across_an_empty_first_input() {
+        let _serial = lock(&CONTEXT_TESTS);
+        let mut input = std::ptr::null_mut();
+        let mut output = std::ptr::null_mut();
+        let mut input_apu = 0;
+        let mut output_apu = 0;
+        assert_eq!(ApuAlloc(&mut input, &mut input_apu, 0x1000, 0x800, 1), S_OK);
+        assert_eq!(
+            ApuAlloc(&mut output, &mut output_apu, 0x400, 0x100, 2),
+            S_OK
+        );
+        let stream = silent_stream();
+        // SAFETY: the input allocation holds two packets.
+        unsafe { std::ptr::copy_nonoverlapping(stream.as_ptr(), input.cast(), stream.len()) };
+        let mut words = [0u32; 16];
+        let context = Context(words.as_mut_ptr());
+        context.set(0, 2 | 1 << 20 | 4 << 22);
+        context.set(1, 3 << 27 | 1 << 31);
+        context.set(2, 32);
+        context.set(5, input_apu);
+        context.set(7, output_apu);
+        let mut voice = Voice {
+            decoder: None,
+            pcm: VecDeque::new(),
+            skip: 0,
+            ended: false,
+            trace: Trace {
+                since: Instant::now(),
+                produced: 0,
+                taken: 0,
+                takes: 0,
+                partial_takes: 0,
+                frames: 0,
+                bad_frames: 0,
+                peak: 0,
+                ended_ms: None,
+            },
+        };
+
+        let drain = |voice: &mut Voice| {
+            for _ in 0..32 {
+                pump(context, voice);
+                context.set_field(9, 0, 5, context.field(0, 27, 5));
+                context.set_field(1, 31, 1, 1);
+                if voice.ended && voice.pcm.is_empty() {
+                    return;
+                }
+            }
+            panic!("the two-packet stream did not drain");
+        };
+        drain(&mut voice);
+        assert_eq!(voice.trace.frames, 6);
+        assert_eq!(context.field(2, 26, 5), INPUT_INVALID);
+        let produced = voice.trace.produced;
+        pump(context, &mut voice);
+        assert_eq!(voice.trace.produced, produced);
+
+        // Republish input 0 with zero packets and input 1 with a complete stream.
+        // The same enabled voice must move on to input 1 before writing a block.
+        context.set_field(0, 0, 12, 0);
+        context.set_field(0, 20, 2, 3);
+        context.set_field(1, 0, 12, 2);
+        context.set(6, input_apu);
+        drain(&mut voice);
+
+        ApuFree(input);
+        ApuFree(output);
+        assert_eq!(voice.trace.frames, 12);
+        assert_eq!(voice.trace.bad_frames, 0);
+        let resumed_blocks = (voice.trace.produced - produced) / SAMPLES_PER_BLOCK;
+        assert_eq!(
+            resumed_blocks, 26,
+            "six resumed frames and their overlap tail must fill 26 blocks"
+        );
+    }
+
+    #[test]
     fn ended_voice_stays_ended_until_input_is_republished() {
         let _serial = lock(&CONTEXT_TESTS);
         let (mut input, mut input_apu) = (std::ptr::null_mut(), 0);
