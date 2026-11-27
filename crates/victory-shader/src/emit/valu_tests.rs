@@ -1311,8 +1311,7 @@ fn v_cvt_f16_u16_and_i16_widen_the_integer_first() {
 
 #[test]
 fn v_16_bit_integer_ops_match_rdna2() {
-    // v_<op>_{u,i}16 v0, v1, v2 (VOP3 0x303..0x30c, 0x314): only the low
-    // halves of the sources count, and the result is the low half of v0.
+    // OPSEL picks each source half and which half of v0 to write.
     // The 16-bit shifts take a four-bit amount from the first operand.
     type Pick = fn(u16, u16) -> u16;
     let ops: [(&str, u16, Pick); 10] = [
@@ -1330,29 +1329,37 @@ fn v_16_bit_integer_ops_match_rdna2() {
         ("v_lshlrev_b16", 0x314, |a, b| b << (a & 15)),
     ];
     let values = [0u16, 1, 5, 16, 17, 0x7FFF, 0x8000, 0xFFFF];
-    let mut cases = Vec::new();
-    for a in values {
-        for b in values {
-            // Garbage in the high halves, which must not matter.
-            cases.push([0xABCD_0000 | u32::from(a), 0x1234_0000 | u32::from(b), 0, 0]);
+    let pack = |value: u16, other: u16, shift: u32| {
+        (u32::from(value) << shift) | (u32::from(other) << (16 - shift))
+    };
+    let old = 0x55AA_AA55;
+    for select in [0u32, 1, 2, 3, 8, 9, 10, 11] {
+        let src0_shift = (select & 1) * 16;
+        let src1_shift = (select >> 1 & 1) * 16;
+        let dst_shift = (select >> 3 & 1) * 16;
+        let mut cases = Vec::new();
+        for a in values {
+            for b in values {
+                cases.push([pack(a, 0xABCD, src0_shift), pack(b, 0x1234, src1_shift), 0, old]);
+            }
+        }
+
+        for (name, op, pick) in ops {
+            let [w0, w1] = vop3(op, 0, vgpr(1), vgpr(2), 0);
+            let shader = build_valu_cs(&[vop1(0x001, 0, vgpr(4)), w0 | select << 11, w1]);
+            run_cases(&shader, &cases, |backend, _, inp, got| {
+                let a = (inp[0] >> src0_shift) as u16;
+                let b = (inp[1] >> src1_shift) as u16;
+                let preserved = old & !(0xFFFF << dst_shift);
+                let want = preserved | (u32::from(pick(a, b)) << dst_shift);
+                assert_eq!(
+                    got, want,
+                    "{backend}: {name}({a:#06x}, {b:#06x}), OPSEL={select:#x}"
+                );
+            });
         }
     }
-    for (name, op, pick) in ops {
-        let shader = build_valu_cs(&[
-            vop1(0x001, 0, 128),
-            vop3(op, 0, vgpr(1), vgpr(2), 0)[0],
-            vop3(op, 0, vgpr(1), vgpr(2), 0)[1],
-        ]);
-        run_cases(&shader, &cases, |backend, _, inp, got| {
-            let (a, b) = (inp[0] as u16, inp[1] as u16);
-            let want = pick(a, b);
-            assert_eq!(
-                got & 0xFFFF,
-                u32::from(want),
-                "{backend}: {name}({a:#06x}, {b:#06x}) = {got:#010x}, want {want:#06x}",
-            );
-        });
-    }
+    println!("All 5120 int16 OPSEL results matched both destination halves");
 }
 
 #[test]
