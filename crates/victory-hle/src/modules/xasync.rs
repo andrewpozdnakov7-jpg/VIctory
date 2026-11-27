@@ -700,11 +700,17 @@ fn complete_call(call: &Call, block: *mut AsyncBlock, result: HRESULT, required_
     // SAFETY: a block in flight is valid.
     let (handle, routine) = unsafe { ((*block).queue, (*block).callback) };
     let (status, size) = words(block);
-    if result < 0 || required_size == 0 {
-        release(block);
-    }
+    // Keep the call findable during cleanup. The registry lock makes its
+    // removal and final status publication indivisible to a blocking lookup.
+    let calls = (result < 0 || required_size == 0).then(|| {
+        call.provider(OP_CLEANUP, block, 0, std::ptr::null_mut());
+        let mut calls = lock(&CALLS);
+        calls.remove(&(block as usize));
+        calls
+    });
     size.store(required_size, Ordering::Release);
     status.store(result as u32 as usize, Ordering::Release);
+    drop(calls);
     *lock(&call.done) = true;
     call.finished.notify_all();
     if routine.is_some() {
@@ -1752,6 +1758,73 @@ mod tests {
             SEEN.store(if free { 1 } else { 2 }, Ordering::SeqCst);
         }
         S_OK
+    }
+
+    #[test]
+    fn waiting_status_follows_payload_free_cleanup() {
+        struct CleanupGate {
+            entered: std::sync::Barrier,
+            finish: std::sync::Barrier,
+        }
+
+        extern "system" fn provider(op: u32, data: *const ProviderData) -> HRESULT {
+            if op == OP_CLEANUP {
+                // SAFETY: the test's gate outlives both scoped threads.
+                let gate = unsafe { &*(*data).context.cast::<CleanupGate>() };
+                gate.entered.wait();
+                gate.finish.wait();
+            }
+            S_OK
+        }
+
+        let outcomes = [S_OK, E_ABORT].map(|expected| {
+            let gate = CleanupGate {
+                entered: std::sync::Barrier::new(2),
+                finish: std::sync::Barrier::new(2),
+            };
+            let mut block = AsyncBlock {
+                queue: std::ptr::null(),
+                context: std::ptr::null_mut(),
+                callback: None,
+                internal: [0; 4],
+            };
+            let address = (&raw mut block) as usize;
+            let context = std::ptr::from_ref(&gate).cast_mut().cast();
+            let null = std::ptr::null();
+            assert_eq!(XAsyncBegin(&mut block, context, null, null.cast(), Some(provider)), S_OK);
+
+            std::thread::scope(|scope| {
+                let complete = scope.spawn(move || {
+                    let block = address as *mut AsyncBlock;
+                    if expected == E_ABORT {
+                        XAsyncCancel(block);
+                    } else {
+                        XAsyncComplete(block, expected, 0);
+                    }
+                });
+                gate.entered.wait();
+                let tracked = call(address as *mut AsyncBlock).is_some();
+                let polled = XAsyncGetStatus(address as *mut AsyncBlock, false);
+                let (send, recv) = std::sync::mpsc::channel();
+                scope.spawn(move || {
+                    let _ = send.send(XAsyncGetStatus(address as *mut AsyncBlock, true));
+                });
+                let early = recv.recv_timeout(std::time::Duration::from_millis(250));
+                gate.finish.wait();
+                complete.join().unwrap();
+                let waited = early
+                    .as_ref()
+                    .copied()
+                    .unwrap_or_else(|_| recv.recv_timeout(std::time::Duration::from_secs(2)).unwrap());
+                eprintln!("target={expected:#010x} tracked={tracked} polled={polled:#010x} early={early:?} waited={waited:#010x}");
+                (tracked, polled, early, waited)
+            })
+        });
+        use std::sync::mpsc::RecvTimeoutError::Timeout;
+        assert_eq!(outcomes, [
+            (true, E_PENDING, Err(Timeout), S_OK),
+            (true, E_PENDING, Err(Timeout), E_ABORT),
+        ]);
     }
 
     /// A failed call's cleanup runs without the completion lock: a cleanup
