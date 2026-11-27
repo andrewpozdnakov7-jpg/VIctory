@@ -7281,7 +7281,10 @@ impl<'a> Lower<'a> {
         if matches!(op, Operand::Literal(_)) {
             return Err("a literal operand of v_pk_fmac_f16");
         }
-        let x = self.f16_operand(inst, &op)?;
+        let x = match self.src0 {
+            Some(x) if k == 0 => x,
+            _ => self.f16_operand(inst, &op)?,
+        };
         let c = self.cur;
         let x = if high {
             let k16 = self.s.m.i32(16);
