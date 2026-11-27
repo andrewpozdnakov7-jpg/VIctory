@@ -597,6 +597,19 @@ fn normalized_codes_truncate_back_to_themselves() {
 }
 
 #[test]
+fn normalized_11_bit_buffer_loads_keep_exact_rounding() {
+    let shader = tbuffer_load_of_v1(0, 30); // x of 10_11_11_UNORM
+    // Zero, the switch to the wider quotient, the changes in bit length,
+    // and the largest codes.
+    let cases = [0, 1, 7, 8, 15, 16, 31, 32, 63, 64, 127, 128, 255, 256, 511, 512, 1023, 1024, 2046, 2047]
+        .map(|code| [code, 0, 0, 0]);
+    run_cases(&shader, &cases, |backend, _, [code, ..], got| {
+        let want = (f64::from(code) / 2047.0) as f32;
+        assert_eq!(got, want.to_bits(), "{backend}: 11-bit UNORM code {code}");
+    });
+}
+
+#[test]
 fn packed_add_selects_halves_of_inline_constants() {
     // Add the inline constant 1/(2*pi) to v1 (zero) to read back its two halves.
     // The same GFX10 source field (248) has a different bit pattern for a

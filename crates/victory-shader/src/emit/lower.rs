@@ -5165,14 +5165,15 @@ impl<'a> Lower<'a> {
             let b40 = k(self, 127 + 23 - 40);
             bias = self.s.m.select(c, small, b40, bias);
         }
-        // Bits to drop: the bit length less 24, 1 to 8.
-        let mut shift = one;
-        for bit in 25..32 {
-            let at = k(self, 1 << bit);
-            let ge = self.s.m.cmp(c, pred::IUGE, q, at);
-            let add = self.s.m.select(c, ge, one, zero);
-            shift = self.s.m.bin(c, Bin::Add, shift, add);
-        }
+        // Bits to drop: the bit length less 24, with a minimum of one.
+        // Set bit 24 for the scan so even a zero quotient gives a shift of one.
+        let bit24 = k(self, 1 << 24);
+        let scan = self.s.m.bin(c, Bin::Or, q, bit24);
+        // FirstbitHi counts from the most significant bit.
+        let leading = self
+            .s
+            .op(c, "unaryBits.i32", Attr::ReadNone, self.s.t.i32, 33, &[scan]);
+        let shift = self.s.m.bin(c, Bin::Sub, k8, leading);
         let mant = self.s.m.bin(c, Bin::LShr, q, shift);
         let below = self.s.m.bin(c, Bin::Sub, shift, one);
         let half = self.s.m.bin(c, Bin::LShr, q, below);
@@ -11673,6 +11674,14 @@ mod tests {
             v.validate(&mut l.dxil.clone())
                 .expect("DXIL validation failed");
         }
+    }
+
+    #[test]
+    fn an_11_bit_unorm_load_has_a_short_rounding_sequence() {
+        // tbuffer_load_format_x v0, off, s[8:11], 0 format:10_11_11_UNORM.
+        // The first (11-bit) channel comes from a runtime buffer read.
+        let l = lower_valu(&[0xE8F0_0000, 0x8002_0000]).unwrap();
+        assert!(l.instructions <= 60, "emitted {} DXIL instructions", l.instructions);
     }
 
     #[test]
