@@ -1437,7 +1437,9 @@ fn default_view(resource: crate::object::This) -> bool {
 
 /// Whether the host stores to typed unordered views of `format`.
 fn typed_store(format: u32) -> bool {
-    crate::resource::format_support(format).contains(D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW)
+    crate::resource::format_support(format)
+        .Support1
+        .contains(D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW)
 }
 
 /// Makes the host descriptor for `view` at `at` (in any host view heap):

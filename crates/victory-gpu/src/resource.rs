@@ -10,6 +10,8 @@ use std::ffi::c_void;
 use std::ptr::NonNull;
 
 use victory_formats::texture;
+#[cfg(windows)]
+use windows::Win32::Graphics::Direct3D12::D3D12_FEATURE_DATA_FORMAT_SUPPORT;
 
 use crate::object::{
     self, E_INVALIDARG, E_OUTOFMEMORY, HEAP, HRESULT, Iid, Object, RESOURCE, S_OK, Table, This,
@@ -244,13 +246,14 @@ pub(crate) fn pc_format(format: u32) -> u32 {
 
 /// The uses the host device supports for a format.
 #[cfg(windows)]
-pub(crate) fn format_support(format: u32) -> windows::Win32::Graphics::Direct3D12::D3D12_FORMAT_SUPPORT1 {
+pub(crate) fn format_support(format: u32) -> D3D12_FEATURE_DATA_FORMAT_SUPPORT {
     use windows::Win32::Graphics::Direct3D12::*;
     use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
-    static KNOWN: std::sync::Mutex<Vec<(u32, D3D12_FORMAT_SUPPORT1)>> = std::sync::Mutex::new(Vec::new());
+    static KNOWN: std::sync::Mutex<Vec<D3D12_FEATURE_DATA_FORMAT_SUPPORT>> =
+        std::sync::Mutex::new(Vec::new());
     let mut known = KNOWN.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(&(_, flags)) = known.iter().find(|(f, _)| *f == format) {
-        return flags;
+    if let Some(&support) = known.iter().find(|s| s.Format.0 as u32 == format) {
+        return support;
     }
     let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
         Format: DXGI_FORMAT(format as i32),
@@ -267,9 +270,12 @@ pub(crate) fn format_support(format: u32) -> windows::Win32::Graphics::Direct3D1
         }
         .is_ok()
     });
-    let flags = if ok { support.Support1 } else { D3D12_FORMAT_SUPPORT1_NONE };
-    known.push((format, flags));
-    flags
+    if !ok {
+        support.Support1 = D3D12_FORMAT_SUPPORT1_NONE;
+        support.Support2 = D3D12_FORMAT_SUPPORT2_NONE;
+    }
+    known.push(support);
+    support
 }
 
 /// Packed colour targets use RGBA8 when the device lacks either writable use.
@@ -281,14 +287,20 @@ pub(crate) fn target_format(format: u32) -> u32 {
 #[cfg(windows)]
 fn packed_target_format(
     format: u32,
-    support: impl FnOnce(u32) -> windows::Win32::Graphics::Direct3D12::D3D12_FORMAT_SUPPORT1,
+    support: impl FnOnce(u32) -> D3D12_FEATURE_DATA_FORMAT_SUPPORT,
 ) -> u32 {
     use windows::Win32::Graphics::Direct3D12::*;
+    if !matches!(format, 86 | 115) {
+        return format;
+    }
+    let support = support(format);
     let both = D3D12_FORMAT_SUPPORT1_RENDER_TARGET | D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW;
-    if matches!(format, 86 | 115) && !support(format).contains(both) {
-        28
-    } else {
+    if support.Support1.contains(both)
+        && support.Support2.contains(D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE)
+    {
         format
+    } else {
+        28
     }
 }
 
@@ -2391,11 +2403,23 @@ mod tests {
         use windows::Win32::Graphics::Direct3D12::*;
         let rt = D3D12_FORMAT_SUPPORT1_RENDER_TARGET;
         let uav = D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW;
+        let store = D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE;
+        let support = |support1, support2| D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+            Support1: support1,
+            Support2: support2,
+            ..Default::default()
+        };
         for format in [86, 115] {
-            for support in [D3D12_FORMAT_SUPPORT1_NONE, rt, uav] {
+            for support in [
+                support(D3D12_FORMAT_SUPPORT1_NONE, D3D12_FORMAT_SUPPORT2_NONE),
+                support(rt, store),
+                support(uav, store),
+                support(rt | uav, D3D12_FORMAT_SUPPORT2_NONE),
+                support(rt | uav, D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD),
+            ] {
                 assert_eq!(packed_target_format(format, |_| support), 28);
             }
-            assert_eq!(packed_target_format(format, |_| rt | uav), format);
+            assert_eq!(packed_target_format(format, |_| support(rt | uav, store)), format);
         }
         for format in [28, 85, 87] {
             assert_eq!(packed_target_format(format, |_| unreachable!()), format);
