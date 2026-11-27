@@ -56,6 +56,11 @@ fn partial_dmask_and_d16_image_stores_lower_and_validate() {
             let emitted = lower_with(&words, layout.clone(), used.clone())
                 .unwrap_or_else(|e| panic!("image_store dmask={dmask:#x} d16={d16} failed: {e}"));
             assert!(!emitted.dxil.is_empty());
+            assert_eq!(
+                emitted.typed_texture_annotations,
+                [true, d16],
+                "2D image_store dmask={dmask:#x} d16={d16}",
+            );
             #[cfg(windows)]
             if let Ok(mut v) = crate::emit::validator::Validator::load(
                 crate::emit::validator::Validator::default_path().as_deref(),

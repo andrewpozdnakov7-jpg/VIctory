@@ -404,12 +404,12 @@ impl HostHeap {
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
     /// host cannot.
     pub(crate) fn make_at(&self, index: u32, view: &View) {
-        let (kept, mark) = make_marked(view, self.cpu(index));
+        let (kept, mark, format) = make_marked(view, self.cpu(index));
         if kept.is_none() {
             null_for(view, self.cpu(index));
         }
         self.keep(index, kept.flatten());
-        self.set_stride(index, Some(view));
+        self.set_stride(index, Some(view), format);
         self.set_mark(index, mark);
         // A table made afresh: shaders reading a view's address there (e.g.
         // the BVH builder's base) index the view addresses at this slot.
@@ -483,7 +483,7 @@ impl HostHeap {
             null_view(self.cpu(index));
         }
         self.keep(index, None);
-        self.set_stride(index, None);
+        self.set_stride(index, None, None);
         self.set_mark(index, None);
         self.note_address(index, None);
         if index < self.count {
@@ -494,8 +494,11 @@ impl HostHeap {
     /// Enters the byte stride of `view` (0 for none or not a buffer view)
     /// for slot `index` in the view-stride table, with the integer-format
     /// bits of a typed buffer view or texture UAV ([`view_kind`]).
-    fn set_stride(&self, index: u32, view: Option<&View>) {
-        self.write_stride(index, view.map_or(0, |v| view_stride(v) | view_kind(v)));
+    fn set_stride(&self, index: u32, view: Option<&View>, texture_uav_format: Option<u32>) {
+        self.write_stride(
+            index,
+            view.map_or(0, |v| view_stride(v) | view_kind(v, texture_uav_format)),
+        );
     }
 
     fn write_stride(&self, index: u32, stride: u32) {
@@ -808,18 +811,18 @@ impl HostHeap {
             }
         }
         {
-            self.set_stride(index, Some(&view));
             self.note_address(index, Some(&view));
             if later {
                 // Made once a shader reads it (`crate::shadow::take_reads`).
                 crate::shadow::forget_read(index);
             }
             made[index as usize] = key;
-            let (kept, mark) = if later {
-                (None, None)
+            let (kept, mark, format) = if later {
+                (None, None, None)
             } else {
                 make_marked(&view, self.cpu(index))
             };
+            self.set_stride(index, Some(&view), format);
             self.set_mark(index, mark);
             if kept.is_none() && !self.sampler {
                 null_for(&view, self.cpu(index));
@@ -1010,8 +1013,16 @@ fn view_stride(view: &View) -> u32 {
 
 /// Record the format kind for typed buffers and texture UAVs. Shader
 /// stores use it to extend integer d16 values before writing.
-fn view_kind(view: &View) -> u32 {
+fn view_kind(view: &View, texture_uav_format: Option<u32>) -> u32 {
     use victory_shader::emit::{VIEW_INTEGER, VIEW_SIGNED};
+    let kind = |format| match integer_format(crate::resource::pc_format(format)) {
+        Some(true) => VIEW_INTEGER | VIEW_SIGNED,
+        Some(false) => VIEW_INTEGER,
+        None => 0,
+    };
+    if let Some(format) = texture_uav_format {
+        return kind(format);
+    }
     let (unordered, words): (bool, &[u32; 10]) = match view {
         View::Shader(_, Some(desc)) => (false, desc),
         View::Unordered(_, _, Some(desc)) => (true, desc),
@@ -1037,10 +1048,12 @@ fn view_kind(view: &View) -> u32 {
         (true, 2..=5 | 8) => true,
         _ => false,
     };
-    match typed.then(|| integer_format(crate::resource::pc_format(words[0]))).flatten() {
-        Some(true) => VIEW_INTEGER | VIEW_SIGNED,
-        Some(false) => VIEW_INTEGER,
-        None => 0,
+    if !typed {
+        return 0;
+    }
+    match (words[0], view) {
+        (0, View::Placed(true, resource, _)) if resource[0] != 1 => kind(resource[8]),
+        (format, _) => kind(format),
     }
 }
 
@@ -1330,10 +1343,14 @@ thread_local! {
 /// [`make`], and the view-mark entry of the view if it is an unordered
 /// buffer view whose writes shaders mark (`victory_shader::emit`, "Write
 /// marks").
-fn make_marked(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> (Option<Kept>, Option<(u32, u32)>) {
+fn make_marked(
+    view: &View,
+    at: D3D12_CPU_DESCRIPTOR_HANDLE,
+) -> (Option<Kept>, Option<(u32, u32)>, Option<u32>) {
     MARK.with(|m| m.set(None));
-    let kept = make(view, at);
-    (kept, MARK.with(std::cell::Cell::take))
+    let mut texture_uav_format = None;
+    let kept = make(view, at, &mut texture_uav_format);
+    (kept, MARK.with(std::cell::Cell::take), texture_uav_format)
 }
 
 /// Whether the host can make a shader (or unordered access) view of
@@ -1460,12 +1477,16 @@ fn typed_store(format: u32) -> bool {
 /// Makes the host descriptor for `view` at `at` (in any host view heap):
 /// the host resource it views, if it can.
 pub(crate) fn make_view(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<ID3D12Resource> {
-    make(view, at).flatten().map(|k| k.0)
+    make(view, at, &mut None).flatten().map(|k| k.0)
 }
 
 /// Makes the host descriptor for `view` at `at`: the host resource it
 /// views, or `None` if it cannot.
-fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
+fn make(
+    view: &View,
+    at: D3D12_CPU_DESCRIPTOR_HANDLE,
+    texture_uav_format: &mut Option<u32>,
+) -> Option<Kept> {
     let host = host()?;
     let device = &host.device;
     match view {
@@ -1538,9 +1559,10 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             };
             copy.viewed.store(true, std::sync::atomic::Ordering::Relaxed);
             let texture = &copy.texture;
-            // A depth texture's unordered views write its twin.
             // SAFETY: a live resource.
-            if unsafe { texture.GetDesc() }.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0 != 0 {
+            let texture_desc = unsafe { texture.GetDesc() };
+            // A depth texture's unordered views write its twin.
+            if texture_desc.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0 != 0 {
                 return crate::twin::uav(resource, &copy, desc.as_ref(), at)
                     .map(|twin| Some((twin, None)));
             }
@@ -1557,6 +1579,11 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             if !fits(texture, &copy.castable, desc.as_mut().map(|d| &mut d.Format), true) {
                 return None;
             }
+            *texture_uav_format = Some(
+                desc.as_ref()
+                    .filter(|d| d.Format.0 != 0)
+                    .map_or(texture_desc.Format.0, |d| d.Format.0) as u32,
+            );
             // SAFETY: a live texture and a slot of our heap.
             unsafe {
                 device.CreateUnorderedAccessView(
@@ -1587,7 +1614,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
         }
         View::Placed(unordered, resource, desc) => {
             if let Some(view) = placed_texture(view) {
-                return make(&view, at);
+                return make(&view, at, texture_uav_format);
             }
             const BUFFER: u32 = 1;
             if resource[0] != BUFFER {
@@ -1832,19 +1859,36 @@ mod tests {
     fn integer_typed_buffer_views_are_marked_in_the_stride_table() {
         use victory_shader::emit::{VIEW_INTEGER, VIEW_SIGNED};
         // Format, dimension (buffer), first element, count, stride, counter, flags.
-        let uav = |format, stride, flags| View::Unordered(0, 0, Some([format, 1, 0, 0, 64, stride, 0, 0, flags, 0]));
-        assert_eq!(view_kind(&uav(12, 0, 0)), VIEW_INTEGER, "R16G16B16A16_UINT");
-        assert_eq!(view_kind(&uav(57, 0, 0)), VIEW_INTEGER, "R16_UINT");
-        assert_eq!(view_kind(&uav(59, 0, 0)), VIEW_INTEGER | VIEW_SIGNED, "R16_SINT");
-        assert_eq!(view_kind(&uav(64, 0, 0)), VIEW_INTEGER | VIEW_SIGNED, "R8_SINT");
-        assert_eq!(view_kind(&uav(10, 0, 0)), 0, "R16G16B16A16_FLOAT");
-        assert_eq!(view_kind(&uav(58, 0, 0)), 0, "R16_SNORM");
-        assert_eq!(view_kind(&uav(39, 0, 1)), 0, "raw");
-        assert_eq!(view_kind(&uav(0, 16, 0)), 0, "structured");
+        let uav = |format, stride, flags| {
+            View::Unordered(0, 0, Some([format, 1, 0, 0, 64, stride, 0, 0, flags, 0]))
+        };
+        assert_eq!(
+            view_kind(&uav(12, 0, 0), None),
+            VIEW_INTEGER,
+            "R16G16B16A16_UINT"
+        );
+        assert_eq!(view_kind(&uav(57, 0, 0), None), VIEW_INTEGER, "R16_UINT");
+        assert_eq!(
+            view_kind(&uav(59, 0, 0), None),
+            VIEW_INTEGER | VIEW_SIGNED,
+            "R16_SINT"
+        );
+        assert_eq!(
+            view_kind(&uav(64, 0, 0), None),
+            VIEW_INTEGER | VIEW_SIGNED,
+            "R8_SINT"
+        );
+        assert_eq!(view_kind(&uav(10, 0, 0), None), 0, "R16G16B16A16_FLOAT");
+        assert_eq!(view_kind(&uav(58, 0, 0), None), 0, "R16_SNORM");
+        assert_eq!(view_kind(&uav(39, 0, 1), None), 0, "raw");
+        assert_eq!(view_kind(&uav(0, 16, 0), None), 0, "structured");
         // Format, dimension, mapping, first element, count, stride, flags.
         let srv = View::Shader(0, Some([62, 1, 5768, 0, 0, 0, 64, 0, 0, 0]));
-        assert_eq!(view_kind(&srv), VIEW_INTEGER, "R8_UINT");
-        assert_eq!(view_stride(&uav(12, 0, 0)) | view_kind(&uav(12, 0, 0)), 8 | VIEW_INTEGER);
+        assert_eq!(view_kind(&srv, None), VIEW_INTEGER, "R8_UINT");
+        assert_eq!(
+            view_stride(&uav(12, 0, 0)) | view_kind(&uav(12, 0, 0), None),
+            8 | VIEW_INTEGER
+        );
     }
 
     #[test]
@@ -1853,13 +1897,37 @@ mod tests {
         for (format, bits) in [(36, VIEW_INTEGER), (38, VIEW_INTEGER | VIEW_SIGNED), (34, 0)] {
             let words = [format, 4, 0, 0, 0, 0, 0, 0, 0, 0];
             let view = View::Unordered(0, 0, Some(words));
-            assert_eq!((view_stride(&view), view_kind(&view)), (0, bits));
+            assert_eq!((view_stride(&view), view_kind(&view, None)), (0, bits));
             let mut resource = [0; 14];
             resource[0] = 3;
             let mut desc = [0; 16];
             desc[..10].copy_from_slice(&words);
             let placed = View::Placed(true, resource, desc);
-            assert_eq!((view_stride(&placed), view_kind(&placed)), (0, bits));
+            assert_eq!((view_stride(&placed), view_kind(&placed, None)), (0, bits));
+        }
+    }
+
+    #[test]
+    fn inherited_integer_texture_uavs_have_kind_bits() {
+        use victory_shader::emit::{VIEW_INTEGER, VIEW_SIGNED};
+        let mut desc = [0; 16];
+        desc[1] = 4; // Texture2D, Format = DXGI_FORMAT_UNKNOWN.
+        let mut resource = [3, 0, 0, 0, 4, 0, 1, 1 | 1 << 16, 38, 1, 0, 0x100, 4, 0];
+        assert_eq!(
+            view_kind(&View::Placed(true, resource, desc), None),
+            VIEW_INTEGER | VIEW_SIGNED
+        );
+        resource[8] = 36;
+        assert_eq!(
+            view_kind(&View::Placed(true, resource, desc), None),
+            VIEW_INTEGER
+        );
+        // Resolved formats supplied by the host view creation path.
+        let default = View::Unordered(0, 0, None);
+        let unknown = View::Unordered(0, 0, desc[..10].try_into().ok());
+        for view in [&default, &unknown] {
+            assert_eq!(view_kind(view, Some(36)), VIEW_INTEGER);
+            assert_eq!(view_kind(view, Some(38)), VIEW_INTEGER | VIEW_SIGNED);
         }
     }
 

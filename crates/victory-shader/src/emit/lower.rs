@@ -25,6 +25,7 @@ mod bvh;
 mod image_store_tests;
 
 type Why = &'static str;
+type HandleProps = (u32, u32);
 
 #[derive(Debug, Clone, Copy)]
 enum Val {
@@ -34,6 +35,8 @@ enum Val {
 }
 
 pub(crate) struct Lowered {
+    #[cfg(test)]
+    pub typed_texture_annotations: [bool; 2],
     pub dxil: Vec<u8>,
     /// Bit n: immediate sampler n is a comparison sampler.
     pub cmp_samplers: u64,
@@ -216,15 +219,15 @@ struct Lower<'a> {
     scalar: HashMap<Site, Address>,
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
-    handles: HashMap<(usize, Site, u8, bool, u32), V>,
+    handles: HashMap<(usize, Site, u8, bool, HandleProps), V>,
     /// Handles made in the entry block for descriptors at addresses the
     /// root parameters alone give (table and heap loads with no other
     /// term), by base value, byte offset, dword, offset register, sampler
     /// heap and properties ([`Lower::entry_address`]).
-    entry_handles: HashMap<(EntryAddress, u8, bool, u32), V>,
+    entry_handles: HashMap<(EntryAddress, u8, bool, HandleProps), V>,
     /// Handles of descriptors chosen by control flow, made in their join
     /// block, by the choice (its `Debug` text), sampler heap and properties.
-    join_handles: HashMap<(String, bool, u32), V>,
+    join_handles: HashMap<(String, bool, HandleProps), V>,
     /// Blocks splitting the edge from one IR block to another.
     edges: HashMap<(usize, usize), usize>,
     /// Per IR block: a `done` export is behind every lane entering it.
@@ -1392,6 +1395,8 @@ impl<'a> Lower<'a> {
         let view_addresses = self.s.view_addresses.is_some();
         let cmp_samplers = self.s.cmp_samplers;
         Ok(Lowered {
+            #[cfg(test)]
+            typed_texture_annotations: [0x409, 0x405].map(|n| self.s.m.has_i32_const(n)),
             cmp_samplers,
             root_cbvs,
             root_srvs,
@@ -5337,7 +5342,7 @@ impl<'a> Lower<'a> {
     /// for the instruction's read mark (handles are made once per block,
     /// often before the instruction). A view read through a table needs
     /// none: the host makes the slot for the draw.
-    fn handle(&mut self, site: Site, src: &Source, sampler: bool, props: (u32, u32)) -> Result<V, Why> {
+    fn handle(&mut self, site: Site, src: &Source, sampler: bool, props: HandleProps) -> Result<V, Why> {
         let h = self.handle_made(site, src, sampler, props)?;
         if let Some(&index) = self.s.texture_index.get(&h)
             && self.is_heap_direct(src)
@@ -5352,7 +5357,7 @@ impl<'a> Lower<'a> {
         site: Site,
         src: &Source,
         sampler: bool,
-        props: (u32, u32),
+        props: HandleProps,
     ) -> Result<V, Why> {
         let props = if self.pops && props.0 & 0x1000 != 0 {
             self.s.flags |= flags::ROVS;
@@ -5374,7 +5379,7 @@ impl<'a> Lower<'a> {
                 // compiler reloads one before every use rather than keep it
                 // (ActivateRays: 2,399 loads of one), and one handle made in
                 // the entry block serves them all.
-                let key = (address, *first, sampler, props.0);
+                let key = (address, *first, sampler, props);
                 if let Some(&h) = self.entry_handles.get(&key) {
                     return Ok(h);
                 }
@@ -5387,7 +5392,7 @@ impl<'a> Lower<'a> {
                 Ok(h)
             }
             Source::Loaded { load, first } => {
-                let key = (self.cur, *load, *first, sampler, props.0);
+                let key = (self.cur, *load, *first, sampler, props);
                 if let Some(&h) = self.handles.get(&key) {
                     return Ok(h);
                 }
@@ -5496,7 +5501,7 @@ impl<'a> Lower<'a> {
                 // One handle at the join for every access the choice reaches
                 // (each is in a block the join dominates).
                 let _ = site;
-                let key = (format!("{src:?}"), sampler, props.0);
+                let key = (format!("{src:?}"), sampler, props);
                 if let Some(&h) = self.join_handles.get(&key) {
                     return Ok(h);
                 }
