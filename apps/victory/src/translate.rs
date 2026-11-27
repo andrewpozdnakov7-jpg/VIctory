@@ -355,7 +355,9 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result
             };
             let jobs = sources(&data);
             if pipelines
-                && (data.starts_with(victory_game::shaderpack::MAGIC) || !jobs.is_empty())
+                && (data.starts_with(victory_game::shaderpack::MAGIC)
+                    || !jobs.is_empty()
+                    || victory_game::sgd5::is_sgd5(&data))
             {
                 relevant.push(entry.path().to_owned());
             }

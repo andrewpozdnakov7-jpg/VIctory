@@ -12,6 +12,7 @@
 //! interrupted pre-build keeps its work, and the next one finds those
 //! pipelines there.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -42,6 +43,7 @@ pub fn run(paths: &[PathBuf], threads: usize) -> Result<()> {
     pipeline::use_pipeline_cache(victory_core::Config::load()?.cache_subdir("pipelines")?);
     // The files that hold shaders (or the pack itself).
     let mut read_paths = (paths.len() > 1).then(HashSet::new);
+    let mut archive_pack = None;
     let files: Vec<(PathBuf, Vec<u8>)> = paths
         .iter()
         .flat_map(|root| {
@@ -55,12 +57,27 @@ pub fn run(paths: &[PathBuf], threads: usize) -> Result<()> {
             let bytes = read_warmup_input(&path, &mut read_paths)?;
             Some((path, bytes))
         })
-        .filter(|(_, d)| d.starts_with(shaderpack::MAGIC) || !sources(d).is_empty())
+        .filter(|(path, data)| {
+            if data.starts_with(shaderpack::MAGIC) || !sources(data).is_empty() {
+                return true;
+            }
+            // An SGD5 archive can carry the pack even without shader records.
+            // Keep just the extracted bytes when the archive has no other inputs.
+            if archive_pack.is_none() && sgd5::is_sgd5(data) {
+                archive_pack = shaderpack::find(data).map(|pack| (path.clone(), pack.into_owned()));
+            }
+            false
+        })
         .collect();
     // It ships beside the shader databases.
     let found = (files.iter())
         .filter(|(_, d)| d.starts_with(shaderpack::MAGIC) || sgd5::is_sgd5(d))
-        .find_map(|(p, d)| Some((p, shaderpack::find(d)?)));
+        .find_map(|(p, d)| Some((p, shaderpack::find(d)?)))
+        .or_else(|| {
+            archive_pack
+                .as_ref()
+                .map(|(path, pack)| (path, Cow::Borrowed(pack.as_slice())))
+        });
     let Some((pack_path, pack)) = found else {
         println!("pipelines    no shader pack among the files: nothing to pre-build");
         return Ok(());
