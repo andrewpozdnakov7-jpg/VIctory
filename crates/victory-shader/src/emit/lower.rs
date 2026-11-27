@@ -2220,7 +2220,10 @@ impl<'a> Lower<'a> {
     // shortcut: rounding toward +-infinity, or a mode not known at this
     // point (paths that set it differently join), rounds to nearest even.
     fn narrow16(&mut self, f: V) -> V {
-        let rtz = self.mode16 == Some(3);
+        self.narrow16_rounded(f, self.mode16 == Some(3))
+    }
+
+    fn narrow16_rounded(&mut self, f: V, rtz: bool) -> V {
         let c = self.cur;
         let x = self.as_int(f);
         let k = |l: &mut Self, v: u32| l.s.m.i32(v);
@@ -6987,7 +6990,18 @@ impl<'a> Lower<'a> {
             if v.clamp {
                 f = l.unary(7, f);
             }
-            let h = l.narrow16(f);
+            // RDNA2 rounds these instructions to nearest even in every FP_ROUND mode.
+            let rounds_to_nearest = matches!(
+                name,
+                "v_rcp_f16"
+                    | "v_sqrt_f16"
+                    | "v_rsq_f16"
+                    | "v_log_f16"
+                    | "v_exp_f16"
+                    | "v_sin_f16"
+                    | "v_cos_f16"
+            );
+            let h = l.narrow16_rounded(f, !rounds_to_nearest && l.mode16 == Some(3));
             l.write_half(inst, h, guard)
         };
         if name == "v_cvt_f16_f32" {
@@ -7073,7 +7087,7 @@ impl<'a> Lower<'a> {
                     let a = self.half_fsrc(inst, 0)?;
                     let r = self.unary(21, a);
                     // Exact 2^(0x11c5) exceeds the 0x3c00/0x3c01 tie where f32
-                    // lands; nudge 1 ULP up so narrow16 respects RNE and RTZ.
+                    // lands; nudge 1 ULP up so nearest-even selects the upper half.
                     let x = self.s.m.f32(0x3A38_A000);
                     let boundary = self.s.m.cmp(c, pred::OEQ, a, x);
                     let up = self.s.m.f32(0x3F80_1001);
