@@ -2163,6 +2163,25 @@ impl<'a> Lower<'a> {
         )
     }
 
+    /// A scalar or vector bit-field mask, truncated at the end of the dword.
+    fn bitfield_mask32(&mut self, width: V, offset: V) -> V {
+        let immediate = self.s.m.int_value(width).zip(self.s.m.int_value(offset));
+        if let Some((width, offset)) = immediate {
+            return self.s.m.i32(((1u32 << (width & 31)) - 1) << (offset & 31));
+        }
+        // Bfi uses the low five bits of width and offset. Insert ones into zero.
+        let ones = self.s.m.i32(u32::MAX);
+        let zero = self.s.m.i32(0);
+        self.s.op(
+            self.cur,
+            "quaternary.i32",
+            Attr::ReadNone,
+            self.s.t.i32,
+            53,
+            &[width, offset, ones, zero],
+        )
+    }
+
     /// A 32-bit denormal as the console's float mode reads it: a zero of its
     /// sign, decided on the bits (the host's own denormal mode varies).
     fn ftz(&mut self, f: V) -> V {
@@ -4014,24 +4033,7 @@ impl<'a> Lower<'a> {
             }
             "s_bfm_b32" => {
                 let (width, offset) = (src32(self, 0)?, src32(self, 1)?);
-                let immediate = self.s.m.int_value(width).zip(self.s.m.int_value(offset));
-                let mask = if let Some((width, offset)) = immediate {
-                    self.s.m.i32(((1u32 << (width & 31)) - 1) << (offset & 31))
-                } else {
-                    // Bfi uses the low five bits of width and offset, inserting
-                    // a field of ones into zero to make the mask.
-                    let ones = self.s.m.i32(u32::MAX);
-                    let zero = self.s.m.i32(0);
-                    self.s.op(
-                        c,
-                        "quaternary.i32",
-                        Attr::ReadNone,
-                        self.s.t.i32,
-                        53,
-                        &[width, offset, ones, zero],
-                    )
-                };
-                (mask, None)
+                (self.bitfield_mask32(width, offset), None)
             }
             _ => return Err(name),
         };
@@ -7772,18 +7774,8 @@ impl<'a> Lower<'a> {
                 r
             }
             "v_bfm_b32" => {
-                // Bfi masks width/offset to five bits and truncates fields
-                // crossing bit 31, just as the ISA's shifted mask does.
-                let (a, b) = (s(self, 0)?, s(self, 1)?);
-                let (ones, zero) = (k(self, u32::MAX), k(self, 0));
-                self.s.op(
-                    c,
-                    "quaternary.i32",
-                    Attr::ReadNone,
-                    self.s.t.i32,
-                    53,
-                    &[a, b, ones, zero],
-                )
+                let (width, offset) = (s(self, 0)?, s(self, 1)?);
+                self.bitfield_mask32(width, offset)
             }
             "v_cvt_pk_u8_f32" => {
                 // src0 rounded to nearest even and saturated to a byte, into
@@ -11119,6 +11111,12 @@ mod tests {
         let count = lower_valu(&words).unwrap().instructions;
         eprintln!("v_bfm_b32 DXIL instruction count: {count}");
         assert_eq!(count, 17, "v_bfm_b32 DXIL instruction count");
+        let literal = [0xD763_0000, 140 | 140 << 9]; // v_bfm_b32 v0, 12, 12
+        let lowered = lower_valu(&literal).unwrap();
+        assert_eq!(
+            lowered.instructions, 12,
+            "constant v_bfm_b32 instruction count"
+        );
     }
 
     #[test]

@@ -259,6 +259,18 @@ fn vector_bitfield_mask_matches_rdna2() {
         let want = (((1u64 << (width & 31)) - 1) << (offset & 31)) as u32;
         assert_eq!(got, want, "{backend}: v_bfm_b32({width:#x}, {offset:#x})");
     });
+    // Both operands are inline integers, including widths and offsets above 31.
+    for (width, offset, want) in [
+        (12, 12, 0x00FF_F000),
+        (33, 63, 0x8000_0000),
+        (32, 7, 0),
+        (31, 4, 0xFFFF_FFF0),
+    ] {
+        let shader = build_valu_cs(&vop3(0x363, 0, 128 + width, 128 + offset, 0));
+        run_cases(&shader, &[[0; 4]], |backend, _, _, got| {
+            assert_eq!(got, want, "{backend}: inline v_bfm_b32({width}, {offset})");
+        });
+    }
 }
 
 #[test]
