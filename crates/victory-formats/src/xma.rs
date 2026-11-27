@@ -1178,12 +1178,16 @@ fn windows() -> &'static [Vec<f32>; 3] {
 /// the previous block's tail, the second half the current block's head.
 fn window_overlap(block: &mut [f32], window: &[f32]) {
     let len = block.len() / 2;
-    for k in 0..len {
-        let (i, j) = (k, 2 * len - 1 - k);
-        let (s0, s1) = (block[i], block[2 * len - 1 - k]);
-        let (wi, wj) = (window[i], window[j]);
-        block[i] = s0 * wj - s1 * wi;
-        block[j] = s0 * wi + s1 * wj;
+    let (head, tail) = block[..2 * len].split_at_mut(len);
+    let (rising, falling) = window[..2 * len].split_at(len);
+    for ((head, tail), (&rise, &fall)) in head
+        .iter_mut()
+        .zip(tail.iter_mut().rev())
+        .zip(rising.iter().zip(falling.iter().rev()))
+    {
+        let (previous, current) = (*head, *tail);
+        *head = previous * fall - current * rise;
+        *tail = previous * rise + current * fall;
     }
 }
 
