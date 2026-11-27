@@ -18,12 +18,20 @@ pub const ROOT_CBV_SPACE: u32 = 1;
 /// [`VIEW_INTEGER`] and [`VIEW_SIGNED`] for typed views of integer formats.
 pub const VIEW_STRIDES: u8 = 255;
 /// The bits of a view-stride table dword holding the stride.
-pub const VIEW_STRIDE_BITS: u32 = (1 << 30) - 1;
+pub const VIEW_STRIDE_BITS: u32 = (1 << 29) - 1;
 /// In a view-stride table dword: a typed buffer view of an integer format
 /// (`UINT` or `SINT`), whose 16-bit typed accesses (`_d16`) pass bits.
 pub const VIEW_INTEGER: u32 = 1 << 31;
 /// With [`VIEW_INTEGER`]: a signed (`SINT`) format.
 pub const VIEW_SIGNED: u32 = 1 << 30;
+/// A normalized typed buffer view, whose D16 loads round to nearest even.
+pub const VIEW_NORMALIZED: u32 = 1 << 29;
+
+/// UNORM and SNORM color formats usable for typed buffer elements (DXGI_FORMAT).
+pub fn normalized_buffer_format(format: u32) -> bool {
+    matches!(format, 11 | 13 | 24 | 28 | 31 | 35 | 37 | 49 | 51 | 56 | 58 | 61 | 63 | 85 | 86 | 87 | 88 | 115)
+}
+
 /// Where the title-memory page table is bound: `t0` (a raw root SRV) in
 /// this space (see `emit` "Title memory").
 pub const MEMORY_SPACE: u32 = 2;

@@ -1036,7 +1036,13 @@ fn view_kind(view: &View) -> u32 {
         let b = unsafe { desc.Anonymous.Buffer };
         (desc.Format.0 as u32, b.StructureByteStride == 0 && b.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 == 0)
     };
-    match (words[1] == 1 && typed).then(|| integer_format(format)).flatten() {
+    if words[1] != 1 || !typed {
+        return 0;
+    }
+    if victory_shader::emit::normalized_buffer_format(format) {
+        return victory_shader::emit::VIEW_NORMALIZED;
+    }
+    match integer_format(format) {
         Some(true) => VIEW_INTEGER | VIEW_SIGNED,
         Some(false) => VIEW_INTEGER,
         None => 0,
@@ -1837,9 +1843,13 @@ mod tests {
         assert_eq!(view_kind(&uav(59, 0, 0)), VIEW_INTEGER | VIEW_SIGNED, "R16_SINT");
         assert_eq!(view_kind(&uav(64, 0, 0)), VIEW_INTEGER | VIEW_SIGNED, "R8_SINT");
         assert_eq!(view_kind(&uav(10, 0, 0)), 0, "R16G16B16A16_FLOAT");
-        assert_eq!(view_kind(&uav(58, 0, 0)), 0, "R16_SNORM");
+        assert_eq!(view_kind(&uav(58, 0, 0)), victory_shader::emit::VIEW_NORMALIZED, "R16_SNORM");
         assert_eq!(view_kind(&uav(39, 0, 1)), 0, "raw");
         assert_eq!(view_kind(&uav(0, 16, 0)), 0, "structured");
+        for format in [85, 86, 87, 88, 115] {
+            let srv = View::Shader(0, Some([format, 1, 5768, 0, 0, 0, 64, 0, 0, 0]));
+            assert_eq!(view_kind(&srv), victory_shader::emit::VIEW_NORMALIZED, "DXGI format {format}");
+        }
         // Format, dimension, mapping, first element, count, stride, flags.
         let srv = View::Shader(0, Some([62, 1, 5768, 0, 0, 0, 64, 0, 0, 0]));
         assert_eq!(view_kind(&srv), VIEW_INTEGER, "R8_UINT");

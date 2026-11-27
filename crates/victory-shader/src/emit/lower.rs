@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use super::UserData;
 use super::bitcode::{Attr, Bin, Cast, Term, V, pred};
 use super::container::SigElement;
-use super::shader::{Shader, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, VIEW_STRIDES, flags};
+use super::shader::{Shader, VIEW_INTEGER, VIEW_NORMALIZED, VIEW_SIGNED, VIEW_STRIDE_BITS, VIEW_STRIDES, flags};
 use crate::ShaderError;
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
 use crate::io::{Barycentric, Elsewhere, Export, Input, Interp, Io, Target};
@@ -66,6 +66,8 @@ pub(crate) struct Lowered {
     /// Whether it declares rasterizer-ordered views.
     #[cfg(test)]
     pub rovs: bool,
+    #[cfg(test)]
+    pub legacy_half_conversion: bool,
     /// Whether the module declares `dx.op.waveGetLaneIndex`.
     #[cfg(test)]
     pub uses_lane_index: bool,
@@ -1409,6 +1411,8 @@ impl<'a> Lower<'a> {
             #[cfg(test)]
             rovs: self.s.flags & flags::ROVS != 0,
             #[cfg(test)]
+            legacy_half_conversion: self.s.m.has_function("dx.op.legacyF32ToF16"),
+            #[cfg(test)]
             uses_lane_index: self.s.m.has_function("dx.op.waveGetLaneIndex"),
             #[cfg(test)]
             has_half_wave_mask: self.s.m.has_i32_const(!31),
@@ -2220,7 +2224,11 @@ impl<'a> Lower<'a> {
     // shortcut: rounding toward +-infinity, or a mode not known at this
     // point (paths that set it differently join), rounds to nearest even.
     fn narrow16(&mut self, f: V) -> V {
-        let rtz = self.mode16 == Some(3);
+        self.narrow16_bits(f, self.mode16 == Some(3))
+    }
+
+    /// Converts with a fixed rounding direction, independent of the host.
+    fn narrow16_bits(&mut self, f: V, rtz: bool) -> V {
         let c = self.cur;
         let x = self.as_int(f);
         let k = |l: &mut Self, v: u32| l.s.m.i32(v);
@@ -4622,20 +4630,17 @@ impl<'a> Lower<'a> {
         self.raw_dword(table, at)
     }
 
-    /// Whether the typed buffer view a handle names has an integer format,
-    /// and whether a signed one, from the view-stride table; `None` if the
-    /// handle's heap index is not known.
-    fn integer_view(&mut self, h: V) -> Option<(V, V)> {
+    /// Requested format flags of a typed view with a known heap index.
+    fn view_flags<const N: usize>(&mut self, h: V, flags: [u32; N]) -> Option<[V; N]> {
         let index = *self.s.view_index.get(&h)?;
         let word = self.view_word(index);
         let c = self.cur;
         let zero = self.s.m.i32(0);
-        let [int, signed] = [VIEW_INTEGER, VIEW_SIGNED].map(|bit| {
+        Some(flags.map(|bit| {
             let bit = self.s.m.i32(bit);
             let x = self.s.m.bin(c, Bin::And, word, bit);
             self.s.m.cmp(c, pred::NE, x, zero)
-        });
-        Some((int, signed))
+        }))
     }
 
     /// Title memory at a raw GPU address (decision 0005: the unified-memory
@@ -5202,13 +5207,20 @@ impl<'a> Lower<'a> {
         let c = self.cur;
         let mut halves = Vec::new();
         for x in channels {
-            halves.push(if matches!(numeric, Numeric::Uint | Numeric::Sint) {
-                let m = self.s.m.i32(0xFFFF);
-                self.s.m.bin(c, Bin::And, x, m)
-            } else {
-                let (f, i32t) = (self.as_float(x), self.s.t.i32);
-                self.s
-                    .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f])
+            halves.push(match numeric {
+                Numeric::Uint | Numeric::Sint => {
+                    let m = self.s.m.i32(0xFFFF);
+                    self.s.m.bin(c, Bin::And, x, m)
+                }
+                Numeric::Uscaled | Numeric::Sscaled | Numeric::Unorm | Numeric::Snorm => {
+                    // D16 rounds these formats to nearest even, independently of VALU MODE.
+                    let f = self.as_float(x);
+                    self.narrow16_bits(f, false)
+                }
+                Numeric::Float => {
+                    let f = self.as_float(x);
+                    self.s.op(c, "legacyF32ToF16", Attr::ReadNone, self.s.t.i32, 130, &[f])
+                }
             });
         }
         let mut out = Vec::new();
@@ -9639,7 +9651,7 @@ impl<'a> Lower<'a> {
                 // kind, from the view-stride table) the 16-bit integer, zero-
                 // or sign-extended (stored through the float-typed handle as
                 // loads read: see there).
-                let integer = typed_h.and_then(|h| self.integer_view(h));
+                let integer = typed_h.and_then(|h| self.view_flags(h, [VIEW_INTEGER, VIEW_SIGNED]));
                 let c = self.cur;
                 let mut wide = Vec::new();
                 for k in 0..count {
@@ -9653,7 +9665,7 @@ impl<'a> Lower<'a> {
                         .s
                         .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x]);
                     let mut w = self.as_int(f);
-                    if let Some((int, signed)) = integer {
+                    if let Some([int, signed]) = integer {
                         let (k16, low) = (self.s.m.i32(16), self.s.m.i32(0xFFFF));
                         let zero_ext = self.s.m.bin(c, Bin::And, x, low);
                         let up = self.s.m.bin(c, Bin::Shl, x, k16);
@@ -9846,7 +9858,7 @@ impl<'a> Lower<'a> {
             // passes a mismatched component type (unchanged on the RX 6700
             // XT and WARP, `stride_tests`); an integer-typed second handle
             // for the slot would not rely on it.
-            let integer = typed_h.and_then(|h| self.integer_view(h));
+            let kinds = typed_h.and_then(|h| self.view_flags(h, [VIEW_INTEGER, VIEW_NORMALIZED]));
             let c = self.cur;
             let k16 = self.s.m.i32(16);
             let i32t = self.s.t.i32;
@@ -9857,7 +9869,9 @@ impl<'a> Lower<'a> {
                     let mut h = self
                         .s
                         .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f]);
-                    if let Some((int, _)) = integer {
+                    if let Some([int, normalized]) = kinds {
+                        let rounded = self.narrow16_bits(f, false);
+                        h = self.s.m.select(c, normalized, rounded, h);
                         let bits = self.as_int(f);
                         let low = self.s.m.i32(0xFFFF);
                         let low = self.s.m.bin(c, Bin::And, bits, low);
@@ -11119,6 +11133,16 @@ mod tests {
     }
 
     #[test]
+    fn d16_scaled_buffer_load_uses_portable_rounding() {
+        // tbuffer_load_format_d16_x v0, off, s[8:11], 0 format:16_USCALED
+        let shader = lower_valu(&[0xE848_0000, 0x8022_0000]).unwrap();
+        assert!(
+            !shader.legacy_half_conversion,
+            "D16 load uses host-dependent f32tof16"
+        );
+    }
+
+    #[test]
     fn the_24_bit_multiplies_lower_both_halves() {
         // VOP2 `op v0, v1, v2`: v_mul_i32_i24 and v_mul_u32_u24 (the low
         // dword) and v_mul_hi_i32_i24 and v_mul_hi_u32_u24 (the high one).
@@ -11578,6 +11602,7 @@ mod tests {
         let layout = vec![root(RootType::Table, 0, 0)];
         let l = lower_with(&words, layout, used).unwrap();
         assert_eq!(l.nonuniform_handles, 0);
+        #[cfg(windows)]
         if let Ok(mut v) = super::super::validator::Validator::load(
             super::super::validator::Validator::default_path().as_deref(),
         ) {
@@ -11631,6 +11656,7 @@ mod tests {
         let l = lower_with(&words, layout, used).unwrap();
         // One image handle from the joins' heap index, the same in all lanes.
         assert_eq!(l.nonuniform_handles, 0);
+        #[cfg(windows)]
         if let Ok(mut v) = super::super::validator::Validator::load(
             super::super::validator::Validator::default_path().as_deref(),
         ) {
@@ -11681,6 +11707,7 @@ mod tests {
         // One image handle made in the entry block for both loads, and the
         // UAV's.
         assert_eq!(l.heap_handles, 2);
+        #[cfg(windows)]
         if let Ok(mut v) = super::super::validator::Validator::load(
             super::super::validator::Validator::default_path().as_deref(),
         ) {
