@@ -8772,16 +8772,19 @@ impl<'a> Lower<'a> {
                 let x = addr_at(self, coord_base, *a16, k)?;
                 *slot = to_float(self, *a16, x);
             }
-            if matches!(kind, 5 | 9) {
+            let cube_face = if matches!(kind, 5 | 9) {
                 if *unorm || op == 81 {
                     return Err("a cube sample with texel coordinates or a level query");
                 }
-                let (dir, slice) = self.cube_direction(cs[0], cs[1], cs[2], kind == 9);
+                let (dir, slice, face) = self.cube_direction(cs[0], cs[1], cs[2], kind == 9);
                 cs[..3].copy_from_slice(&dir);
                 if let Some(slice) = slice {
                     cs[3] = slice;
                 }
-            }
+                Some(face)
+            } else {
+                None
+            };
             if *unorm {
                 // Texel coordinates: divided by the size of level 0.
                 let i32t = self.s.t.i32;
@@ -8872,16 +8875,8 @@ impl<'a> Lower<'a> {
                         &args,
                     )
                 }
-                63 if matches!(kind, 5 | 9) => {
-                    // A cube's gradients are the face's: ds, dt per step in x,
-                    // then in y, in face coordinates (a face spans 1). The level
-                    // the hardware picks from them, isotropically: log2 of the
-                    // longer gradient in texels of a face, then the clamp.
-                    // shortcut: sampled at that level, so a sampler's
-                    // anisotropy is lost and its LOD bias comes after the
-                    // clamp (the console adds it before); D3D12 cube sampling
-                    // takes 3D gradients only. Upgrade if cube lookups blur or
-                    // a biased sampler meets a binding clamp.
+                63 if cube_face.is_some() && !lod_clamp => {
+                    // Preserve the isotropic LOD approximation for unclamped cubes.
                     let mut g = [fu; 4];
                     for (k, x) in g.iter_mut().enumerate() {
                         let v = addr_at(self, first + (k / 2) * grad_regs, g16, k % 2)?;
@@ -8907,12 +8902,7 @@ impl<'a> Lower<'a> {
                     let m = self.s.m.bin(c, Bin::Mul, m, w2);
                     let half = self.s.m.f32(0.5f32.to_bits());
                     let l = self.unary(23, m);
-                    let mut lod = self.s.m.bin(c, Bin::Mul, l, half);
-                    if lod_clamp {
-                        let x = addr_at(self, coord_base, *a16, coords)?;
-                        let clamp = to_float(self, *a16, x);
-                        lod = self.binary(35, lod, clamp);
-                    }
+                    let lod = self.s.m.bin(c, Bin::Mul, l, half);
                     args.extend(&os);
                     args.push(lod);
                     self.s.op(
@@ -8925,12 +8915,16 @@ impl<'a> Lower<'a> {
                     )
                 }
                 63 => {
-                    let mut g = vec![fu; 6];
-                    for k in 0..spatial {
+                    let mut g = [fu; 6];
+                    for k in 0..grad_dim {
                         let x = addr_at(self, first, g16, k)?;
                         g[k] = to_float(self, g16, x);
                         let y = addr_at(self, first + grad_regs, g16, k)?;
                         g[3 + k] = to_float(self, g16, y);
+                    }
+                    if let Some(face) = cube_face {
+                        // SampleGrad applies the sampler bias before MinLOD.
+                        g = self.cube_gradients(face, [[g[0], g[1]], [g[3], g[4]]]);
                     }
                     args.extend(&os);
                     args.extend(g);
@@ -9104,52 +9098,6 @@ impl<'a> Lower<'a> {
             self.write(inst, Reg::V(reg + k as u8), x, guard);
         }
         Ok(())
-    }
-
-    /// The direction (and, for `array`, the cube slice) a cube sample's face
-    /// coordinates stand for: the console takes s and t in [1, 2]
-    /// (`v_cubesc`/`v_cubetc` over `|v_cubema|`, plus 1.5) and `8 * slice +
-    /// face` (`v_cubeid`), clamping face ids 6 and 7 to face 5 (-z), which
-    /// the host's cube sampling turns back into the same texel.
-    fn cube_direction(&mut self, s: V, t: V, face: V, array: bool) -> ([V; 3], Option<V>) {
-        let c = self.cur;
-        let k = |l: &mut Self, v: f32| l.s.m.f32(v.to_bits());
-        let (two, three) = (k(self, 2.0), k(self, 3.0));
-        let u = self.s.m.bin(c, Bin::Mul, s, two);
-        let u = self.s.m.bin(c, Bin::Sub, u, three);
-        let v = self.s.m.bin(c, Bin::Mul, t, two);
-        let v = self.s.m.bin(c, Bin::Sub, v, three);
-        let z = self.s.m.f32(0x8000_0000);
-        let (nu, nv) = (
-            self.s.m.bin(c, Bin::Sub, z, u),
-            self.s.m.bin(c, Bin::Sub, z, v),
-        );
-        let (one, mone) = (k(self, 1.0), k(self, -1.0));
-        let idx = self.s.m.cast(c, Cast::FpToUi, face, self.s.t.i32);
-        let seven = self.s.m.i32(7);
-        let f = self.s.m.bin(c, Bin::And, idx, seven);
-        let slice = array.then(|| {
-            let k3 = self.s.m.i32(3);
-            let s = self.s.m.bin(c, Bin::LShr, idx, k3);
-            self.s.m.cast(c, Cast::UiToFp, s, self.s.t.f32)
-        });
-        // Per face +x, -x, +y, -y, +z, -z (6 and 7 clamp to -z on RDNA2).
-        let table = [
-            [one, mone, u, u, u, nu],
-            [nv, nv, one, mone, nv, nv],
-            [nu, u, v, nv, one, mone],
-        ];
-        let dir = table.map(|row| {
-            let mut r = row[0];
-            for (n, &x) in row.iter().enumerate().skip(1) {
-                let kn = self.s.m.i32(n as u32);
-                let p = if n == 5 { pred::IUGE } else { pred::EQ };
-                let is = self.s.m.cmp(c, p, f, kn);
-                r = self.s.m.select(c, is, x, r);
-            }
-            r
-        });
-        (dir, slice)
     }
 
     /// `image_gather4_l(_o)`: DXIL gathers only from a view's first level,

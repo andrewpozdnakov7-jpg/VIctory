@@ -1,5 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
+use super::Lower;
+use crate::emit::bitcode::{Bin, Cast, V, pred};
 use crate::gfx10::{Fields, NULL, Operand};
 use crate::ir::{Inst, Program, Reg, Value};
 use crate::resource::{Address, Resources, Role, Site, Source};
@@ -397,6 +399,70 @@ pub(super) fn cube_arrays(p: &Program, res: &Resources) -> HashSet<Site> {
         }
     }
     out
+}
+
+impl Lower<'_> {
+    /// Transform the face coordinates and return the face used for sampling.
+    pub(super) fn cube_direction(
+        &mut self, s: V, t: V, face: V, array: bool,
+    ) -> ([V; 3], Option<V>, V) {
+        let c = self.cur;
+        let two = self.s.m.f32(2.0f32.to_bits());
+        let three = self.s.m.f32(3.0f32.to_bits());
+        let u = self.s.m.bin(c, Bin::Mul, s, two);
+        let u = self.s.m.bin(c, Bin::Sub, u, three);
+        let v = self.s.m.bin(c, Bin::Mul, t, two);
+        let v = self.s.m.bin(c, Bin::Sub, v, three);
+        let idx = self.s.m.cast(c, Cast::FpToUi, face, self.s.t.i32);
+        let seven = self.s.m.i32(7);
+        let face = self.s.m.bin(c, Bin::And, idx, seven);
+        let slice = array.then(|| {
+            let k3 = self.s.m.i32(3);
+            let s = self.s.m.bin(c, Bin::LShr, idx, k3);
+            self.s.m.cast(c, Cast::UiToFp, s, self.s.t.f32)
+        });
+        let major = [self.s.m.f32(1.0f32.to_bits()), self.s.m.f32((-1.0f32).to_bits())];
+        (self.cube_vector(u, v, face, major), slice, face)
+    }
+
+    /// The tangent derivatives expected by SampleGrad, for a face whose
+    /// major direction is held at ±1. The cube slice has no derivative.
+    pub(super) fn cube_gradients(&mut self, face: V, gradients: [[V; 2]; 2]) -> [V; 6] {
+        let c = self.cur;
+        let two = self.s.m.f32(2.0f32.to_bits());
+        let zero = self.s.m.f32(0);
+        let [dx, dy] = gradients.map(|[s, t]| {
+            let u = self.s.m.bin(c, Bin::Mul, s, two);
+            let v = self.s.m.bin(c, Bin::Mul, t, two);
+            self.cube_vector(u, v, face, [zero; 2])
+        });
+        [dx[0], dx[1], dx[2], dy[0], dy[1], dy[2]]
+    }
+
+    fn cube_vector(&mut self, u: V, v: V, face: V, [positive, negative]: [V; 2]) -> [V; 3] {
+        let c = self.cur;
+        let z = self.s.m.f32(0x8000_0000);
+        let (nu, nv) = (
+            self.s.m.bin(c, Bin::Sub, z, u),
+            self.s.m.bin(c, Bin::Sub, z, v),
+        );
+        // +x, -x, +y, -y, +z, -z. Faces 6 and 7 clamp to -z on RDNA2.
+        let table = [
+            [positive, negative, u, u, u, nu],
+            [nv, nv, positive, negative, nv, nv],
+            [nu, u, v, nv, positive, negative],
+        ];
+        table.map(|row| {
+            let mut r = row[0];
+            for (n, &x) in row.iter().enumerate().skip(1) {
+                let kn = self.s.m.i32(n as u32);
+                let p = if n == 5 { pred::IUGE } else { pred::EQ };
+                let is = self.s.m.cmp(c, p, face, kn);
+                r = self.s.m.select(c, is, x, r);
+            }
+            r
+        })
+    }
 }
 
 #[cfg(test)]

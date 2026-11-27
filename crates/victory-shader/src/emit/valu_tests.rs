@@ -2816,12 +2816,127 @@ fn build_cube_cs(body: &[u32], uav_dwords: u8) -> HostShader {
 /// Runs `shader` on every SM 6.6 adapter (`Host::adapters`, including hardware
 /// GPUs and WARP) with `srv` at heap index 0 and a raw UAV of `uav_dwords` at
 /// heap index 1.
+/// A sampler's mip bias must be applied before the cube sample's explicit
+/// minimum LOD. Each texel encodes its face and mip so the readback reveals
+/// both the selected face and the trilinear blend between mip levels.
+#[test]
+fn cube_gradient_lod_bias_precedes_explicit_min_lod() {
+    use windows::Win32::Graphics::Direct3D12::*;
+
+    let mut words = vec![s_mov_b32(5, 0x80), s_mov_b32(7, 0x80)];
+    for (op, dst, base, offset) in [(3u32, 8u32, 4u32, 0u32), (2, 20, 4, 0x20), (2, 16, 6, 0)] {
+        words.extend([
+            0x3D << 26 | op << 18 | dst << 6 | base >> 1,
+            125 << 25 | offset,
+        ]);
+    }
+    // Derivatives span eight texels in x and one in y on a 32x32 face.
+    for (reg, value) in [(1, 0.25f32), (2, 0.0), (3, 0.0), (4, 0.03125)] {
+        words.extend([vop1(0x001, reg, 255), value.to_bits()]);
+    }
+    words.push(vop1(0x001, 7, sgpr(0)));
+    words.push(0x1A << 25 | 31 << 17 | 133); // v_lshlrev_b32 v31, 5, v0
+    // At the face center and off-center, sample with no clamp and with two
+    // different clamps. Both positive and negative biases can trigger it.
+    for (s, t, first) in [(1.5f32, 1.5f32, 9u8), (1.25, 1.75, 12)] {
+        words.extend([
+            vop1(0x001, 5, 255),
+            s.to_bits(),
+            vop1(0x001, 6, 255),
+            t.to_bits(),
+        ]);
+        for (op, result, clamp) in [
+            (0x22, first, 0.0f32),
+            (0x23, first + 1, 1.5),
+            (0x23, first + 2, 3.5),
+        ] {
+            words.extend([vop1(0x001, 8, 255), clamp.to_bits()]);
+            words.extend([
+                0xF000_0118 | op << 18,
+                1 | u32::from(result) << 8 | 2 << 16 | 4 << 21,
+            ]);
+            let [lo, hi] = buffer_store_dword(result, 20, 4 * u16::from(result - 9));
+            words.extend([lo | 1 << 12, hi | 31]); // offen: disjoint 32-byte lane records
+        }
+    }
+    words.push(S_ENDPGM);
+    let shader = lower_cs32(
+        &words,
+        &[
+            (4, ResourceType::Srv, 0, 8),
+            (4, ResourceType::Uav, 8, 4),
+            (6, ResourceType::Sampler, 0, 4),
+        ],
+        true,
+    );
+
+    let mut texels = Vec::new();
+    for face in 0..6 {
+        for mip in 0..6 {
+            let size = 32 >> mip;
+            texels.extend(vec![[(10 * face + mip) as f32; 4]; size * size]);
+        }
+    }
+    let views = [View::MippedCube(32, 6, &texels), View::RawUav(32 * 8)];
+    let linear = D3D12_SAMPLER_DESC {
+        Filter: D3D12_FILTER_MIN_MAG_MIP_LINEAR,
+        AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        MaxAnisotropy: 1,
+        MaxLOD: f32::MAX,
+        ..Default::default()
+    };
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut ran = false;
+    for warp in [false, true] {
+        let Ok(host) = Host::new(warp) else { continue };
+        ran = true;
+        let (root, pso) = host.compute_pipeline(&shader).unwrap();
+        for face in 0..6 {
+            let data = user_data_cs32(&shader, (face as f32).to_bits());
+            for bias in [0.0f32, 1.0, -2.0] {
+                let sampler = D3D12_SAMPLER_DESC {
+                    MipLODBias: bias,
+                    ..linear
+                };
+                let out = host
+                    .dispatch(
+                        &root,
+                        &pso,
+                        &Dispatch {
+                            roots: vec![(0, Root::Constants(data.clone()))],
+                            views: &views,
+                            samplers: &[sampler],
+                            groups: [1, 1, 1],
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(out[0].len(), 32 * 8);
+                let lod = 3.0 + bias;
+                let expected = [lod, lod.max(1.5), lod.max(3.5)];
+                for (lane, record) in out[0].as_chunks::<8>().0.iter().enumerate() {
+                    for (sample, &bits) in record[..6].iter().enumerate() {
+                        let got = f32::from_bits(bits);
+                        let want = 10.0 * face as f32 + expected[sample % 3];
+                        assert!(
+                            (got - want).abs() <= 0.02,
+                            "warp {warp}, face {face}, bias {bias}, lane {lane}, sample {sample}: {got} vs {want}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    assert!(ran, "no SM 6.6 device");
+}
+
 fn run_cube_cases(
     shader: &HostShader,
     srv: View,
     uav_dwords: u32,
     cases: &[[u32; 4]],
-    mut check: impl FnMut(&str, usize, [u32; 4], &[u32]),
+    check: impl FnMut(&str, usize, [u32; 4], &[u32]),
 ) {
     use windows::Win32::Graphics::Direct3D12::*;
     let samplers = [D3D12_SAMPLER_DESC {
@@ -2833,6 +2948,17 @@ fn run_cube_cases(
         MaxLOD: f32::MAX,
         ..Default::default()
     }];
+    run_cube_cases_with_samplers(shader, srv, uav_dwords, cases, &samplers, check);
+}
+
+fn run_cube_cases_with_samplers(
+    shader: &HostShader,
+    srv: View,
+    uav_dwords: u32,
+    cases: &[[u32; 4]],
+    samplers: &[windows::Win32::Graphics::Direct3D12::D3D12_SAMPLER_DESC],
+    mut check: impl FnMut(&str, usize, [u32; 4], &[u32]),
+) {
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let adapters = Host::adapters();
     assert!(
@@ -2861,12 +2987,84 @@ fn run_cube_cases(
                     &Dispatch {
                         roots: vec![(0, Root::Constants(ud))],
                         views: &views,
-                        samplers: &samplers,
+                        samplers,
                         groups: [1, 1, 1],
                     },
                 )
                 .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
             check(label, i, inputs, &out[0]);
+        }
+    }
+}
+
+#[test]
+fn cube_array_gradient_bias_precedes_the_lod_clamp() {
+    use windows::Win32::Graphics::Direct3D12::*;
+
+    let mut texels = Vec::new();
+    for face in 0..12 {
+        for mip in 0..6 {
+            let size = 32 >> mip;
+            let tag = (10 * face + mip) as f32;
+            texels.extend(std::iter::repeat_n([tag; 4], size * size));
+        }
+    }
+    let linear = D3D12_SAMPLER_DESC {
+        Filter: D3D12_FILTER_MIN_MAG_MIP_LINEAR,
+        AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        MaxAnisotropy: 1,
+        MaxLOD: f32::MAX,
+        ..Default::default()
+    };
+    for (face, face16, physical_face) in [(10.0f32, 0x4900, 8), (15.0, 0x4b80, 11)] {
+        for (g16, a16) in [(false, false), (false, true), (true, false), (true, true)] {
+            let mut addr = if g16 {
+                vec![0x3400, 0x2800_0000]
+            } else {
+                [0.25f32, 0.0, 0.0, 0.03125].map(f32::to_bits).to_vec()
+            };
+            if a16 {
+                addr.extend([0x3d80_3e80, 0x4300_0000 | face16]);
+            } else {
+                addr.extend([1.625, 1.375, face, 3.5].map(f32::to_bits));
+            }
+            let mut words = gradient_sample_program(0x23 | u32::from(g16) << 7, 3, a16, &addr);
+            words.insert(0, vop1(0x001, 21, vgpr(0))); // Save the lane before loading the address.
+            words.truncate(words.len() - 3);
+            let [store, operands] = buffer_store_dword(20, 20, 0);
+            words.extend([
+                0x1A << 25 | 22 << 17 | 21 << 9 | 130, // v_lshlrev_b32 v22, 2, v21
+                store | 1 << 12,
+                operands | 22,
+                S_ENDPGM,
+            ]);
+            let shader = lower_cs32(&words, &GRADIENT_BINDINGS, true);
+            for (bias, mip) in [(1.0, 4.0), (-2.0, 3.5)] {
+                let sampler = D3D12_SAMPLER_DESC {
+                    MipLODBias: bias,
+                    ..linear
+                };
+                let expected = 10.0 * physical_face as f32 + mip;
+                run_cube_cases_with_samplers(
+                    &shader,
+                    View::CubeArray(32, 2, 6, &texels),
+                    32,
+                    &[[0; 4]],
+                    &[sampler],
+                    |backend, _, _, words| {
+                        assert_eq!(words.len(), 32);
+                        for (lane, &value) in words.iter().enumerate() {
+                            let got = f32::from_bits(value);
+                            assert!(
+                                (got - expected).abs() < 0.001,
+                                "{backend}: face={face} g16={g16} a16={a16} bias={bias} lane={lane}: {got}, want {expected}"
+                            );
+                        }
+                    },
+                );
+            }
         }
     }
 }
