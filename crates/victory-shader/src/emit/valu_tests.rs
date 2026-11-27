@@ -79,6 +79,10 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
 }
 
 fn try_build_valu_cs(body: &[u32]) -> Result<HostShader, crate::ShaderError> {
+    try_build_valu_cs_in_wave(body, false)
+}
+
+fn try_build_valu_cs_in_wave(body: &[u32], wave64: bool) -> Result<HostShader, crate::ShaderError> {
     let mut words = Vec::new();
     // s[4:5] = descriptor table address (heap index 0 -> byte offset 0).
     words.push(s_mov_b32(5, 0x80)); // inline constant 0
@@ -95,7 +99,7 @@ fn try_build_valu_cs(body: &[u32]) -> Result<HostShader, crate::ShaderError> {
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
     let native = NativeProgram {
         stage: HwStage::Cs,
-        wave64: false,
+        wave64,
         vgprs: 16,
         layout: vec![
             RootParam {
@@ -233,6 +237,66 @@ fn run_cases(
         ran += 1;
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+#[test]
+fn read_fp_round_mode_field_after_each_setting() {
+    // S_ROUND_MODE writes both two-bit rounding fields. Give FP32 a
+    // different value so reading the wrong field cannot pass.
+    for mode in 0..4 {
+        let set_round_mode = 0xBFA4_0000 | (mode << 2) | (mode ^ 3);
+        for (offset, width, expected) in [(2, 2, mode), (2, 1, mode & 1), (3, 1, mode >> 1)] {
+            // S_GETREG_B32 s12, hwreg(MODE, offset, width).
+            let get_mode = 0xB90C_0001 | (offset << 6) | ((width - 1) << 11);
+            let body = [set_round_mode, get_mode, vop1(0x001, 0, sgpr(12))];
+            let shader = try_build_valu_cs(&body).unwrap_or_else(|error| {
+                panic!("S_GETREG_B32 MODE {offset}:{width} with rounding {mode}: {error}");
+            });
+            run_cases(&shader, &[[0; 4]], |backend, _, _, got| {
+                assert_eq!(
+                    got, expected,
+                    "{backend} MODE {offset}:{width} with rounding {mode}"
+                );
+            });
+        }
+    }
+}
+
+#[test]
+fn read_fp_round_mode_written_inside_a_whole_wave_section() {
+    let shader = build_valu_cs(&[
+        0xBE8D_3DC1,            // s_or_saveexec_b32 s13, -1
+        0xBFA4_000C,            // s_round_mode: binary16 and binary64 toward zero
+        s_mov_b32(ir::EXEC, 13), // restore exec_lo
+        0xB90C_0881,            // s_getreg_b32 s12, hwreg(MODE, 2, 2)
+        vop1(0x001, 0, sgpr(12)),
+    ]);
+    run_cases(&shader, &[[0; 4]], |backend, _, _, got| {
+        assert_eq!(got, 3, "{backend}");
+    });
+}
+
+#[test]
+fn read_fp_round_mode_cannot_write_architectural_masks() {
+    for (dst, wave64) in [
+        (ir::EXEC, false),
+        (ir::EXEC + 1, true),
+        (ir::VCC, false),
+        (ir::VCC + 1, true),
+    ] {
+        let error = try_build_valu_cs_in_wave(&[0xB900_0881 | u32::from(dst) << 16], wave64)
+            .expect_err("a MODE read into EXEC or VCC must be refused");
+        assert!(
+            matches!(
+                error,
+                crate::ShaderError::Unsupported {
+                    what: "a hardware register read into EXEC or VCC",
+                    ..
+                }
+            ),
+            "{dst}: {error:?}"
+        );
+    }
 }
 
 #[test]
@@ -623,10 +687,10 @@ fn sqrt_f64_uses_mode_written_in_whole_wave_section() {
 #[test]
 fn sqrt_f64_keeps_the_input_denorm_mode_across_output_only_changes() {
     let instruction = [vop1(0x034, 6, vgpr(1))];
-    let inputs = [1, 4.0f64.to_bits()];
+    let inputs = [1, 2, 4.0f64.to_bits()];
     let output_only = [0xBA80_01C1, 0]; // s_setreg_imm32_b32 hwreg(MODE, 7, 1), 0
     let join = [
-        0xBF06_8002, // s_cmp_eq_u32 s2, 0
+        0xBF06_8100, // s_cmp_eq_u32 s0, 1 (the subnormals take different paths)
         0xBF85_0002, // s_cbranch_scc1 -> preserve both input and output
         0xBFA5_0004, // s_denorm_mode: preserve only FP16/FP64 inputs
         0xBF82_0001, // s_branch -> join
