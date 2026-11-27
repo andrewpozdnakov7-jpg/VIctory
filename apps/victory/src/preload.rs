@@ -75,10 +75,15 @@ fn stagnant_after(before: usize, after: usize, previous: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{STAGNANT_LIMIT, count_keys, stagnant_after};
+    use super::{STAGNANT_LIMIT, count_keys, run, stagnant_after};
 
     fn temp_file(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!("victory-preload-{}-{name}", std::process::id()))
+    }
+
+    #[test]
+    fn zero_attempts_are_refused_before_any_child_starts() {
+        assert!(run(&[], None, 0).is_err());
     }
 
     #[test]
