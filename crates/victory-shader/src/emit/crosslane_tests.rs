@@ -1293,3 +1293,255 @@ fn wave64_mask_operation_scc_reads_both_dwords() {
         assert_eq!(out[0][..64], [want; 64], "lanes above {above}");
     }
 }
+
+// ---- one lane of a whole-wave section's value, read after the section ----
+
+/// The OR reduction of `1 << lane` the console compiler writes with DPP
+/// steps over each row, then adds row 0's result (lane 0) into every lane,
+/// so that only row 1 holds the whole wave's: read at lane 31 after EXEC
+/// is restored. Run under a branch on three of four lanes, so the
+/// reduction covers only those (0x77777777); with a row dropped it would
+/// be half of that, with the inactive lanes counted 0xFFFFFFFF.
+#[test]
+fn whole_wave_section_read_at_one_lane_after_it_on_gpu() {
+    let dpp_or = |ctrl: u16| {
+        [
+            0x1C << 25 | 7 << 17 | 7 << 9 | 0xFA, // v_or_b32 v7, v7, v7 (DPP16)
+            dpp16_word(7, ctrl, 0xF, 0xF, false, false),
+        ]
+    };
+    let mut w = vec![
+        0x7E00_0000 | 6 << 17 | 0x01 << 9 | 0x81,  // v_mov_b32 v6, 1
+        0x1A << 25 | 6 << 17 | 6 << 9 | 256,       // v_lshlrev_b32 v6, v0, v6
+        0xBE80_0000 | 14 << 16 | 0x3D << 8 | 0xC1, // s_or_saveexec_b32 s14, -1
+        0xD501_0007,                               // v_cndmask_b32 v7, 0, v6, s14
+        0x80 | (256 + 6) << 9 | 14 << 18,
+    ];
+    // quad_perm [1,0,3,2], [2,3,0,1], row_half_mirror, row_mirror
+    for ctrl in [0x0B1, 0x04E, 0x141, 0x140] {
+        w.extend(dpp_or(ctrl));
+    }
+    w.extend([
+        0xD760_000F, // v_readlane_b32 s15, v7, 0
+        (256 + 7) | 0x80 << 9,
+        0x1C << 25 | 7 << 17 | 7 << 9 | 15, // v_or_b32 v7, s15, v7
+        s_mov_b32(EXEC_LO, 14),
+        0xD760_000F, // v_readlane_b32 s15, v7, 31
+        (256 + 7) | (0x80 + 31) << 9,
+        0x7E00_0000 | 2 << 17 | 0x01 << 9 | 15, // v_mov_b32 v2, s15
+    ]);
+    let exec = MaskPattern::ThreeOfFour.mask();
+    let want: [u32; 32] = std::array::from_fn(|l| {
+        if exec >> l & 1 != 0 {
+            exec
+        } else {
+            lane_v2_old(l as u32)
+        }
+    });
+    let items = [(
+        "an OR reduction read at lane 31 (branched, 0x77777777)",
+        build_wave32_cs(MaskPattern::ThreeOfFour, Divergence::Branched, &w),
+        want,
+    )];
+    check_cases("section lane read", &items);
+}
+
+/// The wave64 form: each half reduced with DPP and `v_permlanex16_b32`,
+/// then the low half's result (lane 0) added into every lane, so that
+/// only the high half holds the whole wave's, read at lane 63 after the
+/// section. The lanes with `lane & 2 == 0` run it on `1 << (lane >> 1)`:
+/// 0x55555555. Run where the host has 64-lane waves, else lowered and
+/// validated only.
+#[test]
+fn wave64_section_read_at_lane_63_after_it() {
+    check_wave64_section_read_at_lane_63(false);
+}
+
+// The first true comparison is in lane 63 at iteration 2. The loop's
+// mask SCC has to see the high dword, then the section must read lane 63
+// after EXEC is restored. Both results reach the same GPU output.
+#[test]
+fn wave64_mask_poll_before_section_lane_read() {
+    check_wave64_section_read_at_lane_63(true);
+}
+
+fn check_wave64_section_read_at_lane_63(poll: bool) {
+    let dpp_or = |ctrl: u16| {
+        [
+            0x1C << 25 | 7 << 17 | 7 << 9 | 0xFA,
+            dpp16_word(7, ctrl, 0xF, 0xF, false, false),
+        ]
+    };
+    let mut body = vec![
+        0xBE80_0000 | 14 << 16 | 0x25 << 8 | 0xC1, // s_or_saveexec_b64 s[14:15], -1
+        0xD501_0007,                               // v_cndmask_b32 v7, 0, v6, s[14:15]
+        0x80 | (256 + 6) << 9 | 14 << 18,
+    ];
+    for ctrl in [0x0B1, 0x04E, 0x141, 0x140] {
+        body.extend(dpp_or(ctrl));
+    }
+    body.extend([
+        0xD778_0003, // v_permlanex16_b32 v3, v7, 0, 0
+        (256 + 7) | 0x80 << 9 | 0x80 << 18,
+        0x1C << 25 | 7 << 17 | 7 << 9 | (256 + 3), // v_or_b32 v7, v3, v7
+        0xD760_0010,                               // v_readlane_b32 s16, v7, 0
+        (256 + 7) | 0x80 << 9,
+        0x1C << 25 | 7 << 17 | 7 << 9 | 16, // v_or_b32 v7, s16, v7
+        0xBE80_0000 | u32::from(EXEC_LO) << 16 | 0x04 << 8 | 14, // s_mov_b64 exec, s[14:15]
+        0xD760_0010,                        // v_readlane_b32 s16, v7, 63
+        (256 + 7) | (0x80 + 63) << 9,
+        0x7E00_0000 | 2 << 17 | 0x01 << 9 | 16, // v_mov_b32 v2, s16
+    ]);
+    if poll {
+        body.push(0x25 << 25 | 2 << 17 | 2 << 9 | 22); // v_add_nc_u32 v2, s22, v2
+    }
+    let mut w = vec![s_mov_b32(1, 0x80)];
+    w.extend_from_slice(&s_load_dwordx4(4, 0));
+    if poll {
+        w.extend([
+            0x26 << 25 | 4 << 17 | u32::from(INLINE_64), // v_sub_nc_u32 v4, 64, v0
+            sop1(S_MOV_B32, 22, INLINE_0),
+        ]);
+        let iteration = [
+            sop2(S_ADD_U32, 22, 22, INLINE_1),
+            vopc(V_CMP_GT_U32, 22, 4),
+            sop2(S_AND_B64, 20, VCC_LO, EXEC_LO),
+            sop2(S_CSELECT_B32, 24, INLINE_0, INLINE_MINUS_1),
+            sopc(S_CMP_GE_U32, 22, INLINE_64),
+            sop2(S_CSELECT_B32, 23, INLINE_MINUS_1, INLINE_0),
+            sop2(S_ORN2_B32, 23, 23, 24),
+        ];
+        w.extend(iteration);
+        let back = -(iteration.len() as i16 + 1);
+        w.push(0xBF84_0000 | u32::from(back as u16)); // s_cbranch_scc0
+    }
+    w.extend([
+        0x7E00_0000 | 2 << 17 | 0x01 << 9 | 0x87,  // v_mov_b32 v2, 7
+        0x7E00_0000 | 6 << 17 | 0x01 << 9 | 0x81,  // v_mov_b32 v6, 1
+        0x16 << 25 | 5 << 17 | 0x81,               // v_lshrrev_b32 v5, 1, v0
+        0x1A << 25 | 6 << 17 | 6 << 9 | (256 + 5), // v_lshlrev_b32 v6, v5, v6
+        v_and_b32_imm(4, 2, 0),
+        v_cmp_eq_u32_imm(0, 4),
+        0xBE80_0000 | 12 << 16 | 0x24 << 8 | u32::from(VCC_LO), // s_and_saveexec_b64 s[12:13], vcc
+        s_cbranch_execz(body.len() as i16),
+    ]);
+    w.extend(body);
+    w.extend([
+        0x8000_0000 | 0x11 << 23 | u32::from(EXEC_LO) << 16 | 12 << 8 | u32::from(EXEC_LO), // s_or_b64 exec, exec, s[12:13]
+        v_lshlrev_b32_imm(5, 2, 0),
+    ]);
+    w.extend_from_slice(&buffer_store_dword_offen(2, 5, 4));
+    w.push(S_ENDPGM);
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: true,
+        vgprs: 8,
+        layout: vec![RootParam {
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data: 0,
+            slot: 0,
+        }],
+        used: vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        }],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 1 << 1,
+            threads: [64, 1, 1],
+        }),
+        code: w.iter().flat_map(|x| x.to_le_bytes()).collect(),
+    };
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let lowered = lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+        view_marks: false,
+    })
+    .expect("lower");
+    let shader = HostShader {
+        stage: HwStage::Cs,
+        dxil: lowered.dxil,
+        user_data: lowered.user_data,
+        samplers: lowered.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: lowered.root_cbvs,
+        root_srvs: lowered.root_srvs,
+        root_uavs: lowered.root_uavs,
+        memory: lowered.memory,
+        memory_writes: lowered.memory_writes,
+        view_addresses: lowered.view_addresses,
+        heap: lowered.heap,
+        heap_writes: lowered.heap_writes,
+        view_marks: lowered.view_marks,
+    };
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil.clone())
+            .expect("DXIL validation failed");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; skipped");
+        return;
+    };
+    let mut opts1 = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+    // SAFETY: a capability query on a live device, into a structure of the
+    // size given.
+    let queried = unsafe {
+        host.device.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS1,
+            (&raw mut opts1).cast(),
+            size_of_val(&opts1) as u32,
+        )
+    };
+    if queried.is_err() || !opts1.WaveOps.as_bool() || opts1.WaveLaneCountMax < 64 {
+        eprintln!("hardware device runs no 64-lane waves; lowered and validated only");
+        return;
+    }
+    let (root, pso) = host.compute_pipeline(&shader).expect("compute_pipeline");
+    let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+    for u in &shader.user_data {
+        assert_eq!(u.root, RootType::Table);
+        ud[u.index as usize] = 0;
+    }
+    let out = host
+        .dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![(0, Root::Constants(ud))],
+                views: &[View::RawUav(64)],
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        )
+        .expect("dispatch");
+    let reduction = 0x5555_5555 + if poll { 2 } else { 0 };
+    let want: Vec<u32> = (0..64)
+        .map(|l| if l & 2 == 0 { reduction } else { 7 })
+        .collect();
+    assert_eq!(out[0][..64], want[..]);
+    if poll {
+        println!("Wave64 poll and section readback matched all 64 lanes");
+    }
+}
