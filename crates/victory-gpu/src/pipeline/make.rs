@@ -106,16 +106,30 @@ impl Pending {
     }
 }
 
+/// What identifies a title pipeline across runs: its shader stage/hash pairs
+/// and graphics state.
+pub(crate) fn key_from_hashes<'a>(
+    shaders: impl IntoIterator<Item = (&'static str, &'a str)>,
+    graphics: Option<&GraphicsState>,
+) -> String {
+    let mut key = blake3::Hasher::new();
+    for (stage, hash) in shaders {
+        key.update(stage.as_bytes());
+        key.update(hash.as_bytes());
+    }
+    if let Some(g) = graphics {
+        key.update(g.describe().as_bytes());
+    }
+    key.finalize().to_hex()[..32].to_owned()
+}
+
 /// What identifies a title pipeline across runs: its shader containers
 /// and graphics state.
 pub(crate) fn key(shaders: &[Arc<Shader>], graphics: Option<&GraphicsState>) -> String {
-    let mut key = blake3::Hasher::new();
-    for s in shaders {
-        key.update(s.stage.as_bytes());
-        key.update(s.hash.as_bytes());
-    }
-    key.update(graphics.map(|g| g.describe()).unwrap_or_default().as_bytes());
-    key.finalize().to_hex()[..32].to_owned()
+    key_from_hashes(
+        shaders.iter().map(|s| (s.stage, s.hash.as_str())),
+        graphics,
+    )
 }
 
 /// Why a pipeline has no host pipeline (diagnostics): its shaders that do
