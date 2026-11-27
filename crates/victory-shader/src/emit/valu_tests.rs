@@ -2306,3 +2306,50 @@ fn v_mul_legacy_f32_treats_denormals_as_zero() {
         );
     });
 }
+
+/// Correcting the midpoint must leave the final narrowing to the FP16 MODE.
+#[test]
+fn v_exp_f16_midpoint_preserves_round_to_zero() {
+    let mut abs = vop3(0x1D8, 0, vgpr(1), 0, 0);
+    abs[0] |= 1 << 8;
+    let mut neg = vop3(0x1D8, 0, vgpr(1), 0, 0);
+    neg[1] |= 1 << 29;
+    let mut clamp = vop3(0x1D8, 0, vgpr(1), 0, 0);
+    clamp[0] |= 1 << 15;
+
+    let variants = [
+        ("plain", vec![vop1(0x058, 0, vgpr(1))], 0x11C5, false),
+        ("abs", abs.to_vec(), 0x91C5, false),
+        ("neg", neg.to_vec(), 0x91C5, false),
+        ("clamp", clamp.to_vec(), 0x11C5, true),
+    ];
+    let mut wrong = [0; 2];
+    let mut checked = 0;
+    for (slot, (mode, midpoint)) in [(0, 0x3C01), (3, 0x3C00)].into_iter().enumerate() {
+        for (name, words, input, clamped) in &variants {
+            let mut shader_words = vec![0xBFA4_0000 | (mode << 2)];
+            shader_words.extend(words);
+            let shader = build_valu_cs(&shader_words);
+            run_cases(
+                &shader,
+                &[[*input, 0, 0, 0], [0, 0, 0, 0]],
+                |backend, index, _, got| {
+                    let expected = if *clamped || index == 1 {
+                        0x3C00
+                    } else {
+                        midpoint
+                    };
+                    if got != expected {
+                        wrong[slot] += 1;
+                        eprintln!(
+                            "{backend}: mode {mode}, {name}: got {got:#06x}, expected {expected:#06x}"
+                        );
+                    }
+                    checked += 1;
+                },
+            );
+        }
+    }
+    eprintln!("exp midpoint: {checked} readbacks, wrong={wrong:?}");
+    assert_eq!(wrong, [0, 0]);
+}
