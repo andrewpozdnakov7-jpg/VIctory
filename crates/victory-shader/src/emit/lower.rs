@@ -2220,7 +2220,10 @@ impl<'a> Lower<'a> {
     // shortcut: rounding toward +-infinity, or a mode not known at this
     // point (paths that set it differently join), rounds to nearest even.
     fn narrow16(&mut self, f: V) -> V {
-        let rtz = self.mode16 == Some(3);
+        self.narrow16_rounded(f, self.mode16 == Some(3))
+    }
+
+    fn narrow16_rounded(&mut self, f: V, rtz: bool) -> V {
         let c = self.cur;
         let x = self.as_int(f);
         let k = |l: &mut Self, v: u32| l.s.m.i32(v);
@@ -2257,28 +2260,24 @@ impl<'a> Lower<'a> {
         let s = self.s.m.bin(c, Bin::Sub, k126, e);
         let far = self.s.m.cmp(c, pred::IUGT, s, k31);
         let s = self.s.m.select(c, far, k31, s);
-        let (frac, hidden, zero) = (k(self, 0x7F_FFFF), k(self, 0x80_0000), k(self, 0));
+        let (frac, hidden) = (k(self, 0x7F_FFFF), k(self, 0x80_0000));
         let mant = self.s.m.bin(c, Bin::And, a, frac);
+        // The clamped shift of 31 gives zero for f32 denormals even with
+        // the implicit leading bit and the rounding bias below.
         let mant = self.s.m.bin(c, Bin::Or, mant, hidden);
-        let f32_denormal = self.s.m.cmp(c, pred::EQ, e, zero);
-        let mant = self.s.m.select(c, f32_denormal, zero, mant);
         let q = self.s.m.bin(c, Bin::LShr, mant, s);
         let den = if rtz {
             q
         } else {
             let one = k(self, 1);
-            let s1 = self.s.m.bin(c, Bin::Sub, s, one);
-            let half = self.s.m.bin(c, Bin::LShr, mant, s1);
-            let half = self.s.m.bin(c, Bin::And, half, one);
-            let below = self.s.m.bin(c, Bin::Shl, one, s1);
-            let below = self.s.m.bin(c, Bin::Sub, below, one);
-            let rest = self.s.m.bin(c, Bin::And, mant, below);
-            let rest = self.s.m.cmp(c, pred::NE, rest, zero);
-            let rest = self.s.m.cast(c, Cast::ZExt, rest, self.s.t.i32);
+            let unit = self.s.m.bin(c, Bin::Shl, one, s);
+            let half = self.s.m.bin(c, Bin::LShr, unit, one);
+            let bias = self.s.m.bin(c, Bin::Sub, half, one);
+            // At the midpoint, increment only if the retained bit is odd.
             let lsb = self.s.m.bin(c, Bin::And, q, one);
-            let tie = self.s.m.bin(c, Bin::Or, rest, lsb);
-            let up = self.s.m.bin(c, Bin::And, half, tie);
-            self.s.m.bin(c, Bin::Add, q, up)
+            let rounded = self.s.m.bin(c, Bin::Add, mant, bias);
+            let rounded = self.s.m.bin(c, Bin::Add, rounded, lsb);
+            self.s.m.bin(c, Bin::LShr, rounded, s)
         };
         let min_normal = k(self, 0x3880_0000);
         let small = self.s.m.cmp(c, pred::IULT, a, min_normal);
@@ -6987,7 +6986,18 @@ impl<'a> Lower<'a> {
             if v.clamp {
                 f = l.unary(7, f);
             }
-            let h = l.narrow16(f);
+            // RDNA2 rounds these instructions to nearest even in every FP_ROUND mode.
+            let rounds_to_nearest = matches!(
+                name,
+                "v_rcp_f16"
+                    | "v_sqrt_f16"
+                    | "v_rsq_f16"
+                    | "v_log_f16"
+                    | "v_exp_f16"
+                    | "v_sin_f16"
+                    | "v_cos_f16"
+            );
+            let h = l.narrow16_rounded(f, !rounds_to_nearest && l.mode16 == Some(3));
             l.write_half(inst, h, guard)
         };
         if name == "v_cvt_f16_f32" {

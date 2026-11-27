@@ -2981,7 +2981,15 @@ fn f16_results_round_as_the_mode_says() {
     body.extend(setreg(0));
     body.push(vop1(0x0A, 6, v(1)));
     let narrow = |x: u32, rtz: bool| to_f16(f64::from(fl(ftz(x))), rtz);
-    assert_clean(check(&[probe(body, unary(F32_EDGES), F16, move |i| {
+    let mut inputs = unary(F32_EDGES);
+    // Halfway to the first subnormal, odd and even retained bits,
+    // and the midpoint between the last subnormal and the first normal.
+    for midpoint in [0x3300_0000, 0x33C0_0000, 0x3420_0000, 0x387F_E000] {
+        for x in [midpoint - 1, midpoint, midpoint + 1] {
+            inputs.extend([[x, 0, 0, OLD], [x | 0x8000_0000, 0, 0, OLD]]);
+        }
+    }
+    assert_clean(check(&[probe(body, inputs, F16, move |i| {
         vec![
             i[3] & 0xFFFF_0000 | narrow(i[0], true),
             i[3] & 0xFFFF_0000 | narrow(i[0], false),
