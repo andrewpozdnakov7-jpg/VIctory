@@ -2368,6 +2368,40 @@ mod tests {
         }
     }
 
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
+    #[ignore = "run alone because texture counters are process-wide"]
+    fn texture_frame_report_distinguishes_live_and_indexed_bytes() {
+        let backing = vec![0u8; 2 * 256 * 256 * 4];
+        let first = backing.as_ptr() as u64;
+        let second = first + (256 * 256 * 4);
+        let baseline = texture_counts();
+        let small = texture(256, 256, 28, 1);
+        let null = std::ptr::null();
+        let old = shared_texture(first, &small, 0, null).expect("initial texture");
+        let gpu_desc = ResourceDesc { flags: UNORDERED, ..small };
+        let current = shared_texture(first, &gpu_desc, 0, null).expect("replacement texture");
+        let other = shared_texture(second, &small, 0, null).expect("other indexed texture");
+        let unindexed = make_texture(&texture(1024, 256, 28, 1), 0, null)
+            .expect("unindexed texture");
+        assert!(!std::sync::Arc::ptr_eq(&old, &current));
+        let census = texture_census();
+        let total = texture_counts();
+        assert_eq!(total.0 - baseline.0, 4);
+        assert_eq!(total.1 - baseline.1, 1_835_008);
+        assert_eq!(census, [[0, 0, 262_144], [0, 0, 262_144]]);
+        let reports = crate::host::capture_test_frame_texture_report();
+        for line in &reports {
+            eprintln!("{line}");
+        }
+        assert!(reports.iter().any(|line| line.starts_with("live host textures: 4 (2 MB,")));
+        assert!(reports.iter().any(|line| line.starts_with("host textures in the title-memory index: 1 MB")
+            && line.ends_with("GPU-written 0 0 0, from title memory 0 0 0")));
+        drop((old, current, other, unindexed));
+        assert_eq!(texture_counts().1, baseline.1);
+        assert_eq!(texture_census(), [[0; 3]; 2]);
+    }
+
     fn heap(size: u64) -> This {
         let desc = HeapDesc {
             size,

@@ -3179,6 +3179,44 @@ impl Meter {
     }
 }
 
+#[cfg(all(test, feature = "diagnostics"))]
+pub(crate) fn capture_test_frame_texture_report() -> Vec<String> {
+    #[derive(Clone, Default)]
+    struct Reports(std::sync::Arc<Mutex<Vec<String>>>);
+
+    impl tracing::field::Visit for Reports {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.0.lock().unwrap().push(format!("{value:?}"));
+            }
+        }
+    }
+
+    impl tracing::Subscriber for Reports {
+        fn enabled(&self, meta: &tracing::Metadata<'_>) -> bool {
+            meta.target() == module_path!() && *meta.level() == tracing::Level::INFO
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            event.record(&mut self.clone());
+        }
+    }
+
+    let mut meter = Meter::new();
+    let last = std::time::Instant::now() - std::time::Duration::from_secs(6);
+    meter.since = last;
+    meter.logged = last;
+    let reports = Reports::default();
+    tracing::subscriber::with_default(reports.clone(), || meter.frame(HWND::default()));
+    std::mem::take(&mut *reports.0.lock().unwrap())
+}
+
 impl Host {
     /// Shows one or more `planes` (each a live host texture and its current
     /// host state, kept in that state), compositing planes 1.. on top of
