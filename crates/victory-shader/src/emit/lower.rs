@@ -22,6 +22,8 @@ use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 mod bvh;
 mod lanes;
+#[cfg(test)]
+mod wave_tests;
 
 type Why = &'static str;
 
@@ -73,6 +75,9 @@ pub(crate) struct Lowered {
     /// Whether the module contains the 32-lane half mask (`!31`).
     #[cfg(test)]
     pub has_half_wave_mask: bool,
+    /// The declared `WaveSize` attribute, if any.
+    #[cfg(test)]
+    pub wave_size: Option<u32>,
 }
 
 pub(crate) struct Parts<'a> {
@@ -400,6 +405,29 @@ enum MaskData {
 /// What a value holding a lane mask read as a number stops with.
 const LANE_MASK: Why = "a lane mask read as data";
 
+/// DPP can omit the wave size when the source is quad-local and the
+/// destination ignores wave-wide row and bank numbering.
+fn wave_invariant_dpp(dpp: Dpp) -> bool {
+    matches!(
+        dpp,
+        Dpp::Row {
+            ctrl: 0..=0xFF,
+            row_mask: 0xF,
+            bank_mask: 0xF,
+            fi: false,
+            ..
+        }
+    )
+}
+
+fn quad_swizzle(offset: u32) -> bool {
+    match offset & 0xC000 {
+        0x8000 => true,
+        0xC000 => false,
+        _ => offset & 0x1C == 0x1C && offset & 0x380 == 0 && offset >> 10 & 0x1F < 4,
+    }
+}
+
 /// Instructions that read a lane mask (not EXEC implicitly, not a lane's
 /// bit) as a number.
 fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
@@ -572,13 +600,29 @@ impl<'a> Lower<'a> {
             // Code reading other lanes needs the console's wave size and
             // lane order; so do lane masks read as numbers, and LDS shared
             // within one wave, where the console compiler leaves out barriers.
+            // Multidimensional groups use a different host quad layout, and
+            // a first-lane read makes the size of the surrounding wave visible.
+            let quad_layout_matches = cs.threads[1..] == [1, 1]
+                && !insts().any(|i| {
+                    i.name() == "v_readfirstlane_b32"
+                        && i.writes
+                            .first()
+                            .is_some_and(|w| !x.res.waterfall.reads.contains(&w.1))
+                });
             console_lanes = insts().any(|i| {
                 let n = i.name();
-                n.starts_with("ds_swizzle")
-                    || n.contains("permute")
+                matches!(
+                    &i.fields,
+                    Fields::Ds { offset0, offset1, .. }
+                        if n == "ds_swizzle_b32"
+                            && !(quad_layout_matches
+                                && quad_swizzle(u32::from(*offset0) | u32::from(*offset1) << 8))
+                ) || n.contains("permute")
                     || n.starts_with("v_mbcnt")
                     || matches!(n, "v_readlane_b32" | "v_writelane_b32")
-                    || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
+                    || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some_and(|d| {
+                        !(quad_layout_matches && wave_invariant_dpp(d))
+                    }))
                     || reads_mask_as_data(x.st, i)
             }) || {
                 // Masks held as numbers or constant lane sets: the lane
@@ -1418,6 +1462,8 @@ impl<'a> Lower<'a> {
             uses_lane_index: self.s.m.has_function("dx.op.waveGetLaneIndex"),
             #[cfg(test)]
             has_half_wave_mask: self.s.m.has_i32_const(!31),
+            #[cfg(test)]
+            wave_size: self.s.wave_size,
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -2903,6 +2949,10 @@ impl<'a> Lower<'a> {
     /// the console's wave size (lanes are thread ids in group order there).
     /// Pixel lanes match only within a quad.
     fn cross_lane(&mut self, quad: bool) -> Result<(), Why> {
+        self.cross_lane_inner(quad, false)
+    }
+
+    fn cross_lane_inner(&mut self, quad: bool, wave_invariant: bool) -> Result<(), Why> {
         if self.s.mesh.is_some() {
             // shortcut: no wave size for mesh shaders in SM 6.6, so host
             // lanes cannot follow the console's; emulate through group-shared
@@ -2912,7 +2962,7 @@ impl<'a> Lower<'a> {
         if self.s.threads.is_none() && !(quad && self.s.pixel) {
             return Err("a cross-lane operation outside compute");
         }
-        debug_assert!(self.s.threads.is_none() || self.console_lanes);
+        debug_assert!(self.s.threads.is_none() || self.console_lanes || wave_invariant);
         self.s.flags |= flags::WAVE_OPS;
         Ok(())
     }
@@ -3198,15 +3248,15 @@ impl<'a> Lower<'a> {
             _ => None,
         };
         if name == "ds_swizzle_b32" {
-            // Bit 15 set: each lane of a quad picks a lane of it; else lanes
-            // of each group of 32 combine their index with and/or/xor masks.
-            let quad = offset & 0x8000 != 0
-                || offset & 0x1C == 0x1C && offset & 0x380 == 0 && offset >> 10 & 0x1F < 4;
+            if offset >= 0xC000 {
+                return Err("a rotate or FFT DS swizzle");
+            }
+            let quad = quad_swizzle(offset);
             // Mesh: host quads are threads 4n..4n+3 of a 1D group, as the
             // console's, so quad-local swizzles read through quad operations.
             let mesh_quad = self.s.mesh.is_some() && quad;
             if !mesh_quad {
-                self.cross_lane(quad)?;
+                self.cross_lane_inner(quad, quad)?;
             }
             // The source sits in the address field.
             let x = self.vgprs(inst, addr.as_ref().ok_or("a swizzle source")?, 1)?[0];
@@ -5853,7 +5903,7 @@ impl<'a> Lower<'a> {
         let quad = matches!(dpp, Dpp::Row { ctrl: 0..=0xFF, .. });
         let mesh_quad = self.s.mesh.is_some() && quad;
         if !mesh_quad {
-            self.cross_lane(quad)?;
+            self.cross_lane_inner(quad, wave_invariant_dpp(dpp))?;
         }
         let use_quad = mesh_quad || self.helpers_read(quad);
         let c = self.cur;
@@ -5932,10 +5982,13 @@ impl<'a> Lower<'a> {
                 (src, inside, masks, bound_ctrl, fi)
             }
         };
-        let src_active = if fi {
-            None
-        } else {
+        let src_active = if !fi {
             self.src_lane_active(src, guard, mesh_quad)
+        } else if quad && self.s.threads.is_some() && !mesh_quad {
+            // FI ignores guest EXEC, but a host wave read still needs a live lane.
+            self.src_lane_active(src, None, false)
+        } else {
+            None
         };
         let valid = match (inside, src_active) {
             (Some(in_b), Some(act)) => Some(self.s.m.bin(c, Bin::And, in_b, act)),

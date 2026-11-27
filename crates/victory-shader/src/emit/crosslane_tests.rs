@@ -362,13 +362,17 @@ fn build_wave32_cs(pattern: MaskPattern, div: Divergence, op_words: &[u32]) -> H
     w.extend_from_slice(&buffer_store_dword_offen(2, 5, 4));
     w.push(S_ENDPGM);
 
+    build_crosslane_cs(&w, false)
+}
+
+fn build_crosslane_cs(w: &[u32], wave64: bool) -> HostShader {
     let code: Vec<u8> = w.iter().flat_map(|x| x.to_le_bytes()).collect();
     let decoded = gfx10::decode(&code).expect("decode synthetic RDNA2 program");
     assert_eq!(decoded.last().and_then(|i| i.name()), Some("s_endpgm"));
 
     let native = NativeProgram {
         stage: HwStage::Cs,
-        wave64: false,
+        wave64,
         vgprs: 8,
         layout: vec![RootParam {
             root: RootType::Table,
@@ -390,7 +394,7 @@ fn build_wave32_cs(pattern: MaskPattern, div: Divergence, op_words: &[u32]) -> H
         }],
         io: StageIo::Cs(ComputeIo {
             rsrc2: 1 << 1,
-            threads: [32, 1, 1],
+            threads: [if wave64 { 64 } else { 32 }, 1, 1],
         }),
         code,
     };
@@ -1022,4 +1026,139 @@ fn pixel_quad_swizzle_and_dpp_validate_and_create_pipeline() {
             .pipeline(&vs, &ps)
             .unwrap_or_else(|e| panic!("{label}: graphics pipeline creation failed: {e}"));
     }
+}
+
+/// A row-local source can still have a wave-wide write mask. The upper
+/// two rows must be addressable independently of the lower two.
+#[test]
+fn wave64_dpp_row_mask_preserves_both_halves_on_warp() {
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(true) else {
+        return; // no SM 6.6 WARP here
+    };
+    let mut caps = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+    // SAFETY: a capability query into a correctly sized output structure.
+    let queried = unsafe {
+        host.device.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS1,
+            (&raw mut caps).cast(),
+            size_of_val(&caps) as u32,
+        )
+    };
+    if queried.is_err() || !caps.WaveOps.as_bool() || caps.WaveLaneCountMax < 64 {
+        eprintln!("WARP has no 64-lane waves; skipped row-mask dispatch");
+        return;
+    }
+
+    for (control, row_mask, xor) in [(0x140, 0xC, 15), (0x140, 0x5, 15), (0xB1, 0xF, 1)] {
+        let mut w = vec![s_mov_b32(1, 0x80)];
+        w.extend(s_load_dwordx4(4, 0));
+        w.extend([
+            0x7E04_02C0, // v_mov_b32 v2, 64 (sentinel)
+            0x7E04_02FA, // v_mov_b32_dpp v2, v0
+            dpp16_word(0, control, row_mask, 0xF, false, false),
+            v_lshlrev_b32_imm(5, 2, 0),
+        ]);
+        w.extend(buffer_store_dword_offen(2, 5, 4));
+        w.push(S_ENDPGM);
+        let shader = build_crosslane_cs(&w, true);
+        let (root, pso) = host.compute_pipeline(&shader).expect("D3D12 pipeline");
+        let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[View::RawUav(64)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .expect("D3D12 readback");
+        let want: [u32; 64] = std::array::from_fn(|lane| {
+            if row_mask >> (lane / 16) & 1 != 0 {
+                lane as u32 ^ xor
+            } else {
+                64
+            }
+        });
+        let matched = out[0][..64].iter().zip(want).filter(|(a, b)| **a == *b).count();
+        println!("Wave64 DPP row_mask={row_mask:#x}: {matched}/64 words");
+        assert_eq!(out[0][..64], want, "row mask {row_mask:#x}");
+    }
+}
+
+#[test]
+fn wave64_first_lane_with_quad_swizzle_is_uniform_on_warp() {
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(true) else {
+        eprintln!("no SM 6.6 WARP device; skipped");
+        return;
+    };
+    let mut caps = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+    // SAFETY: this query writes into the supplied structure of the given size.
+    unsafe {
+        host.device.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS1,
+            (&raw mut caps).cast(),
+            size_of_val(&caps) as u32,
+        )
+    }
+    .unwrap();
+    if !caps.WaveOps.as_bool() || !(caps.WaveLaneCountMin..=caps.WaveLaneCountMax).contains(&64) {
+        eprintln!("WARP has no 64-lane waves; skipped");
+        return;
+    }
+
+    let mut w = vec![s_mov_b32(1, 0x80)];
+    w.extend(s_load_dwordx4(4, 0));
+    w.extend([
+        0xD8D4_804E,
+        0x0200_0000, // v2 = quad swizzle of v0, lane 0 reads lane 2
+        0x7E04_0502, // v_readfirstlane_b32 s2, v2
+        0x7E04_0202, // v_mov_b32 v2, s2
+        v_lshlrev_b32_imm(5, 2, 0),
+    ]);
+    w.extend(buffer_store_dword_offen(2, 5, 4));
+    w.push(S_ENDPGM);
+    let shader = build_crosslane_cs(&w, true);
+    let (root, pso) = host.compute_pipeline(&shader).expect("D3D12 pipeline");
+    let ud = vec![0; shader.user_data_dwords().max(1) as usize];
+    let out = host
+        .dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![(0, Root::Constants(ud))],
+                views: &[View::RawUav(64)],
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        )
+        .expect("D3D12 readback");
+    assert_eq!(&out[0][..64], &[2; 64]);
+    eprintln!("WARP: quad swizzle plus first-lane read matched all 64 words");
+}
+
+#[test]
+fn dpp_quad_fi_preserves_the_destination_when_a_host_lane_is_absent() {
+    let dpp = Dpp::Row {
+        ctrl: 0xB1,
+        row_mask: 0xF,
+        bank_mask: 0xF,
+        bound_ctrl: false,
+        fi: true,
+    };
+    let words = encode_dpp16(2, 1, None, dpp);
+    let shader = build_wave32_cs(MaskPattern::Even, Divergence::Branched, &words);
+    let expected = std::array::from_fn(|lane| lane_v2_old(lane as u32));
+    check_cases(
+        "DPP FI under divergence",
+        &[("odd source lanes absent", shader, expected)],
+    );
 }
