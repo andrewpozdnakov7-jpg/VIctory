@@ -574,6 +574,7 @@ impl Shader {
         self.fix_user_data_size(ud_size);
         // The flags of what lowering made, as the module writes it: what only
         // unread values or never-taken edges used is not written.
+        self.m.optimize();
         let uses = self.m.uses();
         for (flag, used) in [
             (flags::RESOURCE_HEAP, uses.heap),

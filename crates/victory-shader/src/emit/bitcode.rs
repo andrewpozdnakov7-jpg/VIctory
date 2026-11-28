@@ -562,6 +562,324 @@ impl Module {
         u
     }
 
+    /// Simplifies constants, algebraic identities, and trivial phis, then
+    /// drops unreachable blocks and dead pure instructions.
+    pub fn optimize(&mut self) {
+        let n = self.insts.len();
+        let mut repl: Vec<Option<V>> = vec![None; n];
+        for _ in 0..4 {
+            let mut changed = false;
+            for i in 0..n {
+                map_operands(&mut self.insts[i].op, |v| resolve(&repl, v));
+                if repl[i].is_none()
+                    && let Some(r) = self.simplify_inst(i)
+                {
+                    repl[i] = Some(r);
+                    changed = true;
+                }
+            }
+            for bi in 0..self.blocks.len() {
+                if let Some(Term::CondBr(c, t, f)) = self.blocks[bi].term {
+                    let c = resolve(&repl, c);
+                    self.blocks[bi].term = Some(if t == f {
+                        changed = true;
+                        Term::Br(t)
+                    } else if let Some(cv) = self.const_int(c) {
+                        changed = true;
+                        Term::Br(if cv & 1 != 0 { t } else { f })
+                    } else {
+                        Term::CondBr(c, t, f)
+                    });
+                }
+            }
+            let reachable = self.reachable_blocks();
+            for bi in 0..self.blocks.len() {
+                if !reachable[bi] {
+                    continue;
+                }
+                let phis = self.blocks[bi].phis.clone();
+                for p in phis {
+                    if let Op::Phi(inc) = &mut self.insts[p as usize].op {
+                        let before = inc.len();
+                        inc.retain(|&(_, pred)| {
+                            reachable[pred] && successors(self.blocks[pred].term).contains(&bi)
+                        });
+                        if inc.len() != before {
+                            changed = true;
+                        }
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        let reachable = self.reachable_blocks();
+        for i in 0..n {
+            map_operands(&mut self.insts[i].op, |v| resolve(&repl, v));
+        }
+        for m in &mut self.mds {
+            if let MdDef::Value(_, v) = m {
+                *v = resolve(&repl, *v);
+            }
+        }
+        for (bi, b) in self.blocks.iter_mut().enumerate() {
+            if !reachable[bi] {
+                b.phis.clear();
+                b.body.clear();
+            }
+        }
+        let live = self.live();
+        for b in &mut self.blocks {
+            b.phis.retain(|&i| live[i as usize]);
+            b.body.retain(|&i| live[i as usize]);
+        }
+    }
+
+    fn reachable_blocks(&self) -> Vec<bool> {
+        let mut seen = vec![false; self.blocks.len()];
+        if self.blocks.is_empty() {
+            return seen;
+        }
+        let mut stack = vec![0usize];
+        seen[0] = true;
+        while let Some(b) = stack.pop() {
+            for &s in successors(self.blocks[b].term).iter() {
+                if !seen[s] {
+                    seen[s] = true;
+                    stack.push(s);
+                }
+            }
+        }
+        seen
+    }
+
+    fn int_bits(&self, ty: Ty) -> Option<u32> {
+        match self.types[ty.0 as usize] {
+            TypeDef::Int(bits) if (1..=64).contains(&bits) => Some(bits),
+            _ => None,
+        }
+    }
+
+    fn const_int(&self, v: V) -> Option<u64> {
+        let V::Const(i) = v else { return None };
+        let (ty, Const::Int(x)) = &self.consts[i as usize] else {
+            return None;
+        };
+        let bits = self.int_bits(*ty)?;
+        let mask = if bits == 64 {
+            u64::MAX
+        } else {
+            (1u64 << bits) - 1
+        };
+        Some((*x as u64) & mask)
+    }
+
+    fn make_int(&mut self, ty: Ty, bits: u32, u: u64) -> V {
+        let sh = 64 - bits;
+        let sext = ((u << sh) as i64) >> sh;
+        self.int_const(ty, sext)
+    }
+
+    fn simplify_inst(&mut self, idx: usize) -> Option<V> {
+        let ty = self.insts[idx].ty;
+        match self.insts[idx].op.clone() {
+            Op::Bin(op, a, b) => {
+                let bits = self.int_bits(ty)?;
+                let mask = if bits == 64 {
+                    u64::MAX
+                } else {
+                    (1u64 << bits) - 1
+                };
+                let ca = self.const_int(a);
+                let cb = self.const_int(b);
+                if let (Some(x), Some(y)) = (ca, cb) {
+                    let sx = || -> i64 {
+                        let sh = 64 - bits;
+                        ((x << sh) as i64) >> sh
+                    };
+                    let sy = || -> i64 {
+                        let sh = 64 - bits;
+                        ((y << sh) as i64) >> sh
+                    };
+                    let res = match op {
+                        Bin::Add => Some(x.wrapping_add(y)),
+                        Bin::Sub => Some(x.wrapping_sub(y)),
+                        Bin::Mul => Some(x.wrapping_mul(y)),
+                        Bin::UDiv => (y != 0).then(|| x / y),
+                        Bin::SDiv => {
+                            let (ax, ay) = (sx(), sy());
+                            let min_s = i64::MIN >> (64 - bits);
+                            (ay != 0 && !(ax == min_s && ay == -1)).then(|| ax.wrapping_div(ay) as u64)
+                        }
+                        Bin::URem => (y != 0).then(|| x % y),
+                        Bin::Shl => (y < u64::from(bits)).then(|| x << y),
+                        Bin::LShr => (y < u64::from(bits)).then(|| x >> y),
+                        Bin::AShr => (y < u64::from(bits)).then(|| (sx() >> y) as u64),
+                        Bin::And => Some(x & y),
+                        Bin::Or => Some(x | y),
+                        Bin::Xor => Some(x ^ y),
+                    };
+                    if let Some(r) = res {
+                        return Some(self.make_int(ty, bits, r & mask));
+                    }
+                }
+                match op {
+                    Bin::Add => match (ca, cb) {
+                        (Some(0), _) => Some(b),
+                        (_, Some(0)) => Some(a),
+                        _ => None,
+                    },
+                    Bin::Sub => {
+                        if cb == Some(0) {
+                            Some(a)
+                        } else if a == b {
+                            Some(self.make_int(ty, bits, 0))
+                        } else {
+                            None
+                        }
+                    }
+                    Bin::Mul => match (ca, cb) {
+                        (Some(0), _) | (_, Some(0)) => Some(self.make_int(ty, bits, 0)),
+                        (Some(1), _) => Some(b),
+                        (_, Some(1)) => Some(a),
+                        _ => None,
+                    },
+                    Bin::And => {
+                        if ca == Some(0) || cb == Some(0) {
+                            Some(self.make_int(ty, bits, 0))
+                        } else if ca == Some(mask) {
+                            Some(b)
+                        } else if cb == Some(mask) || a == b {
+                            Some(a)
+                        } else {
+                            None
+                        }
+                    }
+                    Bin::Or => {
+                        if ca == Some(mask) || cb == Some(mask) {
+                            Some(self.make_int(ty, bits, mask))
+                        } else if ca == Some(0) {
+                            Some(b)
+                        } else if cb == Some(0) || a == b {
+                            Some(a)
+                        } else {
+                            None
+                        }
+                    }
+                    Bin::Xor => {
+                        if ca == Some(0) {
+                            Some(b)
+                        } else if cb == Some(0) {
+                            Some(a)
+                        } else if a == b {
+                            Some(self.make_int(ty, bits, 0))
+                        } else {
+                            None
+                        }
+                    }
+                    Bin::Shl | Bin::LShr | Bin::AShr => {
+                        if cb == Some(0) {
+                            Some(a)
+                        } else if ca == Some(0) {
+                            Some(self.make_int(ty, bits, 0))
+                        } else {
+                            None
+                        }
+                    }
+                    Bin::UDiv | Bin::SDiv | Bin::URem => None,
+                }
+            }
+            Op::Cast(op, a) => {
+                let src_ty = self.type_of(a);
+                if src_ty == ty && matches!(op, Cast::Trunc | Cast::ZExt | Cast::SExt | Cast::Bitcast) {
+                    return Some(a);
+                }
+                if let (Some(dst_bits), Some(src_bits), Some(ca)) =
+                    (self.int_bits(ty), self.int_bits(src_ty), self.const_int(a))
+                {
+                    match op {
+                        Cast::Trunc | Cast::ZExt => return Some(self.make_int(ty, dst_bits, ca)),
+                        Cast::SExt => {
+                            let sh = 64 - src_bits;
+                            let s = ((ca << sh) as i64) >> sh;
+                            return Some(self.make_int(ty, dst_bits, s as u64));
+                        }
+                        _ => {}
+                    }
+                }
+                if op == Cast::Bitcast && let V::Const(ci) = a {
+                    match (&self.types[ty.0 as usize], &self.consts[ci as usize].1) {
+                        (TypeDef::Int(32), &Const::Float(bits)) => {
+                            return Some(self.make_int(ty, 32, u64::from(bits)));
+                        }
+                        (TypeDef::Float, &Const::Int(v)) if self.int_bits(src_ty) == Some(32) => {
+                            return Some(self.f32(v as u32));
+                        }
+                        _ => {}
+                    }
+                }
+                None
+            }
+            Op::Cmp(p, a, b) => {
+                let bits = self.int_bits(self.type_of(a))?;
+                if a == b {
+                    let eq_val = match p {
+                        pred::EQ | pred::IUGE | pred::IULE | pred::SGE | pred::SLE => Some(true),
+                        pred::NE | pred::IUGT | pred::IULT | pred::SGT | pred::SLT => Some(false),
+                        _ => None,
+                    };
+                    if let Some(r) = eq_val {
+                        return Some(self.bool(r));
+                    }
+                }
+                let (Some(x), Some(y)) = (self.const_int(a), self.const_int(b)) else {
+                    return None;
+                };
+                let sh = 64 - bits;
+                let sx = ((x << sh) as i64) >> sh;
+                let sy = ((y << sh) as i64) >> sh;
+                let r = match p {
+                    pred::EQ => x == y,
+                    pred::NE => x != y,
+                    pred::IUGT => x > y,
+                    pred::IUGE => x >= y,
+                    pred::IULT => x < y,
+                    pred::IULE => x <= y,
+                    pred::SGT => sx > sy,
+                    pred::SGE => sx >= sy,
+                    pred::SLT => sx < sy,
+                    pred::SLE => sx <= sy,
+                    _ => return None,
+                };
+                Some(self.bool(r))
+            }
+            Op::Select(c, t, f) => {
+                if t == f {
+                    Some(t)
+                } else {
+                    self.const_int(c).map(|cv| if cv & 1 != 0 { t } else { f })
+                }
+            }
+            Op::Phi(inc) => {
+                let me = V::Inst(idx as u32);
+                let mut unique = None;
+                for &(v, _) in &inc {
+                    if v == me {
+                        continue;
+                    }
+                    match unique {
+                        None => unique = Some(v),
+                        Some(u) if u == v => {}
+                        Some(_) => return None,
+                    }
+                }
+                unique
+            }
+            _ => None,
+        }
+    }
+
     /// Which instructions are written: those [`Module::rooted`], the
     /// branch conditions, and whatever they read, transitively (a phi or a
     /// value nothing reads is dropped: lowering makes size queries for
@@ -1112,6 +1430,55 @@ fn for_each_operand(op: &Op, mut f: impl FnMut(V)) {
             idx.iter().copied().for_each(f);
         }
     }
+}
+
+/// Rewrites every value `op` reads using `f`.
+fn map_operands(op: &mut Op, mut f: impl FnMut(V) -> V) {
+    match op {
+        Op::Bin(_, a, b) | Op::Cmp(_, a, b) | Op::Store(a, b) | Op::AtomicRmw(_, a, b) => {
+            *a = f(*a);
+            *b = f(*b);
+        }
+        Op::Cast(_, v) | Op::Extract(v, _) | Op::Load(v) => *v = f(*v),
+        Op::Select(a, b, c) | Op::CmpXchg(a, b, c) => {
+            *a = f(*a);
+            *b = f(*b);
+            *c = f(*c);
+        }
+        Op::Call(_, args) => {
+            for a in args {
+                *a = f(*a);
+            }
+        }
+        Op::Phi(inc) => {
+            for (v, _) in inc {
+                *v = f(*v);
+            }
+        }
+        Op::Gep(_, p, idx) => {
+            *p = f(*p);
+            for i in idx {
+                *i = f(*i);
+            }
+        }
+    }
+}
+
+/// Follows replacement chains in `repl` to the canonical value.
+fn resolve(repl: &[Option<V>], mut v: V) -> V {
+    for _ in 0..repl.len() {
+        let V::Inst(i) = v else {
+            break;
+        };
+        let Some(next) = repl[i as usize] else {
+            break;
+        };
+        if next == v {
+            break;
+        }
+        v = next;
+    }
+    v
 }
 
 /// A block's successors (at most two), without allocating.
@@ -1719,5 +2086,139 @@ mod tests {
                 fnv(&bytes)
             );
         }
+    }
+
+    #[test]
+    fn optimize_folds_constants_and_identities() {
+        let mut m = Module::default();
+        let i32t = m.int(32);
+        let void = m.void();
+        let sink_ty = m.func_ty(void, vec![i32t]);
+        let sink = m.function("dx.op.sink", sink_ty, None, false);
+        let pure_ty = m.func_ty(i32t, vec![]);
+        let pure = m.function("dx.op.pure", pure_ty, Some(Attr::ReadNone), false);
+        let main_ty = m.func_ty(void, vec![]);
+        m.function("main", main_ty, None, true);
+
+        let b = m.new_block();
+        let c2 = m.i32(2);
+        let c3 = m.i32(3);
+        let c4 = m.i32(4);
+        let c20 = m.i32(20);
+        let c99 = m.i32(99);
+        let zero = m.i32(0);
+        let sum = m.bin(b, Bin::Add, c2, c3);
+        let prod = m.bin(b, Bin::Mul, sum, c4);
+        let x = m.call(b, pure, vec![]);
+        let id = m.bin(b, Bin::Add, x, zero);
+        let cmp = m.cmp(b, pred::EQ, prod, c20);
+        let sel = m.select(b, cmp, id, c99);
+        let sink_call = m.call(b, sink, vec![sel]);
+        m.terminate(b, Term::Ret);
+
+        m.optimize();
+
+        assert_eq!(m.blocks[0].body.len(), 2);
+        let V::Inst(sink_idx) = sink_call else {
+            unreachable!()
+        };
+        assert_eq!(m.blocks[0].body[1], sink_idx);
+        assert!(matches!(&m.insts[sink_idx as usize].op, Op::Call(_, args) if args == &[x]));
+    }
+
+    #[test]
+    fn optimize_eliminates_trivial_phi_and_dead_pure() {
+        let mut m = Module::default();
+        let i32t = m.int(32);
+        let void = m.void();
+        let pure_ty = m.func_ty(i32t, vec![]);
+        let pure = m.function("dx.op.pure", pure_ty, Some(Attr::ReadNone), false);
+        let sink_ty = m.func_ty(void, vec![i32t]);
+        let sink = m.function("dx.op.sink", sink_ty, None, false);
+        let main_ty = m.func_ty(void, vec![]);
+        m.function("main", main_ty, None, true);
+
+        let (entry, b1, b2, join) = (m.new_block(), m.new_block(), m.new_block(), m.new_block());
+        let c7 = m.i32(7);
+        let c0 = m.i32(0);
+        let x = m.call(entry, pure, vec![]);
+        let dead = m.bin(entry, Bin::Xor, x, c7);
+        let _dead_pure = m.call(entry, pure, vec![dead]);
+        let cond = m.cmp(entry, pred::NE, x, c0);
+        m.terminate(entry, Term::CondBr(cond, b1, b2));
+        m.terminate(b1, Term::Br(join));
+        m.terminate(b2, Term::Br(join));
+
+        let p = m.phi(join, i32t);
+        m.set_phi(p, vec![(x, b1), (x, b2)]);
+        let sink_call = m.call(join, sink, vec![p]);
+        m.terminate(join, Term::Ret);
+
+        m.optimize();
+
+        let V::Inst(x_idx) = x else { unreachable!() };
+        let V::Inst(cond_idx) = cond else {
+            unreachable!()
+        };
+        let V::Inst(sink_idx) = sink_call else {
+            unreachable!()
+        };
+        assert_eq!(m.blocks[0].body, vec![x_idx, cond_idx]);
+        assert_eq!(m.blocks[3].body, vec![sink_idx]);
+        assert!(matches!(&m.insts[sink_idx as usize].op, Op::Call(_, args) if args == &[x]));
+    }
+
+    #[test]
+    fn optimize_folds_constant_cond_br() {
+        let mut m = Module::default();
+        let i32t = m.int(32);
+        let void = m.void();
+        let sink_ty = m.func_ty(void, vec![i32t]);
+        let sink = m.function("dx.op.sink", sink_ty, None, false);
+        let main_ty = m.func_ty(void, vec![]);
+        m.function("main", main_ty, None, true);
+
+        let (entry, t, f) = (m.new_block(), m.new_block(), m.new_block());
+        let c5 = m.i32(5);
+        let c1 = m.i32(1);
+        let c2 = m.i32(2);
+        let cond = m.cmp(entry, pred::EQ, c5, c5);
+        m.terminate(entry, Term::CondBr(cond, t, f));
+        m.call(t, sink, vec![c1]);
+        m.terminate(t, Term::Ret);
+        m.call(f, sink, vec![c2]);
+        m.terminate(f, Term::Ret);
+
+        m.optimize();
+
+        assert!(m.blocks[0].body.is_empty());
+        assert!(matches!(m.blocks[0].term, Some(Term::Br(x)) if x == t));
+    }
+
+    #[test]
+    fn optimize_drops_unused_readonly_call_and_internal_global() {
+        let mut m = Module::default();
+        let i32t = m.int(32);
+        let void = m.void();
+        let ro_ty = m.func_ty(i32t, vec![i32t]);
+        let ro = m.function("dx.op.rawBufferLoad.f32", ro_ty, Some(Attr::ReadOnly), false);
+        let main_ty = m.func_ty(void, vec![]);
+        m.function("main", main_ty, None, true);
+        let arr_ty = m.array(2, i32t);
+        let init_vals = [m.i32(10), m.i32(20)];
+        let init = m.aggregate(arr_ty, &init_vals);
+        let g = m.constant_global("code", init);
+
+        let entry = m.new_block();
+        let zero = m.i32(0);
+        let ptr = m.element(entry, g, zero);
+        let _dead_ro = m.call(entry, ro, vec![zero]);
+        let _dead_gep = ptr;
+        m.terminate(entry, Term::Ret);
+
+        m.optimize();
+
+        assert!(m.blocks[0].body.is_empty());
+        assert!(!m.write().is_empty());
     }
 }

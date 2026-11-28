@@ -1725,8 +1725,11 @@ mod tests {
             eprintln!("no dxc.exe; DXIL check skipped");
             return;
         };
-        // The low-half write keeps the destination's high half.
-        assert!(low.contains("-65536"), "low write keeps the high half");
+        // The low-half write keeps the destination's high half (folded when 0, leaving & 0xFFFF).
+        assert!(
+            low.contains("-65536") || low.contains("65535"),
+            "low write keeps the high half"
+        );
         // The high-half write shifts the result up by 16.
         assert!(high.contains("shl i32"), "op_sel[3] writes the high half");
         // omod mul:2 and clamp (dx.op.unary.f32, opcode 7) are applied.
