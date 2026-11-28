@@ -3204,6 +3204,8 @@ impl Host {
             &D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
         ),
     ) -> Option<bool> {
+        // Only planes that the compositor can draw contribute to the back buffer size.
+        let planes = &planes[..planes.len().min(MAX_PLANES as usize)];
         let &(primary, _) = planes.first()?;
         // SAFETY: live resources.
         let primary_desc = unsafe { primary.GetDesc() };
@@ -3366,10 +3368,10 @@ impl Host {
                 );
                 let srv_cpu_base = comp.srv_heap.GetCPUDescriptorHandleForHeapStart();
                 let srv_gpu_base = comp.srv_heap.GetGPUDescriptorHandleForHeapStart();
-                let count = planes.len().min(MAX_PLANES as usize);
+                let count = planes.len();
                 let mut before = Vec::with_capacity(count + 1);
                 let mut after = Vec::with_capacity(count);
-                for (i, &(tex, state)) in planes[..count].iter().enumerate() {
+                for (i, &(tex, state)) in planes.iter().enumerate() {
                     let d = tex.GetDesc();
                     let srv_fmt = swap_format(d.Format).unwrap_or(d.Format);
                     let handle = D3D12_CPU_DESCRIPTOR_HANDLE {
@@ -4033,7 +4035,7 @@ mod present_plane_tests {
     use super::*;
 
     #[test]
-    fn compositor_failure_presents_primary_during_retry_cooldown() {
+    fn present_uses_only_rendered_planes() {
         let Some(host) = host() else {
             eprintln!("skipping PresentX recovery: no D3D12 device");
             return;
@@ -4077,9 +4079,13 @@ mod present_plane_tests {
         };
         let scene = make_plane(32, 32, &[1.0, 0.0, 0.0, 1.0]);
         let overlay = make_plane(64, 64, &[0.0, 0.0, 128.0 / 255.0, 128.0 / 255.0]);
+        let excess = make_plane(128, 96, &[0.0, 1.0, 0.0, 1.0]);
         list.close();
         host.execute(&[&list]);
         let state = D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32;
+        let mut crowded = vec![(&scene, state); MAX_PLANES as usize];
+        *crowded.last_mut().unwrap() = (&overlay, state);
+        crowded.push((&excess, state));
         assert!(
             host.present(&[(&scene, state)], 1).is_some(),
             "single-plane control"
@@ -4105,7 +4111,7 @@ mod present_plane_tests {
         let mut attempted = false;
         let mut fallback = None;
         let shown = host.present_with_compositor(
-            &[(&scene, state), (&overlay, state)],
+            &crowded,
             2,
             |_, _| {
                 attempted = true;
@@ -4134,7 +4140,7 @@ mod present_plane_tests {
         let mut during_cooldown = None;
         assert!(
             host.present_with_compositor(
-                &[(&scene, state), (&overlay, state)],
+                &crowded,
                 3,
                 |_, _| panic!("must not recreate the compositor during cooldown"),
                 |buffer, footprint| during_cooldown = Some(first_pixel(buffer, footprint)),
@@ -4150,7 +4156,7 @@ mod present_plane_tests {
         let mut composite = None;
         assert!(
             host.present_with_compositor(
-                &[(&scene, state), (&overlay, state)],
+                &crowded,
                 4,
                 Compositor::new,
                 |buffer, footprint| composite = Some(first_pixel(buffer, footprint)),
@@ -4158,7 +4164,7 @@ mod present_plane_tests {
             .is_some(),
             "compositor initialization can be retried after failure"
         );
-        // Premultiplied half-blue over opaque red.
+        // The eighth plane blends in. The ninth neither draws nor resizes.
         assert_eq!(composite, Some((64, 64, [127, 0, 128, 255])));
         let presentation = host.presenter.lock().unwrap_or_else(|e| e.into_inner());
         assert!(!presentation.compositor_failures.contains_key(&format));
