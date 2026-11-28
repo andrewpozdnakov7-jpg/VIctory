@@ -13,7 +13,7 @@ fn unsigned_24_bit_operands_use_one_mask_each() {
             counts.push((lower_valu(body).unwrap().instructions, expected));
         }
     }
-    for (op, expected) in [(0x143u32, 22), (0x142, 24)] {
+    for (op, expected) in [(0x143u32, 21), (0x142, 23)] {
         let body = [0xD400_0000 | op << 16, 0x101 | 0x102 << 9 | 0x103 << 18];
         counts.push((lower_valu(&body).unwrap().instructions, expected));
     }

@@ -1,4 +1,4 @@
-use super::{Bin, Cast, Fields, Inst, Lower, Operand, Reg, V, Why, pred};
+use super::{Attr, Bin, Cast, Fields, Inst, Lower, Operand, Reg, V, Why, pred};
 
 impl Lower<'_> {
     pub(super) fn valu_mul24(&mut self, inst: &Inst, guard: Option<V>) -> Result<(), Why> {
@@ -21,15 +21,25 @@ impl Lower<'_> {
         let a = self.extend24(a, signed);
         let b = self.extend24(b, signed);
         let c = self.cur;
-        let m = &mut self.s.m;
-        let low = m.bin(c, Bin::Mul, a, b);
-        let sum = addend.map_or(low, |x| m.bin(c, Bin::Add, low, x));
-
-        // Unclamped operations require only the low dword, as before.
-        let result = if v.clamp {
-            self.clamp_mul24(a, b, low, addend, sum, signed)
-        } else {
-            sum
+        let result = match (addend, v.clamp) {
+            (Some(addend), false) => {
+                let mad = if signed { 48 } else { 49 };
+                self.s.op(
+                    c,
+                    "tertiary.i32",
+                    Attr::ReadNone,
+                    self.s.t.i32,
+                    mad,
+                    &[a, b, addend],
+                )
+            }
+            (None, false) => self.s.m.bin(c, Bin::Mul, a, b),
+            (addend, true) => {
+                let m = &mut self.s.m;
+                let low = m.bin(c, Bin::Mul, a, b);
+                let sum = addend.map_or(low, |x| m.bin(c, Bin::Add, low, x));
+                self.clamp_mul24(a, b, low, addend, sum, signed)
+            }
         };
         self.write(inst, Reg::V(reg), result, guard);
         Ok(())

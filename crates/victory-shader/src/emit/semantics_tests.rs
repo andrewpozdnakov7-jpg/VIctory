@@ -2103,6 +2103,36 @@ fn integers_match_the_hardware() {
     assert_clean(check(&integer_probes()));
 }
 
+#[test]
+fn mad24_wraps_with_a_full_width_addend() {
+    let operands = [
+        0,
+        1,
+        0x007F_FFFF,
+        0x0080_0000,
+        0x0080_0001,
+        0x00FF_FFFF,
+        0xA500_0000,
+        0x5A00_0001,
+        0xA57F_FFFF,
+        0x5A80_0000,
+        0xFFFF_FFFF,
+    ];
+    let addends = [0, 1, 0x0100_0000, 0x7FFF_FFFF, 0x8000_0000, u32::MAX];
+    let inputs = triples(&operands, &operands, &addends);
+    let mut body = vop3(0x142, 5, [v(1), v(2), v(3)], NONE).to_vec();
+    body.extend(vop3(0x143, 6, [v(1), v(2), v(3)], NONE));
+    assert_clean(check(&[probe(body, inputs, INT, |[a, b, addend, _]| {
+        let signed24 = |x| {
+            let x = i64::from(x & 0x00FF_FFFF);
+            if x >= 0x0080_0000 { x - 0x0100_0000 } else { x }
+        };
+        let signed = signed24(a) * signed24(b) + i64::from(addend);
+        let unsigned = u64::from(a & 0x00FF_FFFF) * u64::from(b & 0x00FF_FFFF) + u64::from(addend);
+        vec![signed as u32, unsigned as u32]
+    })]));
+}
+
 /// Carries as lane masks: `v_add_co_u32` into VCC, `v_add_co_ci_u32`
 /// taking and giving VCC, the last carry read back by `v_cndmask_b32`.
 #[test]
