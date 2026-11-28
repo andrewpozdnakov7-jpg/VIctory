@@ -4161,6 +4161,7 @@ mod present_plane_tests {
         let rgba = DXGI_FORMAT_R8G8B8A8_UNORM;
         let scene = make_plane(32, 32, rgba, &[1.0, 0.0, 0.0, 1.0]);
         let overlay = make_plane(64, 64, rgba, &[0.0, 0.0, 128.0 / 255.0, 128.0 / 255.0]);
+        let larger_overlay = make_plane(96, 96, rgba, &[0.0, 0.0, 128.0 / 255.0, 128.0 / 255.0]);
         let alternate = make_plane(64, 64, DXGI_FORMAT_B8G8R8A8_UNORM, &[0.0, 1.0, 0.0, 1.0]);
         list.close();
         host.execute(&[&list]);
@@ -4248,5 +4249,62 @@ mod present_plane_tests {
             .is_some()
         );
         assert_eq!(reused, composite);
+
+        {
+            let mut presentation = host.presenter.lock().unwrap_or_else(|e| e.into_inner());
+            let failure_time = Instant::now() + Duration::from_secs(60);
+            let retry = presentation.resize_retries.for_format(rgba);
+            assert_eq!(retry.attempt(|| failure_time, || Err::<(), _>(())), Some(Err(())));
+        }
+
+        let rgba_larger = [(&scene, state), (&larger_overlay, state)];
+        assert!(
+            host.present_with_compositor(
+                &rgba_larger,
+                6,
+                |_, _| panic!("the RGBA compositor must stay cached during resize cooldown"),
+                |_, _| panic!("the resize should be skipped during cooldown"),
+            )
+            .is_none()
+        );
+
+        let mut switched = None;
+        assert!(
+            host.present_with_compositor(
+                &[(&alternate, state), (&alternate, state)],
+                7,
+                |_, _| panic!("the BGRA compositor must stay cached during RGBA cooldown"),
+                |buffer, footprint| switched = Some(first_pixel(buffer, footprint)),
+            )
+            .is_some(),
+            "BGRA must resize while RGBA is cooling down"
+        );
+        assert_eq!(switched, Some((64, 64, [0, 255, 0, 255])));
+
+        assert!(
+            host.present_with_compositor(
+                &rgba_larger,
+                8,
+                |_, _| panic!("the RGBA compositor must remain cached after a BGRA present"),
+                |_, _| panic!("the successful BGRA resize should leave the RGBA cooldown active"),
+            )
+            .is_none()
+        );
+        {
+            let mut presentation = host.presenter.lock().unwrap_or_else(|e| e.into_inner());
+            presentation.resize_retries.for_format(rgba).next_attempt = Some(Instant::now());
+        }
+
+        let mut resized = None;
+        assert!(
+            host.present_with_compositor(
+                &rgba_larger,
+                9,
+                |_, _| panic!("the earlier RGBA compositor must be reused after resize recovery"),
+                |buffer, footprint| resized = Some(first_pixel(buffer, footprint)),
+            )
+            .is_some()
+        );
+        assert_eq!(resized, Some((96, 96, [127, 0, 128, 255])));
     }
 }
