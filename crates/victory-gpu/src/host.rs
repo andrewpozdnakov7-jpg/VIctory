@@ -380,6 +380,10 @@ pub(crate) fn video_memory() -> Option<[(f64, f64); 2]> {
 }
 
 #[cfg(test)]
+#[path = "host/pool_copy_warp.rs"]
+mod pool_copy_warp;
+
+#[cfg(test)]
 pub(crate) mod tests {
     thread_local! {
         /// Every transition barrier built on this thread (resource, before,
