@@ -32,10 +32,11 @@ use crate::shader::{MAX_FILE, Source, read_warmup_input, sources};
 type Found = (usize, usize, HwStage, String);
 
 /// One pipeline to make: a graphics or compute record of the pack.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum Job {
-    Graphics(usize),
+    // Also the order of records in the key report.
     Compute(usize),
+    Graphics(usize),
 }
 
 pub fn run(paths: &[PathBuf], threads: usize) -> Result<()> {
@@ -291,14 +292,14 @@ pub fn run(paths: &[PathBuf], threads: usize) -> Result<()> {
     // First every record's key, which needs no translation: what a
     // pre-build put in the library is skipped, what an earlier run drew
     // with is made first.
-    let lines: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    let lines: Mutex<Vec<(Job, String)>> = Mutex::new(Vec::new());
     let todo: Mutex<Vec<(bool, Job)>> = Mutex::new(Vec::new());
     let listed = AtomicUsize::new(0);
     if keys_only.is_some() {
         each(&jobs, threads, |job| match prepare(job) {
-            Ok(p) => lock(&lines).push(format!("{}\t{job:?}\t{}", p.key(), p.describe())),
+            Ok(p) => lock(&lines).push((job, format!("{}\t{job:?}\t{}", p.key(), p.describe()))),
             Err(why) => {
-                lock(&lines).push(format!("-\t{job:?}\t{}\t{why}", shaders_of(job)));
+                lock(&lines).push((job, format!("-\t{job:?}\t{}\t{why}", shaders_of(job))));
                 skip(why);
             }
         });
@@ -311,7 +312,7 @@ pub fn run(paths: &[PathBuf], threads: usize) -> Result<()> {
     }
     let listed = listed.into_inner();
     if let Some(file) = keys_only {
-        std::fs::write(file, lock(&lines).join("\n"))?;
+        std::fs::write(file, key_report(lines.into_inner().unwrap_or_else(|e| e.into_inner())))?;
     }
     let mut todo = todo.into_inner().unwrap_or_else(|e| e.into_inner());
     todo.sort_by_key(|&(later, _)| later);
@@ -355,6 +356,12 @@ pub fn run(paths: &[PathBuf], threads: usize) -> Result<()> {
     Ok(())
 }
 
+/// Worker completion order varies; list keys by the pack's record indices.
+fn key_report(mut lines: Vec<(Job, String)>) -> String {
+    lines.sort_unstable_by_key(|(job, _)| *job);
+    lines.into_iter().map(|(_, line)| line).collect::<Vec<_>>().join("\n")
+}
+
 /// Runs `f` on every job, on `threads` threads.
 fn each(jobs: &[Job], threads: usize, f: impl Fn(Job) + Sync) {
     let next = AtomicUsize::new(0);
@@ -388,4 +395,20 @@ fn program_ids(bytes: &[u8]) -> Vec<([u8; 24], HwStage)> {
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn key_report_lists_compute_then_graphics_in_numeric_record_order() {
+        let lines = vec![
+            (Job::Graphics(10), "key-g10".into()),
+            (Job::Compute(2), "key-c2".into()),
+            (Job::Graphics(2), "skip-g2".into()),
+            (Job::Compute(10), "skip-c10".into()),
+        ];
+        assert_eq!(key_report(lines), "key-c2\nskip-c10\nskip-g2\nkey-g10");
+    }
 }
