@@ -770,6 +770,72 @@ fn f16_max_and_min_order_negative_zero_below_positive_zero() {
 }
 
 #[test]
+fn v_mul_hi_u32_returns_the_unsigned_high_word() {
+    let shader = build_valu_cs(&vop3(0x16a, 0, vgpr(1), vgpr(2), 0));
+    let cases = [
+        ([0, u32::MAX, 0, 0], 0),
+        ([u32::MAX, 0, 0, 0], 0),
+        ([u32::MAX, 1, 0, 0], 0),
+        ([0xffff, 0xffff, 0, 0], 0),
+        ([0x1_0000, 0x1_0000, 0, 0], 1),
+        ([0x7fff_ffff, u32::MAX, 0, 0], 0x7fff_fffe),
+        ([0x8000_0000, u32::MAX, 0, 0], 0x7fff_ffff),
+        ([0x8000_0000, 0x8000_0000, 0, 0], 0x4000_0000),
+        ([u32::MAX, u32::MAX, 0, 0], 0xffff_fffe),
+        ([0xfedc_ba98, 0x7654_3210, 0, 0], 0x75cd_9046),
+    ];
+    let inputs = cases.map(|(input, _)| input);
+    run_cases(&shader, &inputs, |backend, i, [a, b, ..], got| {
+        assert_eq!(
+            got, cases[i].1,
+            "{backend}: high word of {a:#010x} * {b:#010x}"
+        );
+    });
+}
+
+#[test]
+fn mul_hi_returns_the_exact_high_word() {
+    // Expected high dwords in order: unsigned 32-bit, signed 32-bit,
+    // unsigned 24-bit, signed 24-bit. Checked on origin/main with both backends.
+    let cases = [
+        ([0x8000_0000, 0x8000_0000], [0x4000_0000, 0x4000_0000, 0, 0]),
+        ([0x8000_0000, 0xffff_ffff], [0x7fff_ffff, 0, 0, 0]),
+        ([0x8000_0000, 0x7fff_ffff], [0x3fff_ffff, 0xc000_0000, 0, 0]),
+        ([0xffff_ffff, 0xffff_ffff], [0xffff_fffe, 0, 0xffff, 0]),
+        ([0xffff_ffff, 1], [0, 0xffff_ffff, 0, 0xffff_ffff]),
+        ([0, 0x8000_0000], [0; 4]),
+        ([0x7fff_ffff, 0], [0; 4]),
+        (
+            [0xfedc_ba98, 0x7654_3210],
+            [0x75cd_9046, 0xff79_5e36, 0x4898, 0xffff_f466],
+        ),
+        ([0x0080_0001, 0x007f_ffff], [0x3fff, 0x3fff, 0x3fff, 0xffff_c000]),
+        ([0x0080_0000, 0x0080_0000], [0x4000; 4]),
+        ([0x00ff_ffff, 0x00ff_ffff], [0xffff, 0xffff, 0xffff, 0]),
+        ([0xff00_0000, 0x00ff_ffff], [0x00fe_ffff, 0xffff_0000, 0, 0]),
+        ([0x0001_0000, 0x0001_0000], [1; 4]),
+    ];
+    let inputs = cases.map(|([a, b], _)| [a, b, 0, 0]);
+    // s[8:11] holds the UAV descriptor, so use s6 for scalar results.
+    let forms: [(&str, &[u32], usize); 5] = [
+        ("v_mul_hi_i32", &vop3(0x16c, 0, vgpr(1), vgpr(2), 0), 1),
+        ("s_mul_hi_u32", &[sop2(0x35, 6, 0, 1), vop1(1, 0, sgpr(6))], 0),
+        ("s_mul_hi_i32", &[sop2(0x36, 6, 0, 1), vop1(1, 0, sgpr(6))], 1),
+        ("v_mul_hi_u32_u24", &[0x1800_0501], 2),
+        ("v_mul_hi_i32_i24", &[0x1400_0501], 3),
+    ];
+    for (name, body, column) in forms {
+        let shader = build_valu_cs(body);
+        run_cases(&shader, &inputs, |backend, i, [a, b, ..], got| {
+            assert_eq!(
+                got, cases[i].1[column],
+                "{backend} {name}: high word of {a:#010x} * {b:#010x}"
+            );
+        });
+    }
+}
+
+#[test]
 fn v_min3_max3_med3_integer_forms_match_rdna2() {
     // v_{min3,max3,med3}_{i32,u32} v0, v1, v2, v3 (VOP3 0x152..0x159).
     type Pick = fn([u32; 3]) -> u32;
