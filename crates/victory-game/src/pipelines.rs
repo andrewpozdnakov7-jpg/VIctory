@@ -380,24 +380,23 @@ fn depth_kept(regs: &[u32; 14], mut f: impl FnMut([u8; DEPTH])) {
     } else {
         (&[0, 1], &[0, 1], (1..=8).collect())
     };
-    let mut faces = vec![(front, back)];
-    if stencil_on != 0 {
-        // The second face when back-face stencil is off.
-        faces.push((front, off));
-    }
+    // The front-only form is already covered when the back face is off.
+    let faces = [(front, back), (front, off)];
+    let face_count = 1 + usize::from(stencil_on != 0 && back != off);
+    let saved_masks = [(mask >> 8) as u8, (mask >> 16) as u8];
+    let has_alternate_masks = stencil_on == 0 && saved_masks != [0xFF; 2];
     for &e in enables {
         for &w in writes {
             for &fun in &funcs {
-                for &(front, back) in &faces {
+                for &(front, back) in &faces[..face_count] {
                     let mut b = [0u8; DEPTH];
                     b[..6].copy_from_slice(&[e, w, fun, stencil_on, masks.0 as u8, masks.1 as u8]);
                     b[6..10].copy_from_slice(&front);
                     b[10..14].copy_from_slice(&back);
                     b[22..].copy_from_slice(&[1, 1]);
                     f(b);
-                    if stencil_on == 0 {
-                        b[4] = (mask >> 8) as u8;
-                        b[5] = (mask >> 16) as u8;
+                    if has_alternate_masks {
+                        b[4..6].copy_from_slice(&saved_masks);
                         f(b);
                     }
                 }
