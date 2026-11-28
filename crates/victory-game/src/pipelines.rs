@@ -65,11 +65,18 @@ impl Named {
     /// Names what it can of the state hashes `pack` uses, from `databases`
     /// and the pack itself.
     pub fn find(pack: &Pack, databases: &[Database]) -> Named {
+        let graphics = pack.graphics();
+        let (records, _) = graphics.size_hint();
         let mut want = Wanted {
-            depth: pack.graphics().map(|g| g.depth_stencil_hash).collect(),
-            raster: pack.graphics().map(|g| g.rasterizer_hash).collect(),
-            blend: pack.graphics().map(|g| g.blend_hash).collect(),
+            depth: HashSet::with_capacity(records),
+            raster: HashSet::with_capacity(records),
+            blend: HashSet::with_capacity(records),
         };
+        for g in graphics {
+            want.depth.insert(g.depth_stencil_hash);
+            want.raster.insert(g.rasterizer_hash);
+            want.blend.insert(g.blend_hash);
+        }
         let mut named = Named {
             finding: "database",
             ..Named::default()
