@@ -946,12 +946,18 @@ mod tests {
     #[test]
     fn cpu_rectangle_uses_the_position_corner_order_for_split_vertex_streams() {
         for color in [ColorStream::Unorm, ColorStream::FloatFirst, ColorStream::Constant] {
-            check_split_rectangle(color);
+            check_split_rectangle(color, false);
+            check_split_rectangle(color, true);
         }
     }
 
-    fn check_split_rectangle(layout: ColorStream) {
+    fn check_split_rectangle(layout: ColorStream, sparse: bool) {
         let color_first = layout == ColorStream::FloatFirst;
+        let [position_slot, color_slot] = if sparse {
+            [31, 7]
+        } else {
+            [u32::from(color_first), u32::from(!color_first)]
+        };
         use crate::object::{S_OK, This, guid, slot};
         use victory_shader::{HwStage, emit::HostShader};
         use windows::Win32::Foundation::RECT;
@@ -1046,12 +1052,12 @@ float4 ps(Vertex input) : SV_Target { return input.color; }
         graphics.inputs = vec![
             D3D12_INPUT_ELEMENT_DESC {
                 SemanticName: PCSTR(graphics.names[0].as_ptr().cast()),
-                InputSlot: u32::from(color_first),
+                InputSlot: position_slot,
                 ..element(DXGI_FORMAT_R32G32_FLOAT, 0)
             },
             D3D12_INPUT_ELEMENT_DESC {
                 SemanticName: PCSTR(graphics.names[1].as_ptr().cast()),
-                InputSlot: u32::from(!color_first),
+                InputSlot: color_slot,
                 ..element(color_format, 0)
             },
         ];
@@ -1066,7 +1072,9 @@ float4 ps(Vertex input) : SV_Target { return input.color; }
             ),
             S_OK
         );
-        assert!(!super::super::host_pipeline(pipeline).unwrap().rectangles);
+        let prepared = super::super::host_pipeline(pipeline).unwrap();
+        assert!(!prepared.rectangles);
+        assert_eq!(prepared.slots, (1u32 << position_slot) | (1u32 << color_slot));
 
         let position = crate::resource::test_buffer(256);
         let color = crate::resource::test_buffer(256);
@@ -1146,15 +1154,16 @@ float4 ps(Vertex input) : SV_Target { return input.color; }
                 stride: color_stride,
             },
         ];
-        if color_first {
-            views.swap(0, 1);
+        let bind_vertices = slot::<extern "system" fn(This, u32, u32, *const Vb)>(guest, 0x180);
+        if sparse {
+            bind_vertices(guest, position_slot, 1, &views[0]);
+            bind_vertices(guest, color_slot, 1, &views[1]);
+        } else {
+            if color_first {
+                views.swap(0, 1);
+            }
+            bind_vertices(guest, 0, 2, views.as_ptr());
         }
-        slot::<extern "system" fn(This, u32, u32, *const Vb)>(guest, 0x180)(
-            guest,
-            0,
-            2,
-            views.as_ptr(),
-        );
         crate::list::with_state(guest, |list, state| {
             state.set_topology(list, 17); // Guest rectangle-list topology.
             state.viewports(
