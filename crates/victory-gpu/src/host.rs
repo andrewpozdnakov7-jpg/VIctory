@@ -3585,16 +3585,30 @@ fn title_window() -> Option<HWND> {
         .copied()
 }
 
+/// Serializes tests that expose their windows to the presenter.
+#[cfg(test)]
+static TEST_WINDOWS: Mutex<()> = Mutex::new(());
+
 #[cfg(test)]
 mod title_window_tests {
-    use super::title_window;
+    use super::{TEST_WINDOWS, title_window};
     use windows::Win32::Foundation::{HWND, LPARAM};
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::UI::WindowsAndMessaging::*;
     use windows::core::{PCWSTR, w};
 
-    /// The windows tests here make and move: one test at a time.
-    static WINDOWS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// Queries the HWND of a swap chain created through the presenter.
+    fn bound_window() -> Option<HWND> {
+        let Some(host) = super::host() else {
+            eprintln!("skipping swap-chain binding: no D3D12 device");
+            return None;
+        };
+        let presenter = host
+            .presenter(64, 64, super::DXGI_FORMAT_R8G8B8A8_UNORM)
+            .expect("swap chain on the selected window");
+        // SAFETY: the presenter owns the live swap chain.
+        Some(unsafe { presenter.swap_chain.GetHwnd() }.unwrap())
+    }
 
     /// A visible top-level window of class `class` on this thread, `width`
     /// by `height` (its client area too: no border).
@@ -3667,19 +3681,24 @@ mod title_window_tests {
     /// title's window whenever the terminal is.
     #[test]
     fn an_empty_window_above_the_titles_is_passed_over() {
-        let _one = WINDOWS.lock().unwrap_or_else(|e| e.into_inner());
+        let _one = TEST_WINDOWS.lock().unwrap_or_else(|e| e.into_inner());
         let empty = popup(w!("Static"), 0, 0);
         let title = popup(w!("Static"), 64, 64);
+        raise(title);
         raise(empty);
         assert!(
             before(&visible_in_z_order(), empty, title),
             "the empty window is the first visible one"
         );
         let found = title_window();
+        let bound = bound_window();
         // SAFETY: windows of this thread.
         unsafe {
             let _ = DestroyWindow(title);
             let _ = DestroyWindow(empty);
+        }
+        if let Some(bound) = bound {
+            assert_eq!(bound, title, "swap-chain window");
         }
         assert_eq!(found, Some(title));
     }
@@ -3688,7 +3707,7 @@ mod title_window_tests {
     /// frames go to, wherever it is in z-order.
     #[test]
     fn the_stand_in_wins_over_other_windows_above_it() {
-        let _one = WINDOWS.lock().unwrap_or_else(|e| e.into_inner());
+        let _one = TEST_WINDOWS.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: registers a class (again is harmless) of the stand-in's name.
         unsafe {
             let class = WNDCLASSEXW {
@@ -3708,10 +3727,14 @@ mod title_window_tests {
             "the other window is above the stand-in"
         );
         let found = title_window();
+        let bound = bound_window();
         // SAFETY: windows of this thread.
         unsafe {
             let _ = DestroyWindow(other);
             let _ = DestroyWindow(stand_in);
+        }
+        if let Some(bound) = bound {
+            assert_eq!(bound, stand_in, "swap-chain window");
         }
         assert_eq!(found, Some(stand_in));
     }
@@ -4181,6 +4204,7 @@ mod present_plane_tests {
 
     #[test]
     fn compositor_failure_presents_primary_in_the_same_frame() {
+        let _one = TEST_WINDOWS.lock().unwrap_or_else(|e| e.into_inner());
         let Some(host) = host() else {
             eprintln!("skipping PresentX recovery: no D3D12 device");
             return;
