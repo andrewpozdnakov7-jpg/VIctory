@@ -1602,18 +1602,25 @@ impl State {
             return false;
         };
         let rects = u64::from(count / 3);
+        let mut streams = Vec::new();
         for slot in active_slots(p.slots) {
-            let elements: Vec<(u32, u32)> = p
-                .inputs
-                .iter()
-                .filter(|e| e.slot as usize == slot && !e.per_instance)
-                .map(|e| (e.offset, e.format))
-                .collect();
+            let inputs = p.inputs.iter().filter(|e| e.slot as usize == slot && !e.per_instance);
+            let position = inputs.clone().find(|e| e.position).map(|e| (e.offset, e.format));
+            let elements: Vec<_> = inputs.map(|e| (e.offset, e.format)).collect();
             if elements.is_empty() {
                 continue;
             }
             let v = self.vertex[slot];
             let stride = u64::from(v.stride);
+            if stride == 0
+                && v.address != 0
+                && v.size != 0
+                && crate::shadow::find(v.address, u64::from(v.size)).is_some()
+            {
+                // The input assembler reads the same data at every vertex.
+                // Use the view already bound by prepare.
+                continue;
+            }
             let from = v.address + u64::from(first) * stride;
             if v.address == 0
                 || stride == 0
@@ -1627,18 +1634,7 @@ impl State {
                 return false;
             };
             let (from, to, stride) = (from as usize, to as usize, stride as usize);
-            let n = rects as usize;
-            list.defer_host(move || {
-                // SAFETY: the vertices lie in a title buffer (checked when
-                // recorded) and the scratch memory is the list's.
-                let (src, dst) = unsafe {
-                    (
-                        std::slice::from_raw_parts(from as *const u8, n * 3 * stride),
-                        std::slice::from_raw_parts_mut(to as *mut u8, n * 6 * stride),
-                    )
-                };
-                crate::primitive::expand_rects(src, dst, stride, &elements);
-            });
+            streams.push((from, to, stride, elements, position));
             let view = D3D12_VERTEX_BUFFER_VIEW {
                 BufferLocation: gpu,
                 SizeInBytes: (rects * 6 * stride as u64) as u32,
@@ -1646,6 +1642,40 @@ impl State {
             };
             // SAFETY: an open list; the view names live scratch memory.
             unsafe { list.list.IASetVertexBuffers(slot as u32, Some(&[view])) };
+        }
+        if !streams.is_empty() {
+            let n = rects as usize;
+            list.defer_host(move || {
+                let corners_from = |from: usize, stride, elements: &[(u32, u32)]| {
+                    // SAFETY: the source range was checked when recording.
+                    let src = unsafe { std::slice::from_raw_parts(from as *const u8, n * 3 * stride) };
+                    crate::primitive::rectangle_corners(src, stride, elements)
+                };
+                // An explicit POSITION takes priority over the first float
+                // attribute, which might be a color or texture coordinate.
+                let corners = streams
+                    .iter()
+                    .find_map(|(from, _, stride, _, position)| {
+                        corners_from(*from, *stride, std::slice::from_ref(position.as_ref()?))
+                    })
+                    .or_else(|| {
+                        streams.iter().find_map(|(from, _, stride, elements, _)| {
+                            corners_from(*from, *stride, elements)
+                        })
+                    });
+                let corners = corners.as_deref().unwrap_or_default();
+                for (from, to, stride, elements, _) in &streams {
+                    // SAFETY: the source is in its checked vertex buffer; the
+                    // destination is a distinct slice of list-owned scratch.
+                    let (src, dst) = unsafe {
+                        (
+                            std::slice::from_raw_parts(*from as *const u8, n * 3 * stride),
+                            std::slice::from_raw_parts_mut(*to as *mut u8, n * 6 * stride),
+                        )
+                    };
+                    crate::primitive::expand_rects_with_corners(src, dst, *stride, elements, corners);
+                }
+            });
         }
         true
     }
