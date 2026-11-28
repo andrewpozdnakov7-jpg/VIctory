@@ -24,22 +24,21 @@ pub(crate) fn expand_rects(src: &[u8], dst: &mut [u8], stride: usize, elements: 
     let (Some(in_rect), Some(out_rect)) = (stride.checked_mul(3), stride.checked_mul(6)) else {
         return;
     };
+    let position = elements.iter().find_map(|&(offset, format)| {
+        let at = offset as usize;
+        let (n, kind) = components(format)?;
+        let float = matches!(kind, Kind::F32 | Kind::F16);
+        (float && n >= 2 && stride.saturating_sub(at) / kind.bytes() >= 2).then_some((at, kind))
+    });
     for (rect, out) in src
         .chunks_exact(in_rect)
         .zip(dst.chunks_exact_mut(out_rect))
     {
         let v = |i: usize| &rect[i * stride..(i + 1) * stride];
-        let right = elements
-            .iter()
-            .find_map(|&(offset, format)| {
-                let at = offset as usize;
-                let (n, kind) = components(format)?;
-                let float = matches!(kind, Kind::F32 | Kind::F16);
-                (float && n >= 2 && stride.saturating_sub(at) / kind.bytes() >= 2).then(|| {
-                    victory_shader::emit::right_angle([0, 1, 2].map(|i| [0, 1].map(|k| kind.read(&v(i)[at..], k))))
-                })
-            })
-            .unwrap_or(1);
+        let right = position.map_or(1, |(at, kind)| {
+            let xy = [0, 1, 2].map(|i| [0, 1].map(|c| kind.read(&v(i)[at..], c)));
+            victory_shader::emit::right_angle(xy)
+        });
         let (a, b) = ((right + 2) % 3, (right + 1) % 3);
         for (slot, i) in [0, 1, 2, a, b].into_iter().enumerate() {
             out[slot * stride..(slot + 1) * stride].copy_from_slice(v(i));
