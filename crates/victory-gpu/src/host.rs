@@ -3362,23 +3362,7 @@ impl Host {
                 ));
                 list.ResourceBarrier(&before);
                 list.CopyResource(&back, texture);
-                #[cfg(all(test, feature = "diagnostics"))]
-                let capture = {
-                    // Inspect what reached the swap chain, before Present.
-                    list.ResourceBarrier(&[transition(
-                        &back,
-                        D3D12_RESOURCE_STATE_COPY_DEST,
-                        D3D12_RESOURCE_STATE_COPY_SOURCE,
-                    )]);
-                    let readback = crate::capture::read_back(&self.device, list, &back);
-                    list.ResourceBarrier(&[transition(
-                        &back,
-                        D3D12_RESOURCE_STATE_COPY_SOURCE,
-                        D3D12_RESOURCE_STATE_COPY_DEST,
-                    )]);
-                    readback
-                };
-                #[cfg(all(not(test), feature = "diagnostics"))]
+                #[cfg(feature = "diagnostics")]
                 let capture = crate::capture::wanted(frame)
                     .then(|| crate::capture::read_back(&self.device, list, texture))
                     .flatten();
@@ -3510,7 +3494,7 @@ impl Host {
                         D3D12_RESOURCE_STATE_RENDER_TARGET,
                         D3D12_RESOURCE_STATE_COPY_SOURCE,
                     )]);
-                    let capture = (cfg!(test) || crate::capture::wanted(frame))
+                    let capture = crate::capture::wanted(frame)
                         .then(|| crate::capture::read_back(&self.device, list, &back))
                         .flatten();
                     let probe = crate::capture::probe(&self.device, list, &back);
@@ -3546,14 +3530,31 @@ impl Host {
                 }
                 (capture, probe)
             };
+            #[cfg(all(test, feature = "diagnostics"))]
+            let final_frame = {
+                // Check the actual back buffer after drawing the readout.
+                list.ResourceBarrier(&[transition(
+                    &back,
+                    D3D12_RESOURCE_STATE_PRESENT,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                )]);
+                let readback = crate::capture::read_back(&self.device, list, &back);
+                list.ResourceBarrier(&[transition(
+                    &back,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    D3D12_RESOURCE_STATE_PRESENT,
+                )]);
+                readback
+            };
             p.copy.close();
             self.execute(&[&p.copy]);
+            #[cfg(all(test, feature = "diagnostics"))]
+            if let Some((buffer, footprint)) = final_frame {
+                // A flip-discard Present can invalidate the back buffer.
+                inspect(&buffer, &footprint);
+            }
             #[cfg(feature = "diagnostics")]
             if let Some((buffer, footprint)) = capture {
-                // Tests inspect the completed copy before flip-discard Present
-                // can invalidate the back buffer, with the presenter still locked.
-                #[cfg(test)]
-                inspect(&buffer, &footprint);
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
             let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
@@ -4161,7 +4162,7 @@ mod present_plane_tests {
             }
         };
         let scene = make_plane(32, 32, &[1.0, 0.0, 0.0, 1.0]);
-        let overlay = make_plane(64, 64, &[0.0, 0.0, 128.0 / 255.0, 128.0 / 255.0]);
+        let overlay = make_plane(256, 64, &[0.0, 0.0, 128.0 / 255.0, 128.0 / 255.0]);
         list.close();
         host.execute(&[&list]);
         let state = D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32;
@@ -4169,23 +4170,23 @@ mod present_plane_tests {
             host.present(&[(&scene, state)], 1).is_some(),
             "single-plane control"
         );
-        let first_pixel =
-            |buffer: &ID3D12Resource, footprint: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT| {
-                let mut mapped = std::ptr::null_mut();
-                // SAFETY: the present copy has completed. The footprint names
-                // a live RGBA pixel inside the readback buffer.
-                let rgba = unsafe {
-                    buffer.Map(0, None, Some(&mut mapped)).unwrap();
-                    let rgba = mapped
-                        .cast::<u8>()
-                        .add(footprint.Offset as usize)
-                        .cast::<[u8; 4]>()
-                        .read();
-                    buffer.Unmap(0, None);
-                    rgba
-                };
-                (footprint.Footprint.Width, footprint.Footprint.Height, rgba)
+        let pixel = |buffer: &ID3D12Resource,
+                     footprint: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+                     x: usize,
+                     y: usize| {
+            let mut mapped = std::ptr::null_mut();
+            let offset =
+                footprint.Offset as usize + y * footprint.Footprint.RowPitch as usize + x * 4;
+            // SAFETY: the present copy has completed. The footprint names
+            // a live RGBA pixel inside the readback buffer.
+            let rgba = unsafe {
+                buffer.Map(0, None, Some(&mut mapped)).unwrap();
+                let rgba = mapped.cast::<u8>().add(offset).cast::<[u8; 4]>().read();
+                buffer.Unmap(0, None);
+                rgba
             };
+            (footprint.Footprint.Width, footprint.Footprint.Height, rgba)
+        };
 
         let mut attempted = false;
         let mut fallback = None;
@@ -4198,7 +4199,7 @@ mod present_plane_tests {
                     windows::Win32::Foundation::E_FAIL,
                 ))
             },
-            |buffer, footprint| fallback = Some(first_pixel(buffer, footprint)),
+            |buffer, footprint| fallback = Some(pixel(buffer, footprint, 0, 0)),
         );
         assert!(attempted);
         assert!(
@@ -4206,9 +4207,10 @@ mod present_plane_tests {
             "the primary plane must still be shown in this frame"
         );
         assert_eq!(fallback, Some((32, 32, [255, 0, 0, 255])));
-        let presentation = host.presenter.lock().unwrap_or_else(|e| e.into_inner());
-        let swap_chain = presentation.presenter.as_ref().unwrap();
+        let mut presentation = host.presenter.lock().unwrap_or_else(|e| e.into_inner());
+        let swap_chain = presentation.presenter.as_mut().unwrap();
         assert_eq!((swap_chain.width, swap_chain.height), (32, 32));
+        swap_chain.meter.shown = Some((60.0, 16.7));
         drop(presentation);
 
         let mut composite = None;
@@ -4217,12 +4219,21 @@ mod present_plane_tests {
                 &[(&scene, state), (&overlay, state)],
                 3,
                 Compositor::new,
-                |buffer, footprint| composite = Some(first_pixel(buffer, footprint)),
+                |buffer, footprint| {
+                    composite = Some(pixel(buffer, footprint, 0, 0));
+                    let glyph = if crate::readout::on() {
+                        [255, 230, 26, 255]
+                    } else {
+                        [127, 0, 128, 255]
+                    };
+                    // Top row of the digit 6 in the final back buffer.
+                    assert_eq!(pixel(buffer, footprint, 12, 8).2, glyph);
+                },
             )
             .is_some(),
             "compositor initialization can be retried after failure"
         );
         // Premultiplied half-blue over opaque red.
-        assert_eq!(composite, Some((64, 64, [127, 0, 128, 255])));
+        assert_eq!(composite, Some((256, 64, [127, 0, 128, 255])));
     }
 }
