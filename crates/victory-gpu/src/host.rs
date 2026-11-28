@@ -314,13 +314,15 @@ struct GpuTimes {
     command_ms: f64,
     lists_with_timestamps: u64,
     lists_without_timestamps: u64,
+    beyond_limit: usize,
 }
 
 #[cfg(feature = "diagnostics")]
 impl GpuTimes {
     /// Keeps each list's wall time, with command intervals when available.
-    fn record(&mut self, wall: Duration, commands: Option<&[(f64, String)]>) {
+    fn record(&mut self, wall: Duration, commands: Option<&[(f64, String)]>, beyond_limit: usize) {
         self.wall_ms += wall.as_secs_f64() * 1e3;
+        self.beyond_limit += beyond_limit;
         let Some(commands) = commands else {
             self.lists_without_timestamps += 1;
             return;
@@ -345,24 +347,25 @@ impl GpuTimes {
 #[test]
 fn gpu_timing_distinguishes_empty_and_unavailable_timestamps() {
     let mut times = GpuTimes::default();
-    times.record(Duration::from_millis(20), None);
-    times.record(Duration::from_millis(10), Some(&[]));
-    times.record(Duration::from_millis(5), Some(&[(3.0, "copy".into())]));
+    times.record(Duration::from_millis(20), None, 3);
+    times.record(Duration::from_millis(10), Some(&[]), 0);
+    times.record(Duration::from_millis(5), Some(&[(3.0, "copy".into())]), 1);
     assert_eq!((times.lists_with_timestamps, times.lists_without_timestamps), (2, 1));
     assert_eq!((times.wall_ms, times.command_ms), (35.0, 3.0));
     assert_eq!(times.by.get("copy"), Some(&(3.0, 1)));
+    assert_eq!(times.beyond_limit, 4);
 }
 
 #[cfg(feature = "diagnostics")]
 static GPU_TIMES: Mutex<Option<GpuTimes>> = Mutex::new(None);
 
 #[cfg(feature = "diagnostics")]
-fn gpu_times(wall: Duration, commands: Option<&[(f64, String)]>) {
+fn gpu_times(wall: Duration, commands: Option<&[(f64, String)]>, beyond_limit: usize) {
     GPU_TIMES
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get_or_insert_with(Default::default)
-        .record(wall, commands);
+        .record(wall, commands, beyond_limit);
 }
 
 /// Logs the timing per frame over the window, followed by the 25 costliest commands.
@@ -378,6 +381,12 @@ fn log_gpu_times(frames: f64) {
         times.wall_ms / frames,
         times.command_ms / frames
     );
+    if times.beyond_limit != 0 {
+        tracing::info!(
+            "GPU timing coverage: {} command notes beyond the per-list timestamp limit of {MAX_TIMED_COMMANDS}",
+            times.beyond_limit,
+        );
+    }
     let mut by: Vec<_> = times.by.into_iter().collect();
     by.sort_by(|a, b| b.1.0.total_cmp(&a.1.0));
     for (key, (ms, n)) in by.iter().take(25) {
@@ -901,6 +910,8 @@ pub(crate) fn warn_depth_bounds() {
 /// Timestamps per list (diagnostics); commands past them are not timed.
 #[cfg(feature = "diagnostics")]
 const STAMPS: u32 = 4096;
+#[cfg(feature = "diagnostics")]
+const MAX_TIMED_COMMANDS: usize = STAMPS as usize - 1;
 
 /// A marker's text and the host range its command reads (diagnostics).
 #[cfg(feature = "diagnostics")]
@@ -1341,8 +1352,8 @@ impl Host {
                 // SAFETY: a plain query.
                 let frequency = unsafe { self.queue.GetTimestampFrequency() }.ok();
                 let wall = started.elapsed();
-                let commands = runs[i].slowest(frequency, usize::MAX);
-                gpu_times(wall, commands.as_deref());
+                let (commands, beyond_limit) = runs[i].slowest(frequency, usize::MAX);
+                gpu_times(wall, commands.as_deref(), beyond_limit);
             }
             #[cfg(feature = "diagnostics")]
             if groups.len() > 1 && started.elapsed() > std::time::Duration::from_millis(50) {
@@ -1350,7 +1361,7 @@ impl Host {
                 let frequency = unsafe { self.queue.GetTimestampFrequency() }.ok();
                 let commands = runs[i].notes.lock().unwrap_or_else(|e| e.into_inner()).len();
                 tracing::warn!(ms = started.elapsed().as_millis(), commands, "slow host list");
-                for (ms, op) in runs[i].slowest(frequency, 6).into_iter().flatten() {
+                for (ms, op) in runs[i].slowest(frequency, 6).0.into_iter().flatten() {
                     tracing::warn!("slow list command, {ms:.1} ms: {op}");
                 }
             }
@@ -1759,20 +1770,25 @@ impl HostList {
             .as_ref()
     }
 
-    /// The noted commands that took longest on the GPU, longest first, as
-    /// (milliseconds, text) (diagnostics, timing on, after the list ran).
+    /// The longest GPU command intervals when available, and the independent
+    /// count of command notes beyond the timestamp budget. Read after the list ran.
     #[cfg(feature = "diagnostics")]
-    fn slowest(&self, frequency: Option<u64>, n: usize) -> Option<Vec<(f64, String)>> {
-        let frequency = frequency.filter(|&hz| hz != 0)?;
+    fn slowest(&self, frequency: Option<u64>, n: usize) -> (Option<Vec<(f64, String)>>, usize) {
         let notes = self.notes.lock().unwrap_or_else(|e| e.into_inner());
-        let (_, back) = self.stamps()?;
-        let count = notes.len().min(STAMPS as usize - 1);
+        let count = notes.len().min(MAX_TIMED_COMMANDS);
+        let beyond_limit = notes.len() - count;
+        let Some(frequency) = frequency.filter(|&hz| hz != 0) else {
+            return (None, beyond_limit);
+        };
+        let Some((_, back)) = self.stamps() else {
+            return (None, beyond_limit);
+        };
         let mut data = std::ptr::null_mut();
         let range = D3D12_RANGE { Begin: 0, End: (count + 1) * 8 };
         // SAFETY: a read-back buffer the finished list resolved into.
         let stamps: Vec<u64> = unsafe {
             if back.Map(0, Some(&range), Some(&mut data)).is_err() {
-                return None;
+                return (None, beyond_limit);
             }
             let s = std::slice::from_raw_parts(data.cast::<u64>(), count + 1).to_vec();
             back.Unmap(0, None);
@@ -1786,7 +1802,7 @@ impl HostList {
             .collect();
         times.sort_by(|a, b| b.0.total_cmp(&a.0));
         times.truncate(n);
-        Some(times)
+        (Some(times), beyond_limit)
     }
 
     /// Whether `node` of the device-removed data (its breadcrumbs) is this
