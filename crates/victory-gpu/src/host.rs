@@ -694,6 +694,13 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn present_compositor_reuses_its_compiled_shaders() {
+        let first = Compositor::shaders().expect("compile the compositor shaders");
+        let second = Compositor::shaders().expect("reuse the compiled shaders");
+        assert!(std::ptr::eq(first, second));
+    }
+
+    #[test]
     fn present_compositor_builds_both_pipeline_states() {
         let Some(host) = host() else {
             eprintln!("skipping compositor initialization: no D3D12 device");
@@ -2843,7 +2850,12 @@ struct Compositor {
 }
 
 impl Compositor {
-    fn new(device: &ID3D12Device, format: DXGI_FORMAT) -> windows::core::Result<Self> {
+    /// The shader programs are the same for every output format.
+    fn shaders() -> windows::core::Result<&'static [Vec<u8>; 2]> {
+        static SHADERS: OnceLock<[Vec<u8>; 2]> = OnceLock::new();
+        if let Some(shaders) = SHADERS.get() {
+            return Ok(shaders);
+        }
         const SOURCE: &str = r#"
             Texture2D tex : register(t0);
             SamplerState smp : register(s0);
@@ -2855,7 +2867,7 @@ impl Compositor {
                 return tex.Sample(smp, uv);
             }
         "#;
-        let compile = |entry: PCSTR, target: PCSTR| -> windows::core::Result<ID3DBlob> {
+        let compile = |entry: PCSTR, target: PCSTR| -> windows::core::Result<Vec<u8>> {
             let mut code: Option<ID3DBlob> = None;
             let mut errors: Option<ID3DBlob> = None;
             // SAFETY: static source and entry/target strings; out pointers ours.
@@ -2887,16 +2899,23 @@ impl Compositor {
                 }
                 return Err(e);
             }
-            code.ok_or_else(windows::core::Error::empty)
+            let code = code.ok_or_else(windows::core::Error::empty)?;
+            // SAFETY: copy the compiled bytes while their blob is alive.
+            Ok(unsafe {
+                std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize())
+            }
+            .to_vec())
         };
         let vs = compile(s!("vs"), s!("vs_5_1"))?;
         let ps = compile(s!("ps"), s!("ps_5_1"))?;
-        // SAFETY: compiled shader blobs live through PSO creation.
+        // Only keep a complete pair, so a failed compile can be retried.
+        Ok(SHADERS.get_or_init(|| [vs, ps]))
+    }
+
+    fn new(device: &ID3D12Device, format: DXGI_FORMAT) -> windows::core::Result<Self> {
+        let [vs_bytes, ps_bytes] = Self::shaders()?;
+        // SAFETY: live device and descriptors backed by storage through each call.
         unsafe {
-            let vs_bytes =
-                std::slice::from_raw_parts(vs.GetBufferPointer().cast::<u8>(), vs.GetBufferSize());
-            let ps_bytes =
-                std::slice::from_raw_parts(ps.GetBufferPointer().cast::<u8>(), ps.GetBufferSize());
             // Wine's D3DCompile does not embed a root signature in the shader blobs.
             let range = D3D12_DESCRIPTOR_RANGE {
                 RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
@@ -3074,7 +3093,14 @@ struct Presenter {
     copy: HostList,
     hwnd: HWND,
     meter: Meter,
-    compositor: Option<Compositor>,
+    /// At most one for each presentation format returned by swap_format.
+    compositors: Vec<Compositor>,
+}
+
+impl Presenter {
+    fn compositor(&self, format: DXGI_FORMAT) -> Option<&Compositor> {
+        self.compositors.iter().find(|c| c.format == format)
+    }
 }
 
 /// The frame rate, shown in the window's caption every second and logged
@@ -3284,12 +3310,9 @@ impl Host {
         if presenter.is_none() && !retry.ready(Instant::now()) {
             return None;
         }
-        let cached_format = presenter
-            .as_ref()
-            .and_then(|p| p.compositor.as_ref())
-            .map(|c| c.format);
+        let has_compositor = presenter.as_ref().is_some_and(|p| p.compositor(format).is_some());
         let mut new_compositor = None;
-        let planes = if planes.len() > 1 && cached_format != Some(format) {
+        let planes = if planes.len() > 1 && !has_compositor {
             match create_compositor(&self.device, format) {
                 Ok(c) => {
                     new_compositor = Some(c);
@@ -3323,7 +3346,7 @@ impl Host {
         }
         let p = presenter.as_mut()?;
         if let Some(c) = new_compositor {
-            p.compositor = Some(c);
+            p.compositors.push(c);
         }
         if (p.width, p.height, p.format) != (width, height, format) {
             let retry = resize_retries.for_format(format);
@@ -3408,7 +3431,7 @@ impl Host {
                 list.ResourceBarrier(&after);
                 (capture, probe)
             } else {
-                let comp = p.compositor.as_ref().expect("compositor was prepared for multiple planes");
+                let comp = p.compositor(format).expect("compositor was prepared for this format");
                 let rtv = comp.rtv_heap.GetCPUDescriptorHandleForHeapStart();
                 self.device.CreateRenderTargetView(
                     &back,
@@ -3601,7 +3624,7 @@ impl Host {
                 copy,
                 hwnd,
                 meter: Meter::new(),
-                compositor: None,
+                compositors: Vec::new(),
             })
         }
     }
@@ -4099,7 +4122,7 @@ mod present_plane_tests {
             return;
         };
         let list = host.new_list().unwrap();
-        let make_plane = |width, height, color: &[f32; 4]| {
+        let make_plane = |width, height, format, color: &[f32; 4]| {
             let mut texture = None;
             // SAFETY: live device, valid render target description, and an open list.
             unsafe {
@@ -4116,7 +4139,7 @@ mod present_plane_tests {
                             Height: height,
                             DepthOrArraySize: 1,
                             MipLevels: 1,
-                            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                            Format: format,
                             SampleDesc: DXGI_SAMPLE_DESC {
                                 Count: 1,
                                 Quality: 0,
@@ -4135,8 +4158,10 @@ mod present_plane_tests {
                 texture
             }
         };
-        let scene = make_plane(32, 32, &[1.0, 0.0, 0.0, 1.0]);
-        let overlay = make_plane(64, 64, &[0.0, 0.0, 128.0 / 255.0, 128.0 / 255.0]);
+        let rgba = DXGI_FORMAT_R8G8B8A8_UNORM;
+        let scene = make_plane(32, 32, rgba, &[1.0, 0.0, 0.0, 1.0]);
+        let overlay = make_plane(64, 64, rgba, &[0.0, 0.0, 128.0 / 255.0, 128.0 / 255.0]);
+        let alternate = make_plane(64, 64, DXGI_FORMAT_B8G8R8A8_UNORM, &[0.0, 1.0, 0.0, 1.0]);
         list.close();
         host.execute(&[&list]);
         let state = D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32;
@@ -4199,5 +4224,29 @@ mod present_plane_tests {
         );
         // Premultiplied half-blue over opaque red.
         assert_eq!(composite, Some((64, 64, [127, 0, 128, 255])));
+
+        let mut switched = None;
+        assert!(
+            host.present_with_compositor(
+                &[(&alternate, state), (&alternate, state)],
+                4,
+                Compositor::new,
+                |buffer, footprint| switched = Some(first_pixel(buffer, footprint)),
+            )
+            .is_some()
+        );
+        assert_eq!(switched, Some((64, 64, [0, 255, 0, 255])));
+
+        let mut reused = None;
+        assert!(
+            host.present_with_compositor(
+                &[(&scene, state), (&overlay, state)],
+                5,
+                |_, _| panic!("the earlier RGBA compositor must still be cached"),
+                |buffer, footprint| reused = Some(first_pixel(buffer, footprint)),
+            )
+            .is_some()
+        );
+        assert_eq!(reused, composite);
     }
 }
