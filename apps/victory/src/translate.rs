@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use victory_shader::emit::host::{self, Host};
 use victory_shader::emit::{self, validator::Validator};
 use victory_shader::structure::{self, Atom, LaneExit};
@@ -201,10 +201,10 @@ pub fn run(
             };
             let jobs = sources(&data);
             let next = AtomicUsize::new(0);
-            std::thread::scope(|s| {
+            std::thread::scope(|s| -> Result<()> {
                 let workers: Vec<_> = (0..threads.min(jobs.len()))
                     .map(|_| {
-                        s.spawn(|| {
+                        s.spawn(|| -> Result<()> {
                             let mut t = Tally {
                                 list,
                                 ..Tally::default()
@@ -215,13 +215,16 @@ pub fn run(
                                     .then(|| Validator::load(dll.as_deref()).ok())
                                     .flatten(),
                                 host: pipelines
-                                    .then(|| Host::new(false).ok().map(|h| (h, host::stub_ps())))
-                                    .flatten(),
+                                    .then(|| Host::new(false).map(|h| (h, host::stub_ps())))
+                                    .transpose()
+                                    .map_err(anyhow::Error::msg)
+                                    .context("initializing pipeline checks in a translation worker")?,
                             };
                             while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
                                 translate(job, entry.path(), &seen, &mut t, &mut checks);
                             }
                             lock(&total).merge(t);
+                            Ok(())
                         })
                     })
                     .collect();
@@ -234,7 +237,11 @@ pub fn run(
                     &workers,
                     String::new,
                 );
-            });
+                for worker in workers {
+                    worker.join().expect("translation worker panicked")?;
+                }
+                Ok(())
+            })?;
         }
     }
     let t = total.into_inner().unwrap_or_else(|e| e.into_inner());
