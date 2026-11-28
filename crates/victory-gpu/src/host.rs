@@ -3503,15 +3503,6 @@ impl Host {
                     );
                     list.DrawInstanced(3, 1, 0, 0);
                 }
-                // Over the composed planes, which the back buffer already
-                // holds: the series-s profile presents a scene plane and a
-                // 4K interface plane through this path.
-                p.readout(
-                    &self.device,
-                    list,
-                    &back,
-                    D3D12_RESOURCE_STATE_RENDER_TARGET,
-                );
                 #[cfg(feature = "diagnostics")]
                 let (capture, probe) = {
                     list.ResourceBarrier(&[transition(
@@ -3540,6 +3531,16 @@ impl Host {
                     )]);
                     (None::<()>, None::<()>)
                 };
+                // The readout goes over the composed planes, after the
+                // diagnostics have read the title's own frame: a black scene
+                // is then classified as black, not by one of our glyphs.
+                // The capture left the back buffer presentable.
+                p.readout(
+                    &self.device,
+                    list,
+                    &back,
+                    D3D12_RESOURCE_STATE_PRESENT,
+                );
                 if !after.is_empty() {
                     list.ResourceBarrier(&after);
                 }
