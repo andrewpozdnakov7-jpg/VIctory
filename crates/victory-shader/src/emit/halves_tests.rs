@@ -3076,24 +3076,30 @@ fn first_lane_beside_full_lds() -> Vec<u32> {
 /// alone; the console's own form reads lane 0 under a narrowed EXEC on
 /// `main`, which #2830 fixes): the halves trade
 /// through slots borrowed from the program's LDS, which then holds the
-/// program's values again. Before, such a program was refused in halves,
-/// or, reading first lanes alone, kept each host wave's own first lane
-/// (carlosmegino's synthetic case).
+/// program's values again. Also check the last size that fits separate
+/// slots and the first size that needs borrowed slots. Before, the full-LDS
+/// program was refused in halves or kept each host wave's own first lane
+/// when it only read first lanes (carlosmegino's synthetic case).
 #[test]
 fn a_trade_beside_a_full_lds_borrows_its_slots_and_gives_them_back_on_every_gpu() {
     let mut failed = Vec::new();
-    for threads in [48, 64, 128] {
+    let words = first_lane_beside_full_lds();
+    const LDS_LIMIT: u32 = 32 * 1024;
+    const DWORD_BYTES: u32 = 4;
+    for threads in [48u32, 64, 128] {
         let want: Vec<u32> = (0..threads)
             .flat_map(|l| [(l & !63) + 36, l + 1000])
             .collect();
-        failed.extend(compared(
-            &first_lane_beside_full_lds(),
-            threads,
-            32768,
-            2,
-            &want,
-            false,
-        ));
+        // Two halves per console wave, with two dwords for each half.
+        let trade_bytes = threads.div_ceil(64) * 2 * 2 * DWORD_BYTES;
+        let last_adjacent = LDS_LIMIT - trade_bytes;
+        for lds in [last_adjacent, last_adjacent + DWORD_BYTES, LDS_LIMIT] {
+            failed.extend(
+                compared(&words, threads, lds, 2, &want, false)
+                    .into_iter()
+                    .map(|reason| format!("{threads} threads with {lds} LDS bytes: {reason}")),
+            );
+        }
     }
     assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
