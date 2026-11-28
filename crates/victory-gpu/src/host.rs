@@ -642,6 +642,13 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn present_compositor_reuses_its_compiled_shaders() {
+        let first = Compositor::shaders().expect("compile the compositor shaders");
+        let second = Compositor::shaders().expect("reuse the compiled shaders");
+        assert!(std::ptr::eq(first, second));
+    }
+
+    #[test]
     fn present_compositor_builds_both_pipeline_states() {
         let Some(host) = host() else {
             eprintln!("skipping compositor initialization: no D3D12 device");
@@ -2791,7 +2798,12 @@ struct Compositor {
 }
 
 impl Compositor {
-    fn new(device: &ID3D12Device, format: DXGI_FORMAT) -> windows::core::Result<Self> {
+    /// The shader programs are the same for every output format.
+    fn shaders() -> windows::core::Result<&'static [Vec<u8>; 2]> {
+        static SHADERS: OnceLock<[Vec<u8>; 2]> = OnceLock::new();
+        if let Some(shaders) = SHADERS.get() {
+            return Ok(shaders);
+        }
         const SOURCE: &str = r#"
             Texture2D tex : register(t0);
             SamplerState smp : register(s0);
@@ -2803,7 +2815,7 @@ impl Compositor {
                 return tex.Sample(smp, uv);
             }
         "#;
-        let compile = |entry: PCSTR, target: PCSTR| -> windows::core::Result<ID3DBlob> {
+        let compile = |entry: PCSTR, target: PCSTR| -> windows::core::Result<Vec<u8>> {
             let mut code: Option<ID3DBlob> = None;
             let mut errors: Option<ID3DBlob> = None;
             // SAFETY: static source and entry/target strings; out pointers ours.
@@ -2835,16 +2847,23 @@ impl Compositor {
                 }
                 return Err(e);
             }
-            code.ok_or_else(windows::core::Error::empty)
+            let code = code.ok_or_else(windows::core::Error::empty)?;
+            // SAFETY: copy the compiled bytes while their blob is alive.
+            Ok(unsafe {
+                std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize())
+            }
+            .to_vec())
         };
         let vs = compile(s!("vs"), s!("vs_5_1"))?;
         let ps = compile(s!("ps"), s!("ps_5_1"))?;
-        // SAFETY: compiled shader blobs live through PSO creation.
+        // Only keep a complete pair, so a failed compile can be retried.
+        Ok(SHADERS.get_or_init(|| [vs, ps]))
+    }
+
+    fn new(device: &ID3D12Device, format: DXGI_FORMAT) -> windows::core::Result<Self> {
+        let [vs_bytes, ps_bytes] = Self::shaders()?;
+        // SAFETY: live device and descriptors backed by storage through each call.
         unsafe {
-            let vs_bytes =
-                std::slice::from_raw_parts(vs.GetBufferPointer().cast::<u8>(), vs.GetBufferSize());
-            let ps_bytes =
-                std::slice::from_raw_parts(ps.GetBufferPointer().cast::<u8>(), ps.GetBufferSize());
             // Wine's D3DCompile does not embed a root signature in the shader blobs.
             let range = D3D12_DESCRIPTOR_RANGE {
                 RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
