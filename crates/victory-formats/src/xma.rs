@@ -715,12 +715,7 @@ impl Decoder {
                 self.ch[c].out = [0.0; FRAME_SAMPLES + FRAME_SAMPLES / 2];
             }
         }
-        out.reserve(FRAME_SAMPLES * self.channels);
-        for i in 0..FRAME_SAMPLES {
-            for c in 0..self.channels {
-                out.push(to_i16(self.ch[c].out[i]));
-            }
-        }
+        self.append_pcm(FRAME_SAMPLES, out);
         for c in 0..self.channels {
             self.ch[c].out.copy_within(FRAME_SAMPLES.., 0);
         }
@@ -730,13 +725,24 @@ impl Decoder {
     /// The overlap left after the last frame, then silence: half a frame of
     /// samples per channel.
     pub fn flush(&mut self, out: &mut Vec<i16>) {
-        out.reserve(FRAME_SAMPLES / 2 * self.channels);
-        for i in 0..FRAME_SAMPLES / 2 {
-            for c in 0..self.channels {
-                out.push(to_i16(self.ch[c].out[i]));
-            }
-        }
+        self.append_pcm(FRAME_SAMPLES / 2, out);
         self.reset();
+    }
+
+    fn append_pcm(&self, samples: usize, out: &mut Vec<i16>) {
+        out.reserve(samples * self.channels);
+        let [left, right] = &self.ch;
+        let left = &left.out[..samples];
+        if self.channels == 1 {
+            out.extend(left.iter().copied().map(to_i16));
+        } else {
+            let right = &right.out[..samples];
+            out.extend(
+                left.iter()
+                    .zip(right)
+                    .flat_map(|(&l, &r)| [to_i16(l), to_i16(r)]),
+            );
+        }
     }
 
     fn frame(&mut self, b: &mut Bits, len: usize) -> Result<(), Error> {
@@ -1240,6 +1246,30 @@ fn to_i16(v: f32) -> i16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn flush_appends_mono_or_interleaved_stereo_and_resets() {
+        for channels in [1, 2] {
+            let mut decoder = Decoder::new(channels, 48_000);
+            decoder.ch[0].out[..4].copy_from_slice(&[-2.0, 1.5 / 32768.0, f32::NAN, 0.125]);
+            decoder.ch[1].out[..4].copy_from_slice(&[2.0, -1.5 / 32768.0, -0.0, -0.25]);
+            let mut pcm = vec![42];
+            decoder.flush(&mut pcm);
+
+            let expected: &[i16] = if channels == 1 {
+                &[42, i16::MIN, 2, 0, 4096]
+            } else {
+                &[42, i16::MIN, i16::MAX, 2, -2, 0, 0, 4096, -8192]
+            };
+            assert_eq!(&pcm[..expected.len()], expected);
+            assert_eq!(pcm.len(), 1 + FRAME_SAMPLES / 2 * channels);
+            assert!(pcm[expected.len()..].iter().all(|&sample| sample == 0));
+
+            pcm.clear();
+            decoder.flush(&mut pcm);
+            assert_eq!(pcm, vec![0; FRAME_SAMPLES / 2 * channels]);
+        }
+    }
 
     /// Writes `value` as `n` bits, MSB first, at bit `pos`.
     fn put_bits(data: &mut [u8], pos: usize, n: u32, value: u32) {
