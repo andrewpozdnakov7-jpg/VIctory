@@ -689,7 +689,7 @@ extern "system" fn current_reading(
 fn relative(
     this: This,
     reference: *const Reading,
-    kind: u32,
+    kinds: u32,
     device: *const Device,
     out: Out,
     forward: bool,
@@ -721,22 +721,24 @@ fn relative(
     } else {
         index..index + 1
     };
-    let candidates = devices
-        .flat_map(|i| {
-            let history = &state.slots[i].history;
-            history
-                .iter()
-                .map(move |r| ((r.timestamp, i, r.sequence), r))
-        })
-        .filter(|(_, r)| r.kind() & kind != 0);
+    // Each device's history is sorted by timestamp and then sequence, even
+    // after it wraps. Only its nearest matching reading can win the merge.
+    let candidates = devices.filter(|&i| kind(i) & kinds != 0).filter_map(|i| {
+        let history = &state.slots[i].history;
+        let key = |r: &Ref| (r.timestamp, i, r.sequence);
+        let reading = if forward {
+            let split = history.partition_point(|r| key(r) <= at);
+            history.get(split)
+        } else {
+            let split = history.partition_point(|r| key(r) < at);
+            history.get(split.checked_sub(1)?)
+        }?;
+        Some((key(reading), reading))
+    });
     let found = if forward {
-        candidates
-            .filter(|(key, _)| *key > at)
-            .min_by_key(|(key, _)| *key)
+        candidates.min_by_key(|(key, _)| *key)
     } else {
-        candidates
-            .filter(|(key, _)| *key < at)
-            .max_by_key(|(key, _)| *key)
+        candidates.max_by_key(|(key, _)| *key)
     };
     hand(out, found.map(|(_, r)| r))
 }
@@ -1677,6 +1679,62 @@ mod tests {
         assert_eq!(walk(hub, 0x30, pad_a), Err(READING_NOT_FOUND));
         for r in order {
             release(r);
+        }
+    }
+
+    #[test]
+    fn relative_readings_walk_wrapped_histories_with_tied_timestamps() {
+        let (hub, _) = fake();
+        let base = now() + 1;
+        let mut state = hub.state();
+        for update in 0..HISTORY + 4 {
+            for index in 0..2 {
+                let value = PadState {
+                    buttons: if update % 2 == 0 { A } else { B },
+                    ..Default::default()
+                };
+                state.update(
+                    &hub.devices,
+                    index,
+                    Some(Value::Pad(value)),
+                    base + (update / 2) as u64,
+                    &mut Vec::new(),
+                );
+            }
+        }
+        let first = &state.slots[0].history;
+        let second = &state.slots[1].history;
+        assert!(!first.as_slices().1.is_empty());
+        let readings = [
+            first[0].share(),
+            first[1].share(),
+            second[0].share(),
+            second[1].share(),
+            first[2].share(),
+        ];
+        drop(state);
+
+        let around = |reference, forward| {
+            let mut out = std::ptr::null();
+            let hr = relative(
+                &hub.object,
+                reference,
+                GAMEPAD_KIND,
+                std::ptr::null(),
+                &mut out,
+                forward,
+            );
+            result(hr, out)
+        };
+        for pair in readings.windows(2) {
+            let next = around(pair[0], true).unwrap();
+            let prev = around(pair[1], false).unwrap();
+            assert_eq!((next, prev), (pair[1], pair[0]));
+            release(next);
+            release(prev);
+        }
+        for reading in readings {
+            release(reading);
         }
     }
 
