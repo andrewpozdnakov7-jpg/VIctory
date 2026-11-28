@@ -426,11 +426,16 @@ impl Rotations {
         }
         self.butterflies(re, im);
         let post = self.post_re.iter().zip(&self.post_im);
-        for (k, ((&re, &im), (&c, &s))) in re.iter().zip(im.iter()).zip(post).enumerate() {
-            let (wr, wi) = (re * c - im * s, re * s + im * c);
-            // DCT-IV: c[2k] = Re, c[n-1-2k] = -Im; output j is c[n-1-j].
-            out[n - 1 - 2 * k] = (wr as f32) * scale;
-            out[2 * k] = -(wi as f32) * scale;
+        let points = re.iter().zip(im.iter()).zip(post);
+        let pairs = out[..n].as_chunks_mut::<2>().0;
+        // DCT-IV puts the imaginary component forward and the real component
+        // backward. Pair their mirror points to write in output order.
+        for ([even, odd], (front, back)) in pairs.iter_mut().zip(points.clone().zip(points.rev())) {
+            let ((&re, &im), (&c, &s)) = front;
+            *even = -((re * s + im * c) as f32) * scale;
+
+            let ((&re, &im), (&c, &s)) = back;
+            *odd = ((re * c - im * s) as f32) * scale;
         }
     }
 
