@@ -429,4 +429,122 @@ mod tests {
         assert_eq!(XDspDeactivate(stream), S_OK);
         assert_eq!(XDspDisconnect(dsp), S_OK);
     }
+
+    #[test]
+    fn convolution_gain_matches_direct_reference() {
+        const BLOCK: usize = 1024;
+        const GAINS: [[f32; 2]; 4] = [[0.25, 0.75], [0.75, 1.0], [1.0, 1.0], [1.0, 0.25]];
+        let taps = [
+            (0, 0.375),
+            (1, 0.375),
+            (1022, 0.125),
+            (1023, 0.125),
+            (1024, 0.125),
+            (1025, 0.125),
+            (2046, -0.0625),
+            (2047, -0.0625),
+        ];
+        let mut ir = vec![0.0; BLOCK * 2];
+        for (index, value) in taps {
+            ir[index] = value;
+        }
+        let encoded = crate::modules::dsp_convolve::title_ir(&ir, BLOCK);
+
+        let mut scratch = vec![0u8; 0x1_0000];
+        let mut dsp = std::ptr::null_mut();
+        assert_eq!(
+            XDspConnectWithMaximumStreamLimit(
+                scratch.as_mut_ptr().cast(),
+                0x1_0000,
+                24,
+                4,
+                1,
+                &mut dsp
+            ),
+            S_OK,
+        );
+        let mut outcomes = Vec::new();
+        for (level, amplitude) in [("quiet", 0.125), ("loud", 0.75)] {
+            let input: Vec<f32> = (0..BLOCK * GAINS.len())
+                .map(|index| amplitude * [1.0, 0.875, 1.0, 0.75, 1.0][index % 5])
+                .collect();
+            for (mode, command_gains) in [
+                ("unity", [[1.0; 2]; GAINS.len()]),
+                ("ramp", GAINS),
+                ("double-start", GAINS.map(|[start, _]| [2.0 * start; 2])),
+            ] {
+                let desc = StreamDesc {
+                    kind: CONVOLUTION,
+                    options: 0,
+                    frames: BLOCK as u32,
+                    channels: 1,
+                    ir_floats: encoded.len() as u32,
+                    ir: encoded.as_ptr(),
+                };
+                let (mut status, mut stream) = (std::ptr::null(), std::ptr::null_mut());
+                assert_eq!(XDspActivate(dsp, &desc, &mut status, &mut stream), S_OK);
+                let mut actual = Vec::new();
+                let mut expected = Vec::new();
+                let mut clipped_reference = 0;
+                for (block, gains) in command_gains.into_iter().enumerate() {
+                    let start = block * BLOCK;
+                    let mut output = vec![f32::NAN; BLOCK];
+                    let command = Command {
+                        gains,
+                        input: input[start..start + BLOCK].as_ptr(),
+                        output: output.as_mut_ptr(),
+                        reserved: 0,
+                    };
+                    let mut ticket = 0;
+                    assert_eq!(XDspSubmitCommand(stream, &command, &mut ticket), S_OK);
+                    assert_eq!(ticket, block as u32 + 1);
+                    assert_eq!(
+                        unsafe { ((*status).completed, (*status).result) },
+                        (ticket, S_OK)
+                    );
+                    actual.extend(output);
+                    for offset in 0..BLOCK {
+                        let wet: f32 = taps
+                            .iter()
+                            .filter_map(|&(delay, coefficient)| {
+                                (start + offset)
+                                    .checked_sub(delay)
+                                    .map(|i| input[i] * coefficient)
+                            })
+                            .sum();
+                        let gain = gains[0] + (gains[1] - gains[0]) * offset as f32 / BLOCK as f32;
+                        let scaled = wet * gain;
+                        clipped_reference += usize::from(scaled > 1.00005);
+                        expected.push(scaled.clamp(-1.0, 1.0));
+                    }
+                }
+                assert_eq!(XDspDeactivate(stream), S_OK);
+                assert!(actual.iter().all(|sample| sample.is_finite()));
+                let peak = actual.iter().copied().map(f32::abs).fold(0.0, f32::max);
+                let rms = (actual
+                    .iter()
+                    .map(|&sample| f64::from(sample).powi(2))
+                    .sum::<f64>()
+                    / actual.len() as f64)
+                    .sqrt();
+                let clipped = actual.iter().filter(|&&sample| sample == 1.0).count();
+                let max_error = actual
+                    .iter()
+                    .zip(expected)
+                    .map(|(a, e)| (a - e).abs())
+                    .fold(0.0, f32::max);
+                println!(
+                    "{level} {mode}: {} samples, peak {peak:.6}, rms {rms:.6}, clipped {clipped}/{clipped_reference}, max_error {max_error:.8}",
+                    actual.len()
+                );
+                outcomes.push((level, mode, clipped, clipped_reference, max_error));
+            }
+        }
+        assert_eq!(XDspDisconnect(dsp), S_OK);
+        for (level, mode, clipped, expected_clipped, max_error) in outcomes {
+            assert!(max_error < 0.00005, "{level} {mode}: max_error {max_error}");
+            assert_eq!(clipped, expected_clipped, "{level} {mode}");
+            assert_eq!(clipped > 0, level == "loud" && mode == "double-start");
+        }
+    }
 }

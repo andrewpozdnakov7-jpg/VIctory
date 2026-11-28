@@ -292,6 +292,32 @@ pub(crate) fn encode_ir(time: &[f32], block: usize) -> Vec<f32> {
 }
 
 #[cfg(test)]
+/// The IR as build 1.0.2.1 of the title hands it over: partition `k`
+/// is the spectrum of `time[k * block..k * block + 2 * block]` (2-block
+/// windows a block apart), and one last partition starts with the word
+/// 0xfffface1.
+pub(crate) fn title_ir(time: &[f32], block: usize) -> Vec<f32> {
+    let blocks = time.len() / block;
+    let mut out = Vec::with_capacity((blocks + 1) * block * 2);
+    for block_index in 0..blocks {
+        let mut spectrum = vec![Complex::default(); block * 2];
+        for (i, slot) in spectrum.iter_mut().enumerate() {
+            let sample = time.get(block_index * block + i).copied().unwrap_or(0.0);
+            *slot = Complex::new(sample, 0.0);
+        }
+        fft(&mut spectrum, false);
+        for value in &spectrum[..block] {
+            out.push(value.re);
+            out.push(value.im);
+        }
+    }
+    let mut trailer = vec![0.0f32; block * 2];
+    trailer[0] = f32::from_bits(0xffff_ace1);
+    out.extend(trailer);
+    out
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -427,31 +453,6 @@ mod tests {
         let short = Vec::new();
         let mut output = Vec::new();
         assert!(!convolver.process(&short, &mut output, [1.0, 1.0], false, false));
-    }
-
-    /// The IR as build 1.0.2.1 of the title hands it over: partition `k`
-    /// is the spectrum of `time[k * block..k * block + 2 * block]` (2-block
-    /// windows a block apart), and one last partition starts with the word
-    /// 0xfffface1.
-    fn title_ir(time: &[f32], block: usize) -> Vec<f32> {
-        let blocks = time.len() / block;
-        let mut out = Vec::with_capacity((blocks + 1) * block * 2);
-        for block_index in 0..blocks {
-            let mut spectrum = vec![Complex::default(); block * 2];
-            for (i, slot) in spectrum.iter_mut().enumerate() {
-                let sample = time.get(block_index * block + i).copied().unwrap_or(0.0);
-                *slot = Complex::new(sample, 0.0);
-            }
-            fft(&mut spectrum, false);
-            for value in &spectrum[..block] {
-                out.push(value.re);
-                out.push(value.im);
-            }
-        }
-        let mut trailer = vec![0.0f32; block * 2];
-        trailer[0] = f32::from_bits(0xffff_ace1);
-        out.extend(trailer);
-        out
     }
 
     #[test]
