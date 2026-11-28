@@ -305,48 +305,80 @@ fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
     }
 }
 
-/// Diagnostics, `VICTORY_GPU_TIMING`: GPU time per kind of command and
-/// pipeline (ms, commands) and lists' wall time against the sum of their
-/// commands' (ms), since the last frame-rate line.
+/// GPU timing accumulated since the last frame-rate line.
 #[cfg(feature = "diagnostics")]
-type GpuTimes = (std::collections::HashMap<String, (f64, u64)>, f64, f64);
-#[cfg(feature = "diagnostics")]
-static GPU_TIMES: Mutex<Option<GpuTimes>> = Mutex::new(None);
+#[derive(Default)]
+struct GpuTimes {
+    by: std::collections::HashMap<String, (f64, u64)>,
+    wall_ms: f64,
+    command_ms: f64,
+    lists_with_timestamps: u64,
+    lists_without_timestamps: u64,
+}
 
-/// Adds a timed list's commands (from [`HostList::slowest`]) to [`GPU_TIMES`],
-/// by the command's kind and pipeline: its note before the first ` | `,
-/// without counts and addresses.
 #[cfg(feature = "diagnostics")]
-fn gpu_times(wall: Duration, commands: &[(f64, String)]) {
-    let mut times = GPU_TIMES.lock().unwrap_or_else(|e| e.into_inner());
-    let (by, wall_ms, sum) = times.get_or_insert_with(Default::default);
-    *wall_ms += wall.as_secs_f64() * 1e3;
-    for (ms, note) in commands {
-        // "draw 3x1 [mesh 1f.., pixel 2e..] | ...": the kind and the pipeline.
-        let head = note.split(" | ").next().unwrap_or_default();
-        let kind = head.split(' ').next().unwrap_or_default();
-        let key = match head.find('[') {
-            Some(at) => format!("{kind} {}", &head[at..]),
-            None => kind.to_owned(),
+impl GpuTimes {
+    /// Keeps each list's wall time, with command intervals when available.
+    fn record(&mut self, wall: Duration, commands: Option<&[(f64, String)]>) {
+        self.wall_ms += wall.as_secs_f64() * 1e3;
+        let Some(commands) = commands else {
+            self.lists_without_timestamps += 1;
+            return;
         };
-        let e = by.entry(key).or_default();
-        (e.0, e.1) = (e.0 + ms, e.1 + 1);
-        *sum += ms;
+        self.lists_with_timestamps += 1;
+        for (ms, note) in commands {
+            // "draw 3x1 [mesh 1f.., pixel 2e..] | ...": the kind and the pipeline.
+            let head = note.split(" | ").next().unwrap_or_default();
+            let kind = head.split(' ').next().unwrap_or_default();
+            let key = match head.find('[') {
+                Some(at) => format!("{kind} {}", &head[at..]),
+                None => kind.to_owned(),
+            };
+            let e = self.by.entry(key).or_default();
+            (e.0, e.1) = (e.0 + ms, e.1 + 1);
+            self.command_ms += ms;
+        }
     }
 }
 
-/// Logs [`GPU_TIMES`] per frame over `frames` frames: the 25 costliest.
+#[cfg(all(test, feature = "diagnostics"))]
+#[test]
+fn gpu_timing_distinguishes_empty_and_unavailable_timestamps() {
+    let mut times = GpuTimes::default();
+    times.record(Duration::from_millis(20), None);
+    times.record(Duration::from_millis(10), Some(&[]));
+    times.record(Duration::from_millis(5), Some(&[(3.0, "copy".into())]));
+    assert_eq!((times.lists_with_timestamps, times.lists_without_timestamps), (2, 1));
+    assert_eq!((times.wall_ms, times.command_ms), (35.0, 3.0));
+    assert_eq!(times.by.get("copy"), Some(&(3.0, 1)));
+}
+
+#[cfg(feature = "diagnostics")]
+static GPU_TIMES: Mutex<Option<GpuTimes>> = Mutex::new(None);
+
+#[cfg(feature = "diagnostics")]
+fn gpu_times(wall: Duration, commands: Option<&[(f64, String)]>) {
+    GPU_TIMES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(Default::default)
+        .record(wall, commands);
+}
+
+/// Logs the timing per frame over the window, followed by the 25 costliest commands.
 #[cfg(feature = "diagnostics")]
 fn log_gpu_times(frames: f64) {
-    let Some((by, wall, sum)) = GPU_TIMES.lock().unwrap_or_else(|e| e.into_inner()).take() else {
+    let Some(times) = GPU_TIMES.lock().unwrap_or_else(|e| e.into_inner()).take() else {
         return;
     };
     tracing::info!(
+        lists_with_timestamps = times.lists_with_timestamps,
+        lists_without_timestamps = times.lists_without_timestamps,
         "GPU timing: lists {:.1} ms/frame of wall time, their commands {:.1} ms/frame",
-        wall / frames,
-        sum / frames
+        times.wall_ms / frames,
+        times.command_ms / frames
     );
-    let mut by: Vec<_> = by.into_iter().collect();
+    let mut by: Vec<_> = times.by.into_iter().collect();
     by.sort_by(|a, b| b.1.0.total_cmp(&a.1.0));
     for (key, (ms, n)) in by.iter().take(25) {
         tracing::info!("  GPU {:.2} ms/frame in {:.1} commands/frame: {key}", ms / frames, *n as f64 / frames);
@@ -363,7 +395,7 @@ fn finish_timing_test_window(_: Instant) -> u64 {
         .lock()
         .unwrap()
         .as_ref()
-        .map_or(0, |(by, _, _)| by.values().map(|(_, count)| *count).sum());
+        .map_or(0, |times| times.by.values().map(|(_, count)| *count).sum());
     log_gpu_times(1.0);
     count
 }
@@ -1307,16 +1339,18 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             if timing() {
                 // SAFETY: a plain query.
-                let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
-                gpu_times(started.elapsed(), &runs[i].slowest(frequency, usize::MAX));
+                let frequency = unsafe { self.queue.GetTimestampFrequency() }.ok();
+                let wall = started.elapsed();
+                let commands = runs[i].slowest(frequency, usize::MAX);
+                gpu_times(wall, commands.as_deref());
             }
             #[cfg(feature = "diagnostics")]
             if groups.len() > 1 && started.elapsed() > std::time::Duration::from_millis(50) {
                 // SAFETY: a plain query.
-                let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
+                let frequency = unsafe { self.queue.GetTimestampFrequency() }.ok();
                 let commands = runs[i].notes.lock().unwrap_or_else(|e| e.into_inner()).len();
                 tracing::warn!(ms = started.elapsed().as_millis(), commands, "slow host list");
-                for (ms, op) in runs[i].slowest(frequency, 6) {
+                for (ms, op) in runs[i].slowest(frequency, 6).into_iter().flatten() {
                     tracing::warn!("slow list command, {ms:.1} ms: {op}");
                 }
             }
@@ -1728,17 +1762,17 @@ impl HostList {
     /// The noted commands that took longest on the GPU, longest first, as
     /// (milliseconds, text) (diagnostics, timing on, after the list ran).
     #[cfg(feature = "diagnostics")]
-    fn slowest(&self, frequency: u64, n: usize) -> Vec<(f64, String)> {
+    fn slowest(&self, frequency: Option<u64>, n: usize) -> Option<Vec<(f64, String)>> {
+        let frequency = frequency.filter(|&hz| hz != 0)?;
         let notes = self.notes.lock().unwrap_or_else(|e| e.into_inner());
-        let (Some((_, back)), count) = (self.stamps(), notes.len().min(STAMPS as usize - 1)) else {
-            return Vec::new();
-        };
+        let (_, back) = self.stamps()?;
+        let count = notes.len().min(STAMPS as usize - 1);
         let mut data = std::ptr::null_mut();
         let range = D3D12_RANGE { Begin: 0, End: (count + 1) * 8 };
         // SAFETY: a read-back buffer the finished list resolved into.
         let stamps: Vec<u64> = unsafe {
             if back.Map(0, Some(&range), Some(&mut data)).is_err() {
-                return Vec::new();
+                return None;
             }
             let s = std::slice::from_raw_parts(data.cast::<u64>(), count + 1).to_vec();
             back.Unmap(0, None);
@@ -1747,12 +1781,12 @@ impl HostList {
         let mut times: Vec<(f64, String)> = (0..count)
             .map(|i| {
                 let ticks = stamps[i + 1].saturating_sub(stamps[i]);
-                (ticks as f64 * 1e3 / frequency.max(1) as f64, notes[i].0.chars().take(300).collect())
+                (ticks as f64 * 1e3 / frequency as f64, notes[i].0.chars().take(300).collect())
             })
             .collect();
         times.sort_by(|a, b| b.0.total_cmp(&a.0));
         times.truncate(n);
-        times
+        Some(times)
     }
 
     /// Whether `node` of the device-removed data (its breadcrumbs) is this
