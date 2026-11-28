@@ -3009,22 +3009,26 @@ struct Presenter {
     copy: HostList,
     hwnd: HWND,
     meter: Meter,
-    /// One render target view, for the back buffer the readout is drawn on.
-    rtv: ID3D12DescriptorHeap,
+    /// Render target view for the optional frame readout.
+    readout_rtv: Option<ID3D12DescriptorHeap>,
     compositor: Option<Compositor>,
 }
 
 impl Presenter {
     /// Writes the frame rate and frame time in the top left corner of
-    /// `back`, which is a render target on `list`.
+    /// the back buffer.
     ///
     /// # Safety
-    /// `back` is this swap chain's buffer, in the render target state.
-    unsafe fn readout(&self, device: &ID3D12Device, list: &ID3D12GraphicsCommandList, back: &ID3D12Resource) {
-        let Some((fps, ms)) = self.meter.shown else { return };
-        if !crate::readout::on() {
+    /// The back buffer is in the copy destination state on this list.
+    unsafe fn readout(
+        &self,
+        device: &ID3D12Device,
+        list: &ID3D12GraphicsCommandList,
+        back: &ID3D12Resource,
+    ) {
+        let (Some(heap), Some((fps, ms))) = (&self.readout_rtv, self.meter.shown) else {
             return;
-        }
+        };
         let text = format!("{fps:.1} FPS  {ms:.0} MS");
         // Dots that keep their share of the picture at any size.
         let dot = (self.height as i32 / 216).max(2);
@@ -3036,16 +3040,27 @@ impl Presenter {
             right: at.0 + w * dot,
             bottom: at.1 + h * dot,
         };
+        if behind.right > self.width as i32 || behind.bottom > self.height as i32 {
+            return;
+        }
         let marks = crate::readout::rects(&text, at, dot);
-        // SAFETY: our heap of one view, and rectangles inside the picture
-        // (a text of a few characters at this size).
+        // SAFETY: this list owns the back buffer in the caller's copy
+        // destination state and all rectangles fit within its RTV.
         unsafe {
-            let view = self.rtv.GetCPUDescriptorHandleForHeapStart();
+            let view = heap.GetCPUDescriptorHandleForHeapStart();
             device.CreateRenderTargetView(back, None, view);
-            if behind.right <= self.width as i32 && behind.bottom <= self.height as i32 {
-                list.ClearRenderTargetView(view, &[0.0, 0.0, 0.0, 1.0], Some(&[behind]));
-                list.ClearRenderTargetView(view, &[1.0, 0.9, 0.1, 1.0], Some(&marks));
-            }
+            list.ResourceBarrier(&[transition(
+                back,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_RENDER_TARGET,
+            )]);
+            list.ClearRenderTargetView(view, &[0.0, 0.0, 0.0, 1.0], Some(&[behind]));
+            list.ClearRenderTargetView(view, &[1.0, 0.9, 0.1, 1.0], Some(&marks));
+            list.ResourceBarrier(&[transition(
+                back,
+                D3D12_RESOURCE_STATE_RENDER_TARGET,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+            )]);
         }
     }
 }
@@ -3368,19 +3383,7 @@ impl Host {
                     let _ = frame;
                     (None::<()>, None::<()>)
                 };
-                // The frame rate and frame time in the picture's corner: two
-                // cleared rectangles on the back buffer, no shader or font.
-                list.ResourceBarrier(&[transition(
-                    &back,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                    D3D12_RESOURCE_STATE_RENDER_TARGET,
-                )]);
                 p.readout(&self.device, list, &back);
-                list.ResourceBarrier(&[transition(
-                    &back,
-                    D3D12_RESOURCE_STATE_RENDER_TARGET,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                )]);
                 let mut after = Vec::with_capacity(2);
                 if state != D3D12_RESOURCE_STATE_COPY_SOURCE {
                     after.push(transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state));
@@ -3577,14 +3580,21 @@ impl Host {
                 .map_err(|e| ("swap chain", e))?;
             let copy = self.new_list().map_err(|e| ("copy list", e))?;
             copy.close();
-            let rtv: ID3D12DescriptorHeap = self
-                .device
-                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+            let readout_rtv = if crate::readout::on() {
+                match self.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                     Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
                     NumDescriptors: 1,
                     ..Default::default()
-                })
-                .map_err(|e| ("readout heap", e))?;
+                }) {
+                    Ok(heap) => Some(heap),
+                    Err(error) => {
+                        tracing::warn!(%error, "frame readout unavailable");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
             tracing::info!(width, height, format = format.0, "presenting to a window");
             Ok(Presenter {
                 swap_chain,
@@ -3594,7 +3604,7 @@ impl Host {
                 copy,
                 hwnd,
                 meter: Meter::new(),
-                rtv,
+                readout_rtv,
                 compositor: None,
             })
         }
