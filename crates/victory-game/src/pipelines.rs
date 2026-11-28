@@ -140,11 +140,11 @@ impl Named {
             if !tried.insert((g.depth_stencil_hash, g.blend_hash, formats, regs)) {
                 continue;
             }
+            // A register image can also name a state needed by another record.
             if want.depth.contains(&g.depth_stencil_hash) {
-                let target = g.depth_stencil_hash;
                 let _ = depth_from_registers(&regs, |b| {
                     self.try_depth(want, &b);
-                    if want.depth.contains(&target) {
+                    if !want.depth.is_empty() {
                         std::ops::ControlFlow::Continue(())
                     } else {
                         std::ops::ControlFlow::Break(())
@@ -152,10 +152,9 @@ impl Named {
                 });
             }
             if want.blend.contains(&g.blend_hash) {
-                let target = g.blend_hash;
                 let _ = blend_from_registers(&regs, &formats, |b| {
                     self.try_blend(want, &b);
-                    if want.blend.contains(&target) {
+                    if !want.blend.is_empty() {
                         std::ops::ControlFlow::Continue(())
                     } else {
                         std::ops::ControlFlow::Break(())
@@ -808,6 +807,51 @@ mod tests {
         });
         assert!(flow.is_break());
         assert_eq!(visited, 1);
+    }
+
+    #[test]
+    fn one_register_image_can_name_two_wanted_depth_states() {
+        const HEADER: usize = 0x80;
+        const RECORD: usize = 0x70;
+        const PACKET: usize = 0x144;
+        const METADATA: usize = 0x18;
+        let mut depth = [0; DEPTH];
+        depth[..14].copy_from_slice(&[0, 0, 1, 0, 0xff, 0xff, 1, 1, 1, 8, 1, 1, 1, 8]);
+        depth[22..].copy_from_slice(&[1, 1]);
+        let default_hash = city64(&depth);
+        // The stencil masks are inactive. One image retains them, while
+        // the other image has zeroes. Both records still need their hashes.
+        let masks = [0x3d, 0xa6];
+        depth[4..6].copy_from_slice(&masks);
+        let other_hash = city64(&depth);
+
+        let mut bytes = vec![0u8; HEADER];
+        bytes[..4].copy_from_slice(crate::shaderpack::MAGIC);
+        bytes[0x50..0x54].copy_from_slice(&2u32.to_le_bytes());
+        bytes[0x58..0x5c].copy_from_slice(&3u32.to_le_bytes());
+        bytes[0x60..0x64].copy_from_slice(&((2 * PACKET + METADATA) as u32).to_le_bytes());
+        for (packet_index, hash) in [default_hash, other_hash].into_iter().enumerate() {
+            let mut row = [0u8; RECORD];
+            row[8..12].copy_from_slice(&(packet_index as u32).to_le_bytes());
+            row[12..16].copy_from_slice(&2u32.to_le_bytes());
+            row[0x20..0x28].copy_from_slice(&hash.to_le_bytes());
+            row[0x38..].fill(0xff);
+            bytes.extend(row);
+        }
+        for (offset, size) in [(0, PACKET), (PACKET, PACKET), (2 * PACKET, METADATA)] {
+            bytes.extend((offset as u32).to_le_bytes());
+            bytes.extend((size as u32).to_le_bytes());
+        }
+        let mut packet = [0u8; PACKET];
+        packet[0x114..0x118].copy_from_slice(&[0, masks[0], masks[1], 0]);
+        bytes.extend(packet);
+        bytes.extend([0; PACKET + METADATA]);
+
+        let pack = Pack::parse(&bytes).unwrap();
+        let named = Named::find(&pack, &[]);
+        assert_eq!(named.source.get(&default_hash), Some(&"registers"));
+        assert_eq!(named.depth.get(&other_hash), Some(&depth));
+        assert_eq!(named.source.get(&other_hash), Some(&"registers"));
     }
 
     /// A record's metadata: targets 28 and 10, depth format 40, topology
