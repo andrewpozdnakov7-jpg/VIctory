@@ -230,18 +230,14 @@ pub fn run(paths: &[PathBuf], threads: usize) -> Result<()> {
         (made - made0, loaded - loaded0)
     };
     std::thread::scope(|s| {
-        let workers: Vec<_> = (0..threads.min(todo.len()))
-            .map(|_| {
-                s.spawn(|| {
-                    while let Some(&job) = todo.get(next.fetch_add(1, Ordering::Relaxed)) {
-                        if let Err(why) = prepare(job).and_then(|p| p.make()) {
-                            skip(why);
-                        }
-                        completed.fetch_add(1, Ordering::Relaxed);
-                    }
-                })
-            })
-            .collect();
+        let workers = crate::translate::ReportWorkers::spawn(s, threads.min(todo.len()), || {
+            while let Some(&job) = todo.get(next.fetch_add(1, Ordering::Relaxed)) {
+                if let Err(why) = prepare(job).and_then(|p| p.make()) {
+                    skip(why);
+                }
+                completed.fetch_add(1, Ordering::Relaxed);
+            }
+        });
         let (n, what) = (todo.len(), "pipelines to make");
         crate::translate::report(pack_path, n, what, &completed, started, &workers, || {
             let (made, loaded) = counts();
