@@ -406,6 +406,10 @@ pub(crate) fn video_memory() -> Option<[(f64, f64); 2]> {
     Some([info(DXGI_MEMORY_SEGMENT_GROUP_LOCAL)?, info(DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL)?])
 }
 
+#[cfg(all(test, feature = "diagnostics"))]
+#[path = "host/timing_stats_warp.rs"]
+mod timing_stats_warp;
+
 #[cfg(test)]
 pub(crate) mod tests {
     thread_local! {
@@ -864,6 +868,9 @@ pub(crate) struct HostList {
     /// and at the end, and where they are read back.
     #[cfg(feature = "diagnostics")]
     stamps: OnceLock<Option<(ID3D12QueryHeap, ID3D12Resource)>>,
+    /// With `VICTORY_GPU_TIMING`: pipeline statistics and readback for timed commands.
+    #[cfg(feature = "diagnostics")]
+    stats: OnceLock<Option<(ID3D12QueryHeap, ID3D12Resource)>>,
 }
 
 // SAFETY: D3D12 objects are free-threaded; a host list is recorded by the
@@ -884,7 +891,11 @@ const STAMPS: u32 = 4096;
 #[cfg(feature = "diagnostics")]
 const MAX_TIMED_COMMANDS: usize = STAMPS as usize - 1;
 
-/// A marker's text and the host range its command reads (diagnostics).
+/// Bytes of one pipeline statistics result.
+#[cfg(feature = "diagnostics")]
+const STATS_BYTES: usize = std::mem::size_of::<D3D12_QUERY_DATA_PIPELINE_STATISTICS>();
+
+/// A command's text and the host range it reads (diagnostics).
 #[cfg(feature = "diagnostics")]
 type Note = (String, Option<(u64, u64)>);
 
@@ -1183,6 +1194,8 @@ impl Host {
                 targets: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
                 stamps: OnceLock::new(),
+                #[cfg(feature = "diagnostics")]
+                stats: OnceLock::new(),
             })
         }
     }
@@ -1289,7 +1302,9 @@ impl Host {
         crate::copystat::add(crate::copystat::C::FaultsPrep, crate::copystat::page_faults().saturating_sub(faults));
         // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
         #[cfg(feature = "diagnostics")]
-        let groups: Vec<&[Option<ID3D12CommandList>]> = if timing() {
+        let timed = timing();
+        #[cfg(feature = "diagnostics")]
+        let groups: Vec<&[Option<ID3D12CommandList>]> = if timed {
             firsts
                 .iter()
                 .zip(firsts.iter().skip(1).chain([&lists.len()]))
@@ -1323,21 +1338,30 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             crate::resource::life::note(0, crate::resource::life::RAN, *submitted, 0);
             #[cfg(feature = "diagnostics")]
-            if groups.len() > 1 {
-                // SAFETY: a plain query.
-                let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
-                let wall = started.elapsed();
-                let (commands, beyond_limit) = runs[i].slowest(frequency, usize::MAX);
-                gpu_times(wall, &commands, beyond_limit);
-            }
-            #[cfg(feature = "diagnostics")]
-            if groups.len() > 1 && started.elapsed() > std::time::Duration::from_millis(50) {
-                // SAFETY: a plain query.
-                let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
-                let commands = runs[i].notes.lock().unwrap_or_else(|e| e.into_inner()).len();
-                tracing::warn!(ms = started.elapsed().as_millis(), commands, "slow host list");
-                for (ms, op) in runs[i].slowest(frequency, 6).0 {
-                    tracing::warn!("slow list command, {ms:.1} ms: {op}");
+            if timed {
+                // SAFETY: query the live fence. Readback requires completed work.
+                let completed = unsafe { self.fence.GetCompletedValue() };
+                if completed != u64::MAX && completed >= *submitted {
+                    let wall = started.elapsed();
+                    let slow = wall > std::time::Duration::from_millis(50);
+                    if (groups.len() > 1 || slow)
+                        // SAFETY: query the timestamp frequency of the live queue.
+                        && let Some(frequency) = unsafe { self.queue.GetTimestampFrequency() }
+                            .ok()
+                            .filter(|&hz| hz != 0)
+                    {
+                        if groups.len() > 1 {
+                            let (commands, beyond_limit) = runs[i].slowest(frequency, usize::MAX, false);
+                            gpu_times(wall, &commands, beyond_limit);
+                        }
+                        if slow {
+                            let commands = runs[i].notes.lock().unwrap_or_else(|e| e.into_inner()).len();
+                            tracing::warn!(ms = wall.as_millis(), commands, "slow host list");
+                            for (ms, op) in runs[i].slowest(frequency, 6, true).0 {
+                                tracing::warn!("slow list command, {ms:.1} ms: {op}");
+                            }
+                        }
+                    }
                 }
             }
             // SAFETY: a plain query.
@@ -1745,13 +1769,66 @@ impl HostList {
             .as_ref()
     }
 
-    /// The longest noted GPU commands (milliseconds, text), and how many
-    /// notes were beyond the timestamp budget. Read after the list ran.
+    /// The pipeline-statistics heap and its read-back buffer (diagnostics, timing on).
     #[cfg(feature = "diagnostics")]
-    fn slowest(&self, frequency: u64, n: usize) -> (Vec<(f64, String)>, usize) {
+    fn stats(&self) -> Option<&(ID3D12QueryHeap, ID3D12Resource)> {
+        if !timing() {
+            return None;
+        }
+        self.stats
+            .get_or_init(|| {
+                let device = &host()?.device;
+                let mut heap: Option<ID3D12QueryHeap> = None;
+                let mut back: Option<ID3D12Resource> = None;
+                let readback = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() };
+                let desc = D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                    Width: (MAX_TIMED_COMMANDS * STATS_BYTES) as u64,
+                    Height: 1,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                    ..Default::default()
+                };
+                // SAFETY: plain object creation.
+                unsafe {
+                    device
+                        .CreateQueryHeap(
+                            &D3D12_QUERY_HEAP_DESC {
+                                Type: D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS,
+                                Count: MAX_TIMED_COMMANDS as u32,
+                                NodeMask: 0,
+                            },
+                            &mut heap,
+                        )
+                        .ok()?;
+                    device
+                        .CreateCommittedResource(
+                            &readback,
+                            D3D12_HEAP_FLAG_NONE,
+                            &desc,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                            None,
+                            &mut back,
+                        )
+                        .ok()?;
+                }
+                Some((heap?, back?))
+            })
+            .as_ref()
+    }
+
+    /// The longest noted GPU commands (milliseconds, text), and how many
+    /// notes were beyond the timestamp budget. Include statistics only for log rows.
+    #[cfg(feature = "diagnostics")]
+    fn slowest(&self, frequency: u64, n: usize, with_stats: bool) -> (Vec<(f64, String)>, usize) {
         let notes = self.notes.lock().unwrap_or_else(|e| e.into_inner());
         let count = notes.len().min(MAX_TIMED_COMMANDS);
         let beyond_limit = notes.len() - count;
+        if count == 0 {
+            return (Vec::new(), beyond_limit);
+        }
         let Some((_, back)) = self.stamps() else {
             return (Vec::new(), beyond_limit);
         };
@@ -1766,15 +1843,38 @@ impl HostList {
             back.Unmap(0, None);
             s
         };
-        let mut times: Vec<(f64, String)> = (0..count)
+        let mut times: Vec<_> = (0..count)
             .map(|i| {
                 let ticks = stamps[i + 1].saturating_sub(stamps[i]);
-                (ticks as f64 * 1e3 / frequency.max(1) as f64, notes[i].0.chars().take(300).collect())
+                (ticks as f64 * 1e3 / frequency as f64, i)
             })
             .collect();
         times.sort_by(|a, b| b.0.total_cmp(&a.0));
         times.truncate(n);
-        (times, beyond_limit)
+        let mut rows: Vec<_> = times
+            .iter()
+            .map(|&(ms, i)| (ms, notes[i].0.chars().take(300).collect::<String>()))
+            .collect();
+
+        if with_stats && let Some(Some((_, back))) = self.stats.get() {
+            let mut data = std::ptr::null_mut();
+            let range = D3D12_RANGE { Begin: 0, End: count * STATS_BYTES };
+            // SAFETY: the completed list resolved exactly `count` statistics slots.
+            unsafe {
+                if back.Map(0, Some(&range), Some(&mut data)).is_ok() {
+                    let stats = std::slice::from_raw_parts(data.cast::<D3D12_QUERY_DATA_PIPELINE_STATISTICS>(), count);
+                    for ((_, text), &(_, i)) in rows.iter_mut().zip(&times) {
+                        let s = &stats[i];
+                        *text = format!(
+                            "[primitives to the rasterizer {}, rasterized {}, pixel shader runs {}, compute runs {}] {text}",
+                            s.CInvocations, s.CPrimitives, s.PSInvocations, s.CSInvocations,
+                        );
+                    }
+                    back.Unmap(0, None);
+                }
+            }
+        }
+        (rows, beyond_limit)
     }
 
     /// Whether `node` of the device-removed data (its breadcrumbs) is this
@@ -1801,16 +1901,25 @@ impl HostList {
 
     pub(crate) fn close(&self) {
         #[cfg(feature = "diagnostics")]
-        if let Some((heap, back)) = self.stamps() {
+        if let Some((stamp_heap, stamp_back)) = self.stamps() {
             let notes = self.notes.lock().unwrap_or_else(|e| e.into_inner()).len();
-            let count = notes.min(STAMPS as usize - 1) as u32;
-            // SAFETY: an open list, our heap and read-back buffer.
-            unsafe {
-                // At capacity the first untimed note already closed the last sample.
-                if notes < STAMPS as usize {
-                    self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, count);
+            let count = notes.min(MAX_TIMED_COMMANDS) as u32;
+            if count != 0 {
+                let stats = self.stats();
+                // SAFETY: an open list and its query heaps and readback buffers.
+                unsafe {
+                    // The first untimed note already ended the final measured command.
+                    if notes < STAMPS as usize {
+                        if let Some((heap, _)) = stats {
+                            self.list.EndQuery(heap, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, count - 1);
+                        }
+                        self.list.EndQuery(stamp_heap, D3D12_QUERY_TYPE_TIMESTAMP, count);
+                    }
+                    self.list.ResolveQueryData(stamp_heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, count + 1, stamp_back, 0);
+                    if let Some((heap, back)) = stats {
+                        self.list.ResolveQueryData(heap, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 0, count, back, 0);
+                    }
                 }
-                self.list.ResolveQueryData(heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, count + 1, back, 0);
             }
         }
         // SAFETY: our list.
@@ -2053,12 +2162,21 @@ impl HostList {
         if !notes_on() {
             return;
         }
-        let at = self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32;
-        if let Some((heap, _)) = self.stamps()
-            && at < STAMPS
-        {
-            // SAFETY: an open list and our query heap.
-            unsafe { self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, at) };
+        let at = self.notes.lock().unwrap_or_else(|e| e.into_inner()).len();
+        if at < STAMPS as usize && let Some((stamp_heap, _)) = self.stamps() {
+            let at = at as u32;
+            let stats = self.stats().map(|(heap, _)| heap);
+            // SAFETY: an open list and its query heaps. Each boundary ends
+            // the previous interval before opening the next, up to capacity.
+            unsafe {
+                if at != 0 && let Some(heap) = stats {
+                    self.list.EndQuery(heap, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, at - 1);
+                }
+                self.list.EndQuery(stamp_heap, D3D12_QUERY_TYPE_TIMESTAMP, at);
+                if at < STAMPS - 1 && let Some(heap) = stats {
+                    self.list.BeginQuery(heap, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, at);
+                }
+            }
         }
         let what = what();
         if dred_on() {
