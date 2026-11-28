@@ -1490,6 +1490,38 @@ mod tests {
         }
     }
 
+    #[test]
+    fn quantizer_steps_keep_decoded_pcm_and_flush_bit_exact() {
+        let mut decoder = Decoder::new(1, 48_000);
+        let mut pcm = Vec::new();
+        let mut reference = Vec::new();
+        let half = FRAME_SAMPLES / 2;
+        let mut overlap = [0.0; FRAME_SAMPLES + FRAME_SAMPLES / 2];
+        let window = sine_window(FRAME_SAMPLES);
+        for step in -31i32..=30 {
+            // The generated single-bin frame from #2795. Bits 38..44 hold
+            // the signed quantizer step. Escapes use a separate encoding.
+            let mut frame = [0x00, 0xa5, 0x00, 0x0c, 0x03, 0x63, 0xff, 0xff, 0xf8, 0xab, 0x00];
+            let field = (step & 63) as u8;
+            frame[4] = (frame[4] & !3) | (field >> 4);
+            frame[5] = (frame[5] & 15) | (field << 4);
+            decoder.decode(&frame, 82, &mut pcm).unwrap();
+
+            let mut spectrum = [0.0; FRAME_SAMPLES];
+            spectrum[0] = 10f32.powf((90 + step) as f32 / 20.0);
+            imdct_half_untabled(&spectrum, &mut overlap[half..], 2.0 / FRAME_SAMPLES as f32 / 32768.0);
+            window_overlap(&mut overlap[..FRAME_SAMPLES], &window);
+            reference.extend(overlap[..FRAME_SAMPLES].iter().copied().map(to_i16));
+            overlap.copy_within(FRAME_SAMPLES.., 0);
+        }
+        decoder.flush(&mut pcm);
+        reference.extend(overlap[..half].iter().copied().map(to_i16));
+        assert_eq!(pcm.len(), reference.len());
+        for (i, (actual, expected)) in pcm.into_iter().zip(reference).enumerate() {
+            assert_eq!(actual, expected, "PCM sample {i}");
+        }
+    }
+
     /// `quant_factor` returns the exact `f32` bits of `10f32.powf(exp / 20.0)`
     /// both inside and outside the cached range.
     #[test]
