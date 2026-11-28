@@ -6303,15 +6303,14 @@ impl<'a> Lower<'a> {
             "v_max3_f32" | "v_min3_f32" | "v_med3_f32" => {
                 let (a, bb, cc) = (f(self, 0)?, f(self, 1)?, f(self, 2)?);
                 let r = match name {
-                    "v_max3_f32" => {
-                        let t = self.max_min(true, a, bb);
-                        self.max_min(true, t, cc)
+                    "v_med3_f32" => self.med3(a, bb, cc),
+                    _ => {
+                        let max = name == "v_max3_f32";
+                        let t = self.max_min(max, a, bb);
+                        // The first selection already used flushed inputs.
+                        let cc = self.ftz(cc);
+                        self.max_min_flushed(max, t, cc)
                     }
-                    "v_min3_f32" => {
-                        let t = self.max_min(false, a, bb);
-                        self.max_min(false, t, cc)
-                    }
-                    _ => self.med3(a, bb, cc),
                 };
                 float(self, r)
             }
