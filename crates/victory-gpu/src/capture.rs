@@ -770,11 +770,32 @@ const SLOT: u64 = 512;
 
 pub(crate) struct BlackProbe {
     buffer: ID3D12Resource,
-    packed_rgb10: bool,
+    format: DXGI_FORMAT,
 }
 
-/// Copies a grid of pixels from a color texture in copy-source state for
-/// black-frame diagnostics.
+fn probe_level(format: DXGI_FORMAT, pixel: &[u8]) -> u8 {
+    match format {
+        DXGI_FORMAT_R16G16B16A16_FLOAT => {
+            let rgb = pixel[..6]
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|&word| half(u16::from_le_bytes(word)))
+                .fold(0.0, f32::max);
+            // Match the 8-bit diagnostic scale and ignore alpha.
+            (rgb.min(1.0) * 255.0).round() as u8
+        }
+        DXGI_FORMAT_R10G10B10A2_UNORM | DXGI_FORMAT_R10G10B10A2_UINT => {
+            let packed = u32::from_le_bytes(pixel[..4].try_into().unwrap());
+            let max = (packed & 1023).max((packed >> 10) & 1023).max((packed >> 20) & 1023);
+            ((max * 255 + 511) / 1023) as u8
+        }
+        _ => pixel[0].max(pixel[1]).max(pixel[2]),
+    }
+}
+
+/// Records copies of a grid of pixels from a color texture in copy-source
+/// state into a readback buffer for black-frame detection.
 pub(crate) fn probe(
     device: &ID3D12Device,
     list: &ID3D12GraphicsCommandList,
@@ -782,15 +803,14 @@ pub(crate) fn probe(
 ) -> Option<BlackProbe> {
     // SAFETY: a live resource.
     let d = unsafe { texture.GetDesc() };
-    let packed_rgb10 = match d.Format {
-        DXGI_FORMAT_R10G10B10A2_TYPELESS | DXGI_FORMAT_R10G10B10A2_UNORM | DXGI_FORMAT_R10G10B10A2_UINT => true,
-        format if matches!(format.0, 27..=29 | 87 | 90 | 91) => false,
+    let format = match d.Format {
+        DXGI_FORMAT_R16G16B16A16_FLOAT | DXGI_FORMAT_R16G16B16A16_TYPELESS => {
+            DXGI_FORMAT_R16G16B16A16_FLOAT
+        }
+        DXGI_FORMAT_R10G10B10A2_TYPELESS => DXGI_FORMAT_R10G10B10A2_UNORM,
+        DXGI_FORMAT_R10G10B10A2_UNORM | DXGI_FORMAT_R10G10B10A2_UINT => d.Format,
+        format if matches!(format.0, 27..=29 | 87 | 90 | 91) => format,
         _ => return None,
-    };
-    let format = if d.Format == DXGI_FORMAT_R10G10B10A2_TYPELESS {
-        DXGI_FORMAT_R10G10B10A2_UNORM
-    } else {
-        d.Format
     };
     let desc = D3D12_RESOURCE_DESC {
         Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
@@ -870,11 +890,11 @@ pub(crate) fn probe(
             };
             list.CopyTextureRegion(&to, 0, 0, 0, &from, Some(&pixel));
         }
-        Some(BlackProbe { buffer, packed_rgb10 })
+        Some(BlackProbe { buffer, format })
     }
 }
 
-/// Whether every sampled pixel is (near) black.
+/// Whether every pixel [`probe`] read is (near) black.
 pub(crate) fn black(probe: &BlackProbe) -> bool {
     let buffer = &probe.buffer;
     let mut data = std::ptr::null_mut();
@@ -887,16 +907,7 @@ pub(crate) fn black(probe: &BlackProbe) -> bool {
             std::slice::from_raw_parts(data.cast::<u8>(), (SLOT * u64::from(GRID * GRID)) as usize);
         let level = bytes
             .chunks(SLOT as usize)
-            .map(|pixel| {
-                if probe.packed_rgb10 {
-                    let packed = u32::from_le_bytes(pixel[..4].try_into().unwrap());
-                    let max = (packed & 1023).max((packed >> 10) & 1023).max((packed >> 20) & 1023);
-                    // Keep the existing 8-bit diagnostic scale and ignore alpha.
-                    ((max * 255 + 511) / 1023) as u8
-                } else {
-                    pixel[0].max(pixel[1]).max(pixel[2])
-                }
-            })
+            .map(|pixel| probe_level(probe.format, pixel))
             .max()
             .unwrap_or(0);
         buffer.Unmap(0, None);
@@ -988,6 +999,27 @@ mod tests {
         assert_eq!(super::to_rgba(89, 1, 1, 4, &xr), Some(vec![255, 127, 0, 255]));
         // B8G8R8A8 still swaps to RGBA.
         assert_eq!(super::to_rgba(87, 1, 1, 4, &[1, 2, 3, 4]), Some(vec![3, 2, 1, 255]));
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn black_probe_uses_the_same_level_scale_for_float_and_byte_color() {
+    let fp16 = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    for (rgba, level) in [
+        ([0, 0, 0, 0x3c00], 0),               // Opaque black.
+        ([0x3c00, 0, 0, 0], 255),             // Red.
+        ([0, 0x2800, 0, 0x3c00], 8),           // Green: 1/32.
+        ([0, 0, 0x2700, 0], 7),                // Blue just under the threshold.
+        ([0xbc00, 0x7e00, 0, 0x3c00], 0),     // Negative and NaN channels.
+        ([0, 0, 0x4400, 0x3c00], 255),        // Clip a highlight to white.
+    ] {
+        let pixel = rgba.map(u16::to_le_bytes).concat();
+        assert_eq!(probe_level(fp16, &pixel), level, "{rgba:04x?}");
+    }
+    for level in [0, 7, 8, 255] {
+        assert_eq!(probe_level(DXGI_FORMAT_R8G8B8A8_UNORM, &[0, level, 0, 255]), level);
+        assert_eq!(probe_level(DXGI_FORMAT_B8G8R8A8_UNORM, &[0, 0, level, 255]), level);
     }
 }
 
