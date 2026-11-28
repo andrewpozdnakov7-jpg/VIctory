@@ -263,27 +263,42 @@ impl Bits<'_> {
     }
 }
 
+const VLC_PREFIX_BITS: u8 = 8;
+
 /// A prefix code built like FFmpeg's `ff_vlc_init_from_lengths`: codes are
 /// handed out in table order, each the next free one of its length.
 struct Vlc {
     /// Left-aligned code, length, symbol; sorted by code.
     codes: Vec<(u32, u8, i32)>,
+    /// One-based code index for a short prefix, or zero for a full search.
+    short: [u16; 1 << VLC_PREFIX_BITS],
 }
 
 impl Vlc {
     fn new(entries: impl Iterator<Item = (i32, u8)>) -> Vlc {
         let mut code = 0u64;
         let mut codes = Vec::new();
+        let mut short = [0; 1 << VLC_PREFIX_BITS];
         for (symbol, len) in entries {
             codes.push((code as u32, len, symbol));
+            if len <= VLC_PREFIX_BITS && let Ok(index) = u16::try_from(codes.len()) {
+                let prefix = (code >> (32 - VLC_PREFIX_BITS)) as usize;
+                let span = 1 << (VLC_PREFIX_BITS - len);
+                short[prefix..prefix + span].fill(index);
+            }
             code += 1 << (32 - len);
         }
-        Vlc { codes }
+        Vlc { codes, short }
     }
 
     fn read(&self, bits: &mut Bits) -> i32 {
         let v = bits.peek32();
-        let i = self.codes.partition_point(|c| c.0 <= v) - 1;
+        let prefix = self.short[(v >> (32 - VLC_PREFIX_BITS)) as usize];
+        let i = if prefix == 0 {
+            self.codes.partition_point(|c| c.0 <= v) - 1
+        } else {
+            usize::from(prefix - 1)
+        };
         let (_, len, symbol) = self.codes[i];
         bits.pos += len as usize;
         symbol

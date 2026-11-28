@@ -498,9 +498,9 @@ mod tests {
         }
     }
 
-    /// The lookup is `partition_point(|code| code <= word) - 1`: the exact
-    /// code, every word that only extends it, and the next code's first word
-    /// must all land in the expected entry and consume the right bit count.
+    /// Check the exact code, the last word that extends it, and the next
+    /// code's first word. Each must select the expected entry and consume
+    /// the right number of bits.
     #[test]
     fn every_entry_decodes_at_its_code_and_across_its_block() {
         for (name, vlc) in built_codes() {
