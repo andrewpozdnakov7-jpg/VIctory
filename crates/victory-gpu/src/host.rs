@@ -4039,7 +4039,7 @@ mod present_plane_tests {
             return;
         };
         let list = host.new_list().unwrap();
-        let make_plane = |width, height, color: &[f32; 4]| {
+        let make_plane = |width, height, format, color: &[f32; 4]| {
             let mut texture = None;
             // SAFETY: live device, valid render target description, and an open list.
             unsafe {
@@ -4056,7 +4056,7 @@ mod present_plane_tests {
                             Height: height,
                             DepthOrArraySize: 1,
                             MipLevels: 1,
-                            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                            Format: format,
                             SampleDesc: DXGI_SAMPLE_DESC {
                                 Count: 1,
                                 Quality: 0,
@@ -4075,8 +4075,14 @@ mod present_plane_tests {
                 texture
             }
         };
-        let scene = make_plane(32, 32, &[1.0, 0.0, 0.0, 1.0]);
-        let overlay = make_plane(64, 64, &[0.0, 0.0, 128.0 / 255.0, 128.0 / 255.0]);
+        let rgba = DXGI_FORMAT_R8G8B8A8_UNORM;
+        let bgra = DXGI_FORMAT_B8G8R8A8_UNORM;
+        let red = [1.0, 0.0, 0.0, 1.0];
+        let half_blue = [0.0, 0.0, 128.0 / 255.0, 128.0 / 255.0];
+        let scene = make_plane(32, 32, rgba, &red);
+        let overlay = make_plane(64, 64, rgba, &half_blue);
+        let bgra_scene = make_plane(32, 32, bgra, &red);
+        let bgra_overlay = make_plane(64, 64, bgra, &half_blue);
         list.close();
         host.execute(&[&list]);
         let state = D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32;
@@ -4088,18 +4094,18 @@ mod present_plane_tests {
             |buffer: &ID3D12Resource, footprint: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT| {
                 let mut mapped = std::ptr::null_mut();
                 // SAFETY: the present copy has completed. The footprint names
-                // a live RGBA pixel inside the readback buffer.
-                let rgba = unsafe {
+                // a live four-byte pixel inside the readback buffer.
+                let pixel = unsafe {
                     buffer.Map(0, None, Some(&mut mapped)).unwrap();
-                    let rgba = mapped
+                    let pixel = mapped
                         .cast::<u8>()
                         .add(footprint.Offset as usize)
                         .cast::<[u8; 4]>()
                         .read();
                     buffer.Unmap(0, None);
-                    rgba
+                    pixel
                 };
-                (footprint.Footprint.Width, footprint.Footprint.Height, rgba)
+                (footprint.Footprint.Width, footprint.Footprint.Height, footprint.Footprint.Format, pixel)
             };
 
         let mut attempted = false;
@@ -4120,8 +4126,8 @@ mod present_plane_tests {
             shown.is_some(),
             "the primary plane must still be shown in this frame"
         );
-        assert_eq!(fallback, Some((32, 32, [255, 0, 0, 255])));
-        let format = DXGI_FORMAT_R8G8B8A8_UNORM.0;
+        assert_eq!(fallback, Some((32, 32, rgba, [255, 0, 0, 255])));
+        let format = rgba.0;
         {
             let mut presentation = host.presenter.lock().unwrap_or_else(|e| e.into_inner());
             let swap_chain = presentation.presenter.as_ref().unwrap();
@@ -4131,17 +4137,47 @@ mod present_plane_tests {
             *next = Instant::now() + Duration::from_secs(60);
         }
 
+        // A failure in RGBA must not delay composition in BGRA.
+        let bgra_planes = [(&bgra_scene, state), (&bgra_overlay, state)];
+        let mut bgra_composite = None;
+        assert!(
+            host.present_with_compositor(
+                &bgra_planes,
+                3,
+                |device, format| {
+                    assert_eq!(format, bgra);
+                    Compositor::new(device, format)
+                },
+                |buffer, footprint| bgra_composite = Some(first_pixel(buffer, footprint)),
+            )
+            .is_some()
+        );
+        assert_eq!(bgra_composite, Some((64, 64, bgra, [128, 0, 127, 255])));
+
         let mut during_cooldown = None;
         assert!(
             host.present_with_compositor(
                 &[(&scene, state), (&overlay, state)],
-                3,
+                4,
                 |_, _| panic!("must not recreate the compositor during cooldown"),
                 |buffer, footprint| during_cooldown = Some(first_pixel(buffer, footprint)),
             )
             .is_some()
         );
         assert_eq!(during_cooldown, fallback);
+
+        let mut bgra_reused = None;
+        assert!(
+            host.present_with_compositor(
+                &bgra_planes,
+                5,
+                |_, _| panic!("must reuse the BGRA compositor"),
+                |buffer, footprint| bgra_reused = Some(first_pixel(buffer, footprint)),
+            )
+            .is_some()
+        );
+        assert_eq!(bgra_reused, bgra_composite);
+
         {
             let mut presentation = host.presenter.lock().unwrap_or_else(|e| e.into_inner());
             *presentation.compositor_failures.get_mut(&format).unwrap() = Instant::now();
@@ -4151,7 +4187,7 @@ mod present_plane_tests {
         assert!(
             host.present_with_compositor(
                 &[(&scene, state), (&overlay, state)],
-                4,
+                6,
                 Compositor::new,
                 |buffer, footprint| composite = Some(first_pixel(buffer, footprint)),
             )
@@ -4159,7 +4195,7 @@ mod present_plane_tests {
             "compositor initialization can be retried after failure"
         );
         // Premultiplied half-blue over opaque red.
-        assert_eq!(composite, Some((64, 64, [127, 0, 128, 255])));
+        assert_eq!(composite, Some((64, 64, rgba, [127, 0, 128, 255])));
         let presentation = host.presenter.lock().unwrap_or_else(|e| e.into_inner());
         assert!(!presentation.compositor_failures.contains_key(&format));
     }
