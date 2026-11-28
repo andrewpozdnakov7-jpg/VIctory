@@ -229,8 +229,13 @@ struct Bits<'a> {
 
 impl Bits<'_> {
     fn peek32(&self) -> u32 {
-        let mut v = 0u64;
         let byte = self.pos / 8;
+        if let Some([a, b, c, d, e]) = self.data.get(byte..).and_then(|tail| tail.first_chunk::<5>()) {
+            let hi = u32::from_be_bytes([*a, *b, *c, *d]);
+            let v = (u64::from(hi) << 8) | u64::from(*e);
+            return (v << (24 + self.pos % 8) >> 32) as u32;
+        }
+        let mut v = 0u64;
         for i in 0..5 {
             v = v << 8 | *self.data.get(byte + i).unwrap_or(&0) as u64;
         }
@@ -1299,6 +1304,21 @@ mod tests {
             pcm.clear();
             decoder.flush(&mut pcm);
             assert_eq!(pcm, vec![0; FRAME_SAMPLES / 2 * channels]);
+        }
+    }
+
+    #[test]
+    fn frame_bit_window_matches_bit_by_bit_reading() {
+        let data = [0xa3, 0x72, 0x18, 0x94, 0x65, 0xfe, 0x6b, 0x91];
+        let end = data.len() * 8;
+        for pos in 0..=end {
+            let reader = Bits { data: &data, pos, end };
+            let expected = (pos..pos + 32).fold(0, |word, bit| {
+                let byte = data.get(bit / 8).copied().unwrap_or(0);
+                (word << 1) | u32::from((byte >> (7 - bit % 8)) & 1)
+            });
+            assert_eq!(reader.peek32(), expected, "bit offset {pos}");
+            assert_eq!(reader.consumed(), pos);
         }
     }
 
