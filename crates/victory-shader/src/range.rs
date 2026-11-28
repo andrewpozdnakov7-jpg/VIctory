@@ -393,6 +393,33 @@ mod tests {
         assert_eq!(cached.discards, uncached.discards);
     }
 
+    #[test]
+    fn a_shader_without_relative_moves_keeps_its_structure() {
+        let words = [
+            0x7C00_0000 | 0xC4 << 17 | 129, // v_cmp_gt_u32 vcc, 1, v0
+            0xBF87_0001,                    // s_cbranch_vccnz over the move
+            vop1(0x01, 1, 129),             // v_mov_b32 v1, 1
+            vop2(0x25, 2, 129, 1),          // v_add_nc_u32 v2, 1, v1
+            S_ENDPGM,
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+
+        for wave64 in [false, true] {
+            let direct = ir::build(&code, wave64, 16).unwrap();
+            let expected = structure::structure(&direct).unwrap();
+            let (program, structured) = build(&code, wave64, 16).unwrap();
+            let actual = structured.unwrap();
+
+            assert_eq!(direct.blocks.len(), 3);
+            assert_eq!(program, direct);
+            assert_eq!(actual.exits, expected.exits);
+            assert_eq!(actual.guards, expected.guards);
+            assert_eq!(actual.reach, expected.reach);
+            assert_eq!(actual.masks, expected.masks);
+            assert_eq!(actual.highs, expected.highs);
+        }
+    }
+
     const S_ENDPGM: u32 = 0xBF81_0000;
     const V: u32 = 256;
 
