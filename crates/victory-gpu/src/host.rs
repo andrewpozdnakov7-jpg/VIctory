@@ -3028,7 +3028,14 @@ struct Presenter {
     copy: HostList,
     hwnd: HWND,
     meter: Meter,
-    compositor: Option<Compositor>,
+    /// At most one for each presentation format returned by swap_format.
+    compositors: Vec<Compositor>,
+}
+
+impl Presenter {
+    fn compositor(&self, format: DXGI_FORMAT) -> Option<&Compositor> {
+        self.compositors.iter().find(|c| c.format == format)
+    }
 }
 
 /// The frame rate, shown in the window's caption every second and logged
@@ -3234,12 +3241,9 @@ impl Host {
         if presenter.is_none() && !retry.ready(Instant::now()) {
             return None;
         }
-        let cached_format = presenter
-            .as_ref()
-            .and_then(|p| p.compositor.as_ref())
-            .map(|c| c.format);
+        let has_compositor = presenter.as_ref().is_some_and(|p| p.compositor(format).is_some());
         let mut new_compositor = None;
-        let planes = if planes.len() > 1 && cached_format != Some(format) {
+        let planes = if planes.len() > 1 && !has_compositor {
             match create_compositor(&self.device, format) {
                 Ok(c) => {
                     new_compositor = Some(c);
@@ -3273,7 +3277,7 @@ impl Host {
         }
         let p = presenter.as_mut()?;
         if let Some(c) = new_compositor {
-            p.compositor = Some(c);
+            p.compositors.push(c);
         }
         if (p.width, p.height, p.format) != (width, height, format) {
             let resized = retry.attempt(Instant::now(), || {
@@ -3357,7 +3361,7 @@ impl Host {
                 list.ResourceBarrier(&after);
                 (capture, probe)
             } else {
-                let comp = p.compositor.as_ref().expect("compositor was prepared for multiple planes");
+                let comp = p.compositor(format).expect("compositor was prepared for this format");
                 let rtv = comp.rtv_heap.GetCPUDescriptorHandleForHeapStart();
                 self.device.CreateRenderTargetView(
                     &back,
@@ -3550,7 +3554,7 @@ impl Host {
                 copy,
                 hwnd,
                 meter: Meter::new(),
-                compositor: None,
+                compositors: Vec::new(),
             })
         }
     }
@@ -4048,7 +4052,7 @@ mod present_plane_tests {
             return;
         };
         let list = host.new_list().unwrap();
-        let make_plane = |width, height, color: &[f32; 4]| {
+        let make_plane = |width, height, format, color: &[f32; 4]| {
             let mut texture = None;
             // SAFETY: live device, valid render target description, and an open list.
             unsafe {
@@ -4065,7 +4069,7 @@ mod present_plane_tests {
                             Height: height,
                             DepthOrArraySize: 1,
                             MipLevels: 1,
-                            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                            Format: format,
                             SampleDesc: DXGI_SAMPLE_DESC {
                                 Count: 1,
                                 Quality: 0,
@@ -4084,8 +4088,10 @@ mod present_plane_tests {
                 texture
             }
         };
-        let scene = make_plane(32, 32, &[1.0, 0.0, 0.0, 1.0]);
-        let overlay = make_plane(64, 64, &[0.0, 0.0, 128.0 / 255.0, 128.0 / 255.0]);
+        let rgba = DXGI_FORMAT_R8G8B8A8_UNORM;
+        let scene = make_plane(32, 32, rgba, &[1.0, 0.0, 0.0, 1.0]);
+        let overlay = make_plane(64, 64, rgba, &[0.0, 0.0, 128.0 / 255.0, 128.0 / 255.0]);
+        let alternate = make_plane(64, 64, DXGI_FORMAT_B8G8R8A8_UNORM, &[0.0, 1.0, 0.0, 1.0]);
         list.close();
         host.execute(&[&list]);
         let state = D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32;
@@ -4148,5 +4154,29 @@ mod present_plane_tests {
         );
         // Premultiplied half-blue over opaque red.
         assert_eq!(composite, Some((64, 64, [127, 0, 128, 255])));
+
+        let mut switched = None;
+        assert!(
+            host.present_with_compositor(
+                &[(&alternate, state), (&alternate, state)],
+                4,
+                Compositor::new,
+                |buffer, footprint| switched = Some(first_pixel(buffer, footprint)),
+            )
+            .is_some()
+        );
+        assert_eq!(switched, Some((64, 64, [0, 255, 0, 255])));
+
+        let mut reused = None;
+        assert!(
+            host.present_with_compositor(
+                &[(&scene, state), (&overlay, state)],
+                5,
+                |_, _| panic!("the earlier RGBA compositor must still be cached"),
+                |buffer, footprint| reused = Some(first_pixel(buffer, footprint)),
+            )
+            .is_some()
+        );
+        assert_eq!(reused, composite);
     }
 }
