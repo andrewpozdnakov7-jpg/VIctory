@@ -28,7 +28,7 @@ pub(super) enum Kind {
 pub(super) fn kind(format: u32) -> Kind {
     match format {
         1 | 2 | 9 | 10 | 15 | 16 | 26 | 33 | 34 | 67 => Kind::Light,
-        3 | 4 | 12 | 14 | 19..=22 | 25 | 30 | 32 | 36 | 38..=47 | 50 | 52..=60 | 62 | 64 => {
+        3 | 4 | 12 | 14 | 19..=22 | 25 | 30 | 32 | 36 | 38..=47 | 50 | 52..=60 | 62..=64 => {
             Kind::Single
         }
         _ => Kind::Unit,
@@ -323,6 +323,22 @@ mod tests {
             (nothing.low, nothing.high, nothing.luma_mean),
             (0.0, 0.0, 0.0)
         );
+    }
+
+    #[test]
+    fn single_channel_snorm_previews_distinguish_negative_zero_and_positive() {
+        let r16 = [-i16::MAX, 0, i16::MAX].map(i16::to_le_bytes).concat();
+        let r8 = [-i8::MAX, 0, i8::MAX].map(|v| v as u8);
+        for (format, size, data) in [(58, 2, r16.as_slice()), (63, 1, r8.as_slice())] {
+            let values: Vec<_> = data
+                .chunks_exact(size)
+                .map(|bytes| texel(format, bytes).unwrap())
+                .collect();
+            let measured = health(&values, true);
+            assert_eq!((measured.low, measured.high, measured.black), (-1.0, 1.0, 1));
+            let (_, _, rows) = preview(&values, (3, 1), kind(format), &measured, 960);
+            assert_eq!(rows, [0, 0, 0, 0, 128, 128, 128, 255, 255, 255], "format {format}");
+        }
     }
 
     #[test]
