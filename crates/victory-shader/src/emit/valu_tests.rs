@@ -1099,6 +1099,8 @@ fn v_exp_f16_rounds_the_exact_result_once() {
         (0x0000, 0x3C00), // 2^0 = 1
         (0xBC00, 0x3800), // 2^-1 = 0.5
         (0x11C5, 0x3C01), // correctly rounded up, not a f32 midpoint tie to 1.0
+        (0x8DC6, 0x3BFF), // a one-ULP f32 error can cross the midpoint
+        (0x36B6, 0x3D5A), // a one-ULP f32 error in the other direction can too
     ];
     let inputs: Vec<[u32; 4]> = cases
         .iter()
