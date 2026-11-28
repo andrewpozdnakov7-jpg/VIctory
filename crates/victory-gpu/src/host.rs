@@ -3009,7 +3009,60 @@ struct Presenter {
     copy: HostList,
     hwnd: HWND,
     meter: Meter,
+    /// Render target view for the optional frame readout.
+    readout_rtv: Option<ID3D12DescriptorHeap>,
     compositor: Option<Compositor>,
+}
+
+impl Presenter {
+    /// Writes the frame rate and frame time in the top left corner of
+    /// the back buffer, which `list` holds in the `from` state.
+    ///
+    /// # Safety
+    /// The back buffer is in the `from` state on this list. The return
+    /// value is its state after the readout.
+    unsafe fn readout(
+        &self,
+        device: &ID3D12Device,
+        list: &ID3D12GraphicsCommandList,
+        back: &ID3D12Resource,
+        from: D3D12_RESOURCE_STATES,
+    ) -> D3D12_RESOURCE_STATES {
+        let (Some(heap), Some((fps, ms))) = (&self.readout_rtv, self.meter.shown) else {
+            return from;
+        };
+        let text = format!("{fps:.1} FPS  {ms:.0} MS");
+        // Dots that keep their share of the picture at any size.
+        let dot = (self.height as i32 / 216).max(2);
+        let at = (dot * 3, dot * 3);
+        let (w, h) = crate::readout::size(&text);
+        let behind = RECT {
+            left: at.0,
+            top: at.1,
+            right: at.0 + w * dot,
+            bottom: at.1 + h * dot,
+        };
+        if behind.right > self.width as i32 || behind.bottom > self.height as i32 {
+            return from;
+        }
+        let marks = crate::readout::rects(&text, at, dot);
+        // SAFETY: this list owns the back buffer in the caller's state and all
+        // rectangles fit within its RTV.
+        unsafe {
+            let view = heap.GetCPUDescriptorHandleForHeapStart();
+            device.CreateRenderTargetView(back, None, view);
+            if from != D3D12_RESOURCE_STATE_RENDER_TARGET {
+                list.ResourceBarrier(&[transition(
+                    back,
+                    from,
+                    D3D12_RESOURCE_STATE_RENDER_TARGET,
+                )]);
+            }
+            list.ClearRenderTargetView(view, &[0.0, 0.0, 0.0, 1.0], Some(&[behind]));
+            list.ClearRenderTargetView(view, &[1.0, 0.9, 0.1, 1.0], Some(&marks));
+        }
+        D3D12_RESOURCE_STATE_RENDER_TARGET
+    }
 }
 
 /// The frame rate, shown in the window's caption every second and logged
@@ -3022,6 +3075,8 @@ struct Meter {
     logged: std::time::Instant,
     /// The caption the window had, once read.
     caption: Option<Vec<u16>>,
+    /// The frames a second and milliseconds a frame of the last second.
+    shown: Option<(f64, f64)>,
 }
 
 impl Meter {
@@ -3034,6 +3089,7 @@ impl Meter {
             drawn: crate::draw::drawn(),
             logged: now,
             caption: None,
+            shown: None,
         }
     }
 
@@ -3056,6 +3112,7 @@ impl Meter {
         let ms = elapsed.as_secs_f64() * 1000.0 / frames;
         let draws = (drawn - self.drawn) as f64 / frames;
         (self.since, self.frames, self.drawn) = (std::time::Instant::now(), 0, drawn);
+        self.shown = Some((fps, ms));
         // Of a frame, ms preparing submissions and ms waiting for the GPU.
         let [cpu, gpu] = [0, 1].map(|i| {
             SUBMISSION_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames
@@ -3299,23 +3356,7 @@ impl Host {
                 ));
                 list.ResourceBarrier(&before);
                 list.CopyResource(&back, texture);
-                #[cfg(all(test, feature = "diagnostics"))]
-                let capture = {
-                    // Inspect what reached the swap chain, before Present.
-                    list.ResourceBarrier(&[transition(
-                        &back,
-                        D3D12_RESOURCE_STATE_COPY_DEST,
-                        D3D12_RESOURCE_STATE_COPY_SOURCE,
-                    )]);
-                    let readback = crate::capture::read_back(&self.device, list, &back);
-                    list.ResourceBarrier(&[transition(
-                        &back,
-                        D3D12_RESOURCE_STATE_COPY_SOURCE,
-                        D3D12_RESOURCE_STATE_COPY_DEST,
-                    )]);
-                    readback
-                };
-                #[cfg(all(not(test), feature = "diagnostics"))]
+                #[cfg(feature = "diagnostics")]
                 let capture = crate::capture::wanted(frame)
                     .then(|| crate::capture::read_back(&self.device, list, texture))
                     .flatten();
@@ -3326,13 +3367,19 @@ impl Host {
                     let _ = frame;
                     (None::<()>, None::<()>)
                 };
+                let displayed_state = p.readout(
+                    &self.device,
+                    list,
+                    &back,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                );
                 let mut after = Vec::with_capacity(2);
                 if state != D3D12_RESOURCE_STATE_COPY_SOURCE {
                     after.push(transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state));
                 }
                 after.push(transition(
                     &back,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    displayed_state,
                     D3D12_RESOURCE_STATE_PRESENT,
                 ));
                 list.ResourceBarrier(&after);
@@ -3441,13 +3488,20 @@ impl Host {
                         D3D12_RESOURCE_STATE_RENDER_TARGET,
                         D3D12_RESOURCE_STATE_COPY_SOURCE,
                     )]);
-                    let capture = (cfg!(test) || crate::capture::wanted(frame))
+                    let capture = crate::capture::wanted(frame)
                         .then(|| crate::capture::read_back(&self.device, list, &back))
                         .flatten();
                     let probe = crate::capture::probe(&self.device, list, &back);
-                    list.ResourceBarrier(&[transition(
+                    // Draw the host readout after inspecting the scene.
+                    let displayed_state = p.readout(
+                        &self.device,
+                        list,
                         &back,
                         D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    );
+                    list.ResourceBarrier(&[transition(
+                        &back,
+                        displayed_state,
                         D3D12_RESOURCE_STATE_PRESENT,
                     )]);
                     (capture, probe)
@@ -3455,9 +3509,15 @@ impl Host {
                 #[cfg(not(feature = "diagnostics"))]
                 let (capture, probe) = {
                     let _ = frame;
-                    list.ResourceBarrier(&[transition(
+                    let displayed_state = p.readout(
+                        &self.device,
+                        list,
                         &back,
                         D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    );
+                    list.ResourceBarrier(&[transition(
+                        &back,
+                        displayed_state,
                         D3D12_RESOURCE_STATE_PRESENT,
                     )]);
                     (None::<()>, None::<()>)
@@ -3467,14 +3527,31 @@ impl Host {
                 }
                 (capture, probe)
             };
+            #[cfg(all(test, feature = "diagnostics"))]
+            let final_frame = {
+                // Check the actual back buffer after drawing the readout.
+                list.ResourceBarrier(&[transition(
+                    &back,
+                    D3D12_RESOURCE_STATE_PRESENT,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                )]);
+                let readback = crate::capture::read_back(&self.device, list, &back);
+                list.ResourceBarrier(&[transition(
+                    &back,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    D3D12_RESOURCE_STATE_PRESENT,
+                )]);
+                readback
+            };
             p.copy.close();
             self.execute(&[&p.copy]);
+            #[cfg(all(test, feature = "diagnostics"))]
+            if let Some((buffer, footprint)) = final_frame {
+                // A flip-discard Present can invalidate the back buffer.
+                inspect(&buffer, &footprint);
+            }
             #[cfg(feature = "diagnostics")]
             if let Some((buffer, footprint)) = capture {
-                // Tests inspect the completed copy before flip-discard Present
-                // can invalidate the back buffer, with the presenter still locked.
-                #[cfg(test)]
-                inspect(&buffer, &footprint);
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
             let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
@@ -3522,6 +3599,21 @@ impl Host {
                 .map_err(|e| ("swap chain", e))?;
             let copy = self.new_list().map_err(|e| ("copy list", e))?;
             copy.close();
+            let readout_rtv = if crate::readout::on() {
+                match self.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
+                    NumDescriptors: 1,
+                    ..Default::default()
+                }) {
+                    Ok(heap) => Some(heap),
+                    Err(error) => {
+                        tracing::warn!(%error, "frame readout unavailable");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
             tracing::info!(width, height, format = format.0, "presenting to a window");
             Ok(Presenter {
                 swap_chain,
@@ -3531,6 +3623,7 @@ impl Host {
                 copy,
                 hwnd,
                 meter: Meter::new(),
+                readout_rtv,
                 compositor: None,
             })
         }
@@ -4066,7 +4159,7 @@ mod present_plane_tests {
             }
         };
         let scene = make_plane(32, 32, &[1.0, 0.0, 0.0, 1.0]);
-        let overlay = make_plane(64, 64, &[0.0, 0.0, 128.0 / 255.0, 128.0 / 255.0]);
+        let overlay = make_plane(256, 64, &[0.0, 0.0, 128.0 / 255.0, 128.0 / 255.0]);
         list.close();
         host.execute(&[&list]);
         let state = D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32;
@@ -4074,23 +4167,23 @@ mod present_plane_tests {
             host.present(&[(&scene, state)], 1).is_some(),
             "single-plane control"
         );
-        let first_pixel =
-            |buffer: &ID3D12Resource, footprint: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT| {
-                let mut mapped = std::ptr::null_mut();
-                // SAFETY: the present copy has completed. The footprint names
-                // a live RGBA pixel inside the readback buffer.
-                let rgba = unsafe {
-                    buffer.Map(0, None, Some(&mut mapped)).unwrap();
-                    let rgba = mapped
-                        .cast::<u8>()
-                        .add(footprint.Offset as usize)
-                        .cast::<[u8; 4]>()
-                        .read();
-                    buffer.Unmap(0, None);
-                    rgba
-                };
-                (footprint.Footprint.Width, footprint.Footprint.Height, rgba)
+        let pixel = |buffer: &ID3D12Resource,
+                     footprint: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+                     x: usize,
+                     y: usize| {
+            let mut mapped = std::ptr::null_mut();
+            let offset =
+                footprint.Offset as usize + y * footprint.Footprint.RowPitch as usize + x * 4;
+            // SAFETY: the present copy has completed. The footprint names
+            // a live RGBA pixel inside the readback buffer.
+            let rgba = unsafe {
+                buffer.Map(0, None, Some(&mut mapped)).unwrap();
+                let rgba = mapped.cast::<u8>().add(offset).cast::<[u8; 4]>().read();
+                buffer.Unmap(0, None);
+                rgba
             };
+            (footprint.Footprint.Width, footprint.Footprint.Height, rgba)
+        };
 
         let mut attempted = false;
         let mut fallback = None;
@@ -4103,7 +4196,7 @@ mod present_plane_tests {
                     windows::Win32::Foundation::E_FAIL,
                 ))
             },
-            |buffer, footprint| fallback = Some(first_pixel(buffer, footprint)),
+            |buffer, footprint| fallback = Some(pixel(buffer, footprint, 0, 0)),
         );
         assert!(attempted);
         assert!(
@@ -4111,9 +4204,10 @@ mod present_plane_tests {
             "the primary plane must still be shown in this frame"
         );
         assert_eq!(fallback, Some((32, 32, [255, 0, 0, 255])));
-        let presentation = host.presenter.lock().unwrap_or_else(|e| e.into_inner());
-        let swap_chain = presentation.presenter.as_ref().unwrap();
+        let mut presentation = host.presenter.lock().unwrap_or_else(|e| e.into_inner());
+        let swap_chain = presentation.presenter.as_mut().unwrap();
         assert_eq!((swap_chain.width, swap_chain.height), (32, 32));
+        swap_chain.meter.shown = Some((60.0, 16.7));
         drop(presentation);
 
         let mut composite = None;
@@ -4122,12 +4216,21 @@ mod present_plane_tests {
                 &[(&scene, state), (&overlay, state)],
                 3,
                 Compositor::new,
-                |buffer, footprint| composite = Some(first_pixel(buffer, footprint)),
+                |buffer, footprint| {
+                    composite = Some(pixel(buffer, footprint, 0, 0));
+                    let glyph = if crate::readout::on() {
+                        [255, 230, 26, 255]
+                    } else {
+                        [127, 0, 128, 255]
+                    };
+                    // Top row of the digit 6 in the final back buffer.
+                    assert_eq!(pixel(buffer, footprint, 12, 8).2, glyph);
+                },
             )
             .is_some(),
             "compositor initialization can be retried after failure"
         );
         // Premultiplied half-blue over opaque red.
-        assert_eq!(composite, Some((64, 64, [127, 0, 128, 255])));
+        assert_eq!(composite, Some((256, 64, [127, 0, 128, 255])));
     }
 }
