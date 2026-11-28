@@ -2373,4 +2373,36 @@ fn v_mad_i64_i32_and_v_mad_u64_u32_literal_modifiers_and_carry() {
         let want = carry_cases[i].1;
         assert_eq!(got, want, "{backend}: v_mad_u64_u32 carry {inp:x?}");
     });
+
+    // v2 is both the second factor and the low dword of the addend.
+    let [alias0, alias1] = vop3b(0x176, 6, 12, false, 0, [vgpr(1), vgpr(2), vgpr(2)]);
+    let alias_inputs = [
+        [1, u32::MAX, 1, 0],           // Low dword wraps, no 64-bit carry.
+        [u32::MAX, u32::MAX, 0, 0],    // High dword reaches its maximum.
+        [u32::MAX, u32::MAX, 1, 0],    // Sum lands exactly at 2^64.
+        [2, 0x8000_0000, u32::MAX, 0], // High dword wraps, low dword is unchanged.
+        [0, u32::MAX, u32::MAX, 0],    // Addend alone reaches u64::MAX.
+        [0x8000_0000, 3, 0, 0],        // Distinct nonzero result dwords.
+    ];
+    let alias_lo = build_valu_cs(&[alias0, alias1, vop1(0x001, 0, vgpr(6))]);
+    let alias_hi = build_valu_cs(&[alias0, alias1, vop1(0x001, 0, vgpr(7))]);
+    let alias_carry = build_valu_cs(&[alias0, alias1, c0, c1]);
+    for (label, shader, shift) in [
+        ("lo", &alias_lo, 0),
+        ("hi", &alias_hi, 32),
+        ("carry", &alias_carry, 64),
+    ] {
+        run_cases(
+            shader,
+            &alias_inputs,
+            |backend, _, [a, b, add_hi, _], got| {
+                let addend = u64::from(add_hi) << 32 | u64::from(b);
+                let want = (u128::from(a) * u128::from(b) + u128::from(addend)) >> shift;
+                assert_eq!(
+                    got, want as u32,
+                    "{backend}: v_mad_u64_u32 alias {label} a={a:#x} b={b:#x} add_hi={add_hi:#x}"
+                );
+            },
+        );
+    }
 }
