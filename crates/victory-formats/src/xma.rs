@@ -574,16 +574,26 @@ impl Channel {
     }
 }
 
-/// Scale-factor band layouts for one sample rate bucket, shared across every
-/// [`Decoder`] at that rate.
-struct BandTables {
+/// Immutable scale-factor band boundaries and cross-block mappings for one sample rate.
+struct ScaleBands {
     num_sfb: [usize; BLOCK_SIZES],
     sfb_offsets: [[usize; MAX_BANDS + 1]; BLOCK_SIZES],
     sf_offsets: [[[usize; MAX_BANDS]; BLOCK_SIZES]; BLOCK_SIZES],
 }
 
-impl BandTables {
-    fn new(rate: usize) -> BandTables {
+impl ScaleBands {
+    fn for_sample_rate(sample_rate: u32) -> &'static Self {
+        static BY_RATE: [OnceLock<ScaleBands>; 4] = [const { OnceLock::new() }; 4];
+        let (index, rate) = match sample_rate {
+            r if r > 44_100 => (3, 48_000),
+            r if r > 32_000 => (2, 44_100),
+            r if r > 24_000 => (1, 32_000),
+            _ => (0, 24_000),
+        };
+        BY_RATE[index].get_or_init(|| Self::new(rate))
+    }
+
+    fn new(rate: usize) -> Self {
         let mut sfb_offsets = [[0usize; MAX_BANDS + 1]; BLOCK_SIZES];
         let mut num_sfb = [0usize; BLOCK_SIZES];
         for i in 0..BLOCK_SIZES {
@@ -619,7 +629,7 @@ impl BandTables {
                 }
             }
         }
-        BandTables {
+        Self {
             num_sfb,
             sfb_offsets,
             sf_offsets,
@@ -627,30 +637,11 @@ impl BandTables {
     }
 }
 
-fn band_tables(sample_rate: u32) -> &'static BandTables {
-    static BANDS: OnceLock<[BandTables; 4]> = OnceLock::new();
-    let tables = BANDS.get_or_init(|| {
-        [
-            BandTables::new(24_000),
-            BandTables::new(32_000),
-            BandTables::new(44_100),
-            BandTables::new(48_000),
-        ]
-    });
-    let idx = match sample_rate {
-        r if r > 44_100 => 3,
-        r if r > 32_000 => 2,
-        r if r > 24_000 => 1,
-        _ => 0,
-    };
-    &tables[idx]
-}
-
 /// Decodes the frames of one mono or stereo stream.
 #[derive(Clone)]
 pub struct Decoder {
     channels: usize,
-    bands: &'static BandTables,
+    bands: &'static ScaleBands,
     ch: [Channel; 2],
     // Per subframe.
     subframe_len: usize,
@@ -672,7 +663,7 @@ impl Decoder {
         let channels = channels.clamp(1, 2);
         Decoder {
             channels,
-            bands: band_tables(sample_rate),
+            bands: ScaleBands::for_sample_rate(sample_rate),
             ch: [Channel::new(), Channel::new()],
             subframe_len: FRAME_SAMPLES,
             channels_for_cur_subframe: 0,
@@ -1248,6 +1239,30 @@ fn to_i16(v: f32) -> i16 {
 mod tests {
     use super::*;
 
+#[test]
+    fn decoders_share_the_layout_for_their_normalized_sample_rate() {
+        let mut previous = None;
+        for (rates, canonical) in [
+            ([0, 24_000], 24_000),
+            ([24_001, 32_000], 32_000),
+            ([32_001, 44_100], 44_100),
+            ([44_101, u32::MAX], 48_000),
+        ] {
+            let [mono_rate, stereo_rate] = rates;
+            let mono = Decoder::new(1, mono_rate);
+            let stereo = Decoder::new(2, stereo_rate);
+            let expected = ScaleBands::new(canonical);
+            assert!(std::ptr::eq(mono.bands, stereo.bands));
+            assert_eq!(mono.bands.num_sfb, expected.num_sfb);
+            assert_eq!(mono.bands.sfb_offsets, expected.sfb_offsets);
+            assert_eq!(mono.bands.sf_offsets, expected.sf_offsets);
+            if let Some(previous) = previous {
+                assert!(!std::ptr::eq(mono.bands, previous));
+            }
+            previous = Some(mono.bands);
+        }
+    }
+
     #[test]
     fn flush_appends_mono_or_interleaved_stereo_and_resets() {
         for channels in [1, 2] {
@@ -1640,7 +1655,7 @@ mod tests {
         ];
         for (input_rate, bucket) in cases {
             let d = Decoder::new(2, input_rate);
-            let fresh = BandTables::new(bucket);
+            let fresh = ScaleBands::new(bucket);
             assert_eq!(d.bands.num_sfb, fresh.num_sfb, "rate {input_rate}");
             assert_eq!(d.bands.sfb_offsets, fresh.sfb_offsets, "rate {input_rate}");
             assert_eq!(d.bands.sf_offsets, fresh.sf_offsets, "rate {input_rate}");
