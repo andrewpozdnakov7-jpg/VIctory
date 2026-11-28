@@ -148,13 +148,13 @@ fn library() -> Option<&'static Shared> {
             let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
             let read = |file| DIR.get().and_then(|d| std::fs::read(d.join(file)).ok());
             let blob = read(LIBRARY_FILE).unwrap_or_default();
-            let tag = tag(&blob);
             let mut library = open(&device, blob);
-            // The pre-build's list, if it was saved with these bytes.
-            if let (Some(l), Some(list)) = (library.as_mut(), read(PREBUILT_FILE))
+            // Fingerprint the accepted bytes only when there is a list to verify.
+            if let Some(l) = library.as_mut()
                 && !l._blob.is_empty()
+                && let Some(list) = read(PREBUILT_FILE)
             {
-                l.prebuilt = listed(&list, &tag);
+                l.prebuilt = listed(&list, &tag(&l._blob));
             }
             if library.is_none() {
                 tracing::warn!("no host pipeline library: pipelines are not kept");
@@ -887,6 +887,14 @@ mod tests {
         );
     }
 
+    #[test]
+    fn prebuilt_keys_survive_static_sampler_replay() {
+        static_samplers::runs(
+            "prebuilt_keys_survive_static_sampler_replay",
+            &["store prebuilt", "load prebuilt", "load changed prebuilt"],
+        );
+    }
+
     /// A sampler first met in a later run is appended to the list, and a
     /// pipeline with it, stored then, loads in the run after that, which
     /// met yet other samplers first.
@@ -951,6 +959,7 @@ mod tests {
         /// The probe samplers' greatest LOD: another one makes other
         /// samplers that sample the same (the texture has one level).
         const FIRST: f32 = 12.0;
+        const PREBUILT_KEY: &str = "0123456789abcdef0123456789abcdef";
         const APPENDED: f32 = 13.0;
 
         /// Runs `steps` of `test` in child processes, in order, on one
@@ -981,6 +990,9 @@ mod tests {
         }
 
         fn run(step: &str) {
+            let (step, with_prebuilt) = step
+                .strip_suffix(" prebuilt")
+                .map_or((step, false), |plain| (plain, true));
             let dir = PathBuf::from(std::env::var_os(DIR_VAR).expect("the library's folder"));
             let list = dir.join(sampler_order::FILE);
             if step == "load lost" {
@@ -999,15 +1011,23 @@ mod tests {
                     let (made, values) = probe(&device, FIRST, &[]);
                     check(values);
                     assert!(made, "a first run loaded the probe");
+                    if with_prebuilt {
+                        note_prebuilt(PREBUILT_KEY.to_owned());
+                    }
                     store_and_save(&dir);
+                    assert_eq!(dir.join(PREBUILT_FILE).is_file(), with_prebuilt);
                     if ordered {
                         assert_eq!(lines(&list), 3, "the probe's samplers listed");
                     }
                 }
-                "load" | "load lost" | "load unprimed" => {
+                "load" | "load changed" | "load lost" | "load unprimed" => {
+                    if ordered && matches!(step, "load" | "load changed") {
+                        // The prebuilt tag covers the complete sampler list.
+                        assert_eq!(prebuilt(PREBUILT_KEY), with_prebuilt && step == "load");
+                    }
                     let (made, values) = probe(&device, FIRST, &others(0..OTHERS));
                     match (step, ordered) {
-                        ("load", true) => {
+                        ("load" | "load changed", true) => {
                             check(values);
                             assert!(!made, "the probe was made again, not loaded");
                             assert_eq!(lines(&list), 3 + OTHERS as usize, "the others appended");
