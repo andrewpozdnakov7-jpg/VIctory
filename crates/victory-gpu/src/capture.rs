@@ -1,7 +1,8 @@
 //! Presented frames written to PNG files, to see what reaches the screen:
 //! with `VICTORY_CAPTURE=<folder>`, every frame whose number is a power of
 //! two (the frames the log reports) is saved as `frame-<n>.png`, at half
-//! size. Only in builds with diagnostics.
+//! size by default. `VICTORY_CAPTURE_FULL_RES=1` keeps the original frame size.
+//! Only in builds with diagnostics.
 
 use std::path::PathBuf;
 
@@ -97,10 +98,18 @@ impl PngPixel {
     }
 }
 
-/// Saves four-byte color pixels to an 8-bit RGB PNG at half size.
-fn save_as(name: &str, width: u32, height: u32, pitch: usize, format: PngPixel, rows: &[u8]) {
+/// Saves four-byte color pixels to an 8-bit RGB PNG.
+fn save_as(
+    name: &str,
+    width: u32,
+    height: u32,
+    pitch: usize,
+    format: PngPixel,
+    rows: &[u8],
+    full_resolution: bool,
+) {
     let Some(folder) = folder() else { return };
-    let png = encode_rgb_png(width, height, pitch, format, rows);
+    let png = encode_rgb_png(width, height, pitch, format, rows, full_resolution);
     let path = folder.join(format!("{name}.png"));
     match std::fs::create_dir_all(folder).and_then(|()| std::fs::write(&path, png)) {
         Ok(()) => tracing::info!(path = %path.display(), "frame saved"),
@@ -108,15 +117,25 @@ fn save_as(name: &str, width: u32, height: u32, pitch: usize, format: PngPixel, 
     }
 }
 
-fn encode_rgb_png(width: u32, height: u32, pitch: usize, format: PngPixel, rows: &[u8]) -> Vec<u8> {
-    let (w, h) = ((width / 2).max(1), (height / 2).max(1));
-    // Filter byte 0 per row, then RGB of every other pixel of every other row.
+fn encode_rgb_png(
+    width: u32,
+    height: u32,
+    pitch: usize,
+    format: PngPixel,
+    rows: &[u8],
+    full_resolution: bool,
+) -> Vec<u8> {
+    let step = if full_resolution { 1 } else { 2 };
+    // Keep the last sample when the input width or height is odd.
+    let (w, h) = (width.div_ceil(step).max(1), height.div_ceil(step).max(1));
+    let step = step as usize;
+    // Filter byte 0 per row, then RGB of each sampled pixel.
     let mut raw = Vec::with_capacity((w as usize * 3 + 1) * h as usize);
     for y in 0..h as usize {
         raw.push(0);
-        let row = &rows[(2 * y).min(height as usize - 1) * pitch..];
+        let row = &rows[(step * y).min(height as usize - 1) * pitch..];
         for x in 0..w as usize {
-            let p = &row[(2 * x).min(width as usize - 1) * 4..][..4];
+            let p = &row[(step * x).min(width as usize - 1) * 4..][..4];
             raw.extend(format.rgb(p.try_into().unwrap()));
         }
     }
@@ -257,6 +276,7 @@ pub(crate) fn save_read_back(
             f.RowPitch as usize,
             format,
             rows,
+            crate::switch::on("VICTORY_CAPTURE_FULL_RES"),
         );
         buffer.Unmap(0, None);
     }
@@ -625,6 +645,7 @@ fn dump_one(
                 f.Width as usize * 4,
                 PngPixel::Rgba8,
                 &rgba,
+                false,
             );
         } else {
             tracing::info!(format = f.Format.0, ?resource, "target not dumped: format");
@@ -1236,7 +1257,7 @@ mod tests {
                 rows[offset..offset + 4].copy_from_slice(&color);
             }
             let pixel = PngPixel::for_present_format(format).unwrap();
-            let png = encode_rgb_png(4, 4, PITCH, pixel, &rows);
+            let png = encode_rgb_png(4, 4, PITCH, pixel, &rows, false);
             let word = |at| u32::from_be_bytes(png[at..at + 4].try_into().unwrap());
             assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
             assert_eq!([word(16), word(20)], [2, 2]);
@@ -1302,5 +1323,77 @@ mod r32_tests {
         let expected = Some([0, 0, 0, 255].repeat(2));
         assert_eq!(super::to_rgba(42, 2, 1, 8, &[0; 8]), expected);
         assert_eq!(super::to_rgba(43, 2, 1, 8, &[0; 8]), expected);
+    }
+}
+
+#[cfg(test)]
+mod frame_png_tests {
+    use super::{PngPixel, encode_rgb_png};
+    use windows::Win32::Graphics::Dxgi::Common::*;
+
+    fn decode(png: &[u8]) -> (u32, u32, Vec<u8>) {
+        let word = |at| u32::from_be_bytes(png[at..at + 4].try_into().unwrap());
+        assert_eq!(&png[12..16], b"IHDR");
+        assert_eq!(&png[37..41], b"IDAT");
+        let raw = miniz_oxide::inflate::decompress_to_vec_zlib(&png[41..41 + word(33) as usize]).unwrap();
+        (word(16), word(20), raw)
+    }
+
+    #[test]
+    fn odd_capture_extents_keep_the_final_sampled_row_and_column() {
+        let mut rows = [255u8; 5 * 16];
+        for y in 0..5u8 {
+            for x in 0..3u8 {
+                let at = usize::from(y) * 16 + usize::from(x) * 4;
+                rows[at..at + 4].copy_from_slice(&[100 + y, 50 + x, y * 10 + x, 200]);
+            }
+        }
+        let png = encode_rgb_png(3, 5, 16, PngPixel::Bgra8, &rows, false);
+        let expected = [
+            0, 0, 50, 100, 2, 52, 100,
+            0, 20, 50, 102, 22, 52, 102,
+            0, 40, 50, 104, 42, 52, 104,
+        ];
+        assert_eq!(decode(&png), (2, 3, expected.to_vec()));
+    }
+
+    #[test]
+    fn full_resolution_retains_one_pixel_features_and_ignores_padding() {
+        let mark = [171, 63, 29];
+        let corner = [91, 10, 221];
+        for format in [
+            DXGI_FORMAT_R8G8B8A8_UNORM,
+            DXGI_FORMAT_B8G8R8A8_UNORM,
+            DXGI_FORMAT_R10G10B10A2_UNORM,
+            DXGI_FORMAT_R10G10B10A2_TYPELESS,
+            DXGI_FORMAT_R10G10B10A2_UINT,
+        ] {
+            let pixel = PngPixel::for_present_format(format).unwrap();
+            let encode = |[red, green, blue]: [u8; 3]| match pixel {
+                PngPixel::Rgba8 => [red, green, blue, 11],
+                PngPixel::Bgra8 => [blue, green, red, 11],
+                PngPixel::Rgb10A2 => {
+                    let [red, green, blue] = [red, green, blue].map(|c| u32::from(c) * 1023 / 255);
+                    (red | (green << 10) | (blue << 20) | (3 << 30)).to_le_bytes()
+                }
+            };
+            let mut rows = [0u8; 72];
+            for row in rows.as_chunks_mut::<24>().0 {
+                row[20..].fill(241);
+            }
+            rows[28..32].copy_from_slice(&encode(mark));
+            rows[64..68].copy_from_slice(&encode(corner));
+
+            let mut thumbnail = vec![0; 20]; // Two filter bytes and six RGB pixels.
+            thumbnail[17..20].copy_from_slice(&corner);
+            let png = encode_rgb_png(5, 3, 24, pixel, &rows, false);
+            assert_eq!(decode(&png), (3, 2, thumbnail), "{format:?}");
+
+            let mut full = vec![0; 48]; // Three filter bytes and fifteen RGB pixels.
+            full[20..23].copy_from_slice(&mark);
+            full[45..48].copy_from_slice(&corner);
+            let png = encode_rgb_png(5, 3, 24, pixel, &rows, true);
+            assert_eq!(decode(&png), (5, 3, full), "{format:?}");
+        }
     }
 }
