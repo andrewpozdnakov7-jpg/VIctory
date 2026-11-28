@@ -3,6 +3,7 @@
 //! The root-signature serialization probe deliberately goes through
 //! `victory_gpu::root::serialize_versioned`, the same title-facing path the
 //! game uses, rather than a separate copy of the host call.
+//! Set VICTORY_WARP=1 to select the software adapter for the device check.
 
 use anyhow::Result;
 
@@ -91,17 +92,17 @@ pub fn run() -> Result<()> {
         Ok(host) => {
             let adapter =
                 adapter_name(&host.device).unwrap_or_else(|| "adapter name unknown".into());
-            println!("hardware SM 6.6 device: created ({adapter})");
+            println!("D3D12 SM 6.6 device: created ({adapter})");
             match host.root_signature_for(&[]) {
-                Ok(_) => println!("hardware root signature 0xc01: created"),
+                Ok(_) => println!("D3D12 root signature 0xc01: created"),
                 Err(e) => {
-                    println!("hardware root signature 0xc01: failed: {e}");
+                    println!("D3D12 root signature 0xc01: failed: {e}");
                     failures += 1;
                 }
             }
         }
         Err(e) => {
-            println!("hardware SM 6.6 device: unavailable: {e}");
+            println!("D3D12 SM 6.6 device: unavailable: {e}");
             failures += 1;
         }
     }
