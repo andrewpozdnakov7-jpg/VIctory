@@ -1180,12 +1180,37 @@ fn window_overlap(block: &mut [f32], window: &[f32]) {
 }
 
 fn to_i16(v: f32) -> i16 {
-    (v * 32768.0).round().clamp(-32768.0, 32767.0) as i16
+    // Widen before adding half so f32 samples next to a tie round correctly.
+    // The signed bias rounds ties away from zero, then the cast saturates.
+    let scaled = f64::from(v) * 32768.0;
+    (scaled + 0.5f64.copysign(scaled)) as i16
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pcm_rounds_ties_away_from_zero_and_saturates() {
+        let tie = 0.5f32 / 32768.0;
+        let below = tie.next_down();
+        let above = tie.next_up();
+        for (sample, expected) in [
+            (below, 0),
+            (tie, 1),
+            (above, 1),
+            (-below, 0),
+            (-tie, -1),
+            (-above, -1),
+            (1.0, i16::MAX),
+            (-1.0, i16::MIN),
+            (f32::INFINITY, i16::MAX),
+            (f32::NEG_INFINITY, i16::MIN),
+            (f32::NAN, 0),
+        ] {
+            assert_eq!(to_i16(sample), expected, "sample bits: {:08x}", sample.to_bits());
+        }
+    }
 
     #[test]
     fn flush_appends_mono_or_interleaved_stereo_and_resets() {
