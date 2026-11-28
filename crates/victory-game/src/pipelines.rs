@@ -109,18 +109,23 @@ impl Named {
     /// not keep every field (factors of a target that does not blend, the
     /// depth func with depth off): those are enumerated.
     fn name_from_registers(&mut self, want: &mut Wanted, pack: &Pack) {
-        let mut tried = HashSet::new();
+        let mut tried_depth = HashSet::new();
+        let mut tried_blend = HashSet::new();
         for g in pack.graphics() {
             let (Some(regs), Some(formats)) = (registers(g.packet), g.target_formats()) else {
                 continue;
             };
-            if !tried.insert((g.depth_stencil_hash, g.blend_hash, formats, regs)) {
-                continue;
-            }
-            if want.depth.contains(&g.depth_stencil_hash) {
+            // Each search only depends on the registers for its own state kind.
+            let [control, stencil, mask, _, _, blend_regs @ ..] = regs;
+            let depth_regs = [control, stencil, mask];
+            if want.depth.contains(&g.depth_stencil_hash)
+                && tried_depth.insert((g.depth_stencil_hash, depth_regs))
+            {
                 depth_from_registers(&regs, |b| self.try_depth(want, &b));
             }
-            if want.blend.contains(&g.blend_hash) {
+            if want.blend.contains(&g.blend_hash)
+                && tried_blend.insert((g.blend_hash, formats, blend_regs))
+            {
                 blend_from_registers(&regs, &formats, |b| self.try_blend(want, &b));
             }
         }
@@ -405,7 +410,7 @@ fn blend_from_registers(regs: &[u32; 14], formats: &[u8; 8], mut f: impl FnMut([
     if per_target.iter().any(Vec::is_empty) {
         return;
     }
-    let build = |head: [u8; 4], targets: &[[u8; 8]]| {
+    let build = |head: [u8; 4], targets: &[[u8; 8]; 8]| {
         let mut b = [0u8; BLEND];
         b[..4].copy_from_slice(&head);
         for (i, t) in targets.iter().enumerate() {
@@ -421,10 +426,9 @@ fn blend_from_registers(regs: &[u32; 14], formats: &[u8; 8], mut f: impl FnMut([
                 // have no format (whose registers repeat another target's)
                 // left at D3D12's default, writing nothing up to some target
                 // and everything from there; then one target changed.
-                let first: Vec<[u8; 8]> = per_target.iter().map(|c| c[0]).collect();
-                let mut bases = vec![first.clone()];
-                for split in 0..=8 {
-                    let mut base = first.clone();
+                let first = std::array::from_fn(|i| per_target[i][0]);
+                let bases = std::iter::once(first).chain((0..=8).map(|split| {
+                    let mut base = first;
                     for (i, t) in base
                         .iter_mut()
                         .enumerate()
@@ -433,13 +437,13 @@ fn blend_from_registers(regs: &[u32; 14], formats: &[u8; 8], mut f: impl FnMut([
                         *t = DEFAULT_TARGET;
                         t[7] = if i < split { 0 } else { 15 };
                     }
-                    bases.push(base);
-                }
-                for base in &bases {
-                    f(build(head, base));
+                    base
+                }));
+                for base in bases {
+                    f(build(head, &base));
                     for (i, c) in per_target.iter().enumerate() {
                         for &t in c {
-                            let mut targets = base.clone();
+                            let mut targets = base;
                             targets[i] = t;
                             f(build(head, &targets));
                         }
@@ -459,8 +463,7 @@ fn blend_from_registers(regs: &[u32; 14], formats: &[u8; 8], mut f: impl FnMut([
                     disabled[0] = 0;
                     for fill in [DEFAULT_TARGET, keep_off, default_off, [0; 8], off, disabled] {
                         for n in 1..8 {
-                            let targets: Vec<[u8; 8]> =
-                                (0..8).map(|i| if i < n { c0 } else { fill }).collect();
+                            let targets = std::array::from_fn(|i| if i < n { c0 } else { fill });
                             f(build(head, &targets));
                         }
                     }
