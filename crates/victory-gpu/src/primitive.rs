@@ -129,15 +129,19 @@ impl Kind {
         }
     }
 
+    // Reconstruct normalized attributes in their integer storage units.
+    // The three inputs and their sum fit exactly in f32, so only clamping
+    // to the format's range is needed when writing them back.
     fn read(self, at: &[u8], c: usize) -> f32 {
         let b = &at[c * self.bytes()..];
         match self {
             Kind::F32 => f32::from_le_bytes([b[0], b[1], b[2], b[3]]),
             Kind::F16 => half_to_f32(u16::from_le_bytes([b[0], b[1]])),
-            Kind::Unorm16 => f32::from(u16::from_le_bytes([b[0], b[1]])) / 65535.0,
-            Kind::Unorm8 => f32::from(b[0]) / 255.0,
-            Kind::Snorm16 => (f32::from(i16::from_le_bytes([b[0], b[1]])) / 32767.0).max(-1.0),
-            Kind::Snorm8 => (f32::from(b[0] as i8) / 127.0).max(-1.0),
+            Kind::Unorm16 => f32::from(u16::from_le_bytes([b[0], b[1]])),
+            Kind::Unorm8 => f32::from(b[0]),
+            // The two lowest SNORM codes both decode to the negative endpoint.
+            Kind::Snorm16 => f32::from(i16::from_le_bytes([b[0], b[1]]).max(-32767)),
+            Kind::Snorm8 => f32::from((b[0] as i8).max(-127)),
         }
     }
 
@@ -147,14 +151,10 @@ impl Kind {
         match self {
             Kind::F32 => b.copy_from_slice(&v.to_le_bytes()),
             Kind::F16 => b.copy_from_slice(&f32_to_half(v).to_le_bytes()),
-            Kind::Unorm16 => {
-                b.copy_from_slice(&((v.clamp(0.0, 1.0) * 65535.0).round() as u16).to_le_bytes())
-            }
-            Kind::Unorm8 => b[0] = (v.clamp(0.0, 1.0) * 255.0).round() as u8,
-            Kind::Snorm16 => {
-                b.copy_from_slice(&((v.clamp(-1.0, 1.0) * 32767.0).round() as i16).to_le_bytes())
-            }
-            Kind::Snorm8 => b[0] = (v.clamp(-1.0, 1.0) * 127.0).round() as i8 as u8,
+            Kind::Unorm16 => b.copy_from_slice(&(v.clamp(0.0, 65535.0) as u16).to_le_bytes()),
+            Kind::Unorm8 => b[0] = v.clamp(0.0, 255.0) as u8,
+            Kind::Snorm16 => b.copy_from_slice(&(v.clamp(-32767.0, 32767.0) as i16).to_le_bytes()),
+            Kind::Snorm8 => b[0] = v.clamp(-127.0, 127.0) as i8 as u8,
         }
     }
 }
