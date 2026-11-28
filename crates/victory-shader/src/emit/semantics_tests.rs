@@ -2615,6 +2615,40 @@ fn sub_dword_operands_match_the_hardware() {
     assert_clean(check(&passing(p)));
 }
 
+#[test]
+fn f16_transcendental_nan_modifiers_keep_payload_and_other_half() {
+    let mut probes = Vec::new();
+    for op in [0x54, 0x55] {
+        for (src_high, dst_high) in [(false, false), (true, false), (false, true), (true, true)] {
+            let src_shift = if src_high { 16 } else { 0 };
+            let dst_shift = if dst_high { 16 } else { 0 };
+            let inputs = [0x7c01, 0xfc35, 0x7e42, 0xfe7f]
+                .map(|nan| [nan << src_shift | 0x3c00 << (16 - src_shift), 0, 0, 0x9abc_1234])
+                .to_vec();
+            for (abs, neg) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                let modifiers = M {
+                    abs,
+                    neg,
+                    opsel: u8::from(src_high) | u8::from(dst_high) << 3,
+                    ..NONE
+                };
+                let body = vop3(0x180 + op, 5, [v(1), 0, 0], modifiers);
+                probes.push(probe(body, inputs.clone(), INT, move |[a, _, _, old]| {
+                    let mut bits = (a >> src_shift) & 0xffff;
+                    if abs != 0 {
+                        bits &= 0x7fff;
+                    }
+                    if neg != 0 {
+                        bits ^= 0x8000;
+                    }
+                    vec![(old & !(0xffff << dst_shift)) | (bits << dst_shift)]
+                }));
+            }
+        }
+    }
+    assert_clean(check(&probes));
+}
+
 // ---- scalar ----
 
 fn scalar(

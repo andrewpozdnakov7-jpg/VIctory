@@ -404,6 +404,18 @@ impl Module {
         self.push(block, ty, Op::Bin(op, a, b))
     }
     pub fn cast(&mut self, block: usize, op: Cast, v: V, to: Ty) -> V {
+        if op == Cast::Bitcast
+            && let V::Inst(i) = v
+            && let Inst { ty, op: Op::Cast(Cast::Bitcast, source) } = &self.insts[i as usize]
+            && matches!(
+                (&self.types[to.0 as usize], &self.types[ty.0 as usize]),
+                (TypeDef::Int(32), TypeDef::Float) | (TypeDef::Float, TypeDef::Int(32))
+            )
+            && self.type_of(*source) == to
+        {
+            // Inverse i32/f32 reinterpretations preserve the original bits.
+            return *source;
+        }
         self.push(block, to, Op::Cast(op, v))
     }
     pub fn cmp(&mut self, block: usize, pred: u8, a: V, b: V) -> V {
@@ -1558,6 +1570,34 @@ mod tests {
         // atomic's operand list, kept as its body entry.
         let store = m.blocks[entry].body.iter().any(|&i| matches!(m.insts[i as usize].op, Op::Store(..)) && live[i as usize]);
         assert!(store);
+        let _ = m.write();
+    }
+
+    #[test]
+    fn inverse_i32_f32_bitcasts_reuse_the_original_values() {
+        let (mut m, blocks, sink) = module(1);
+        let block = blocks[0];
+        let (i32t, f32t) = (m.int(32), m.float());
+        let one = m.i32(1);
+        let value = m.bin(block, Bin::Add, one, one);
+        let as_float = m.cast(block, Cast::Bitcast, value, f32t);
+        let as_int = m.cast(block, Cast::Bitcast, as_float, i32t);
+        assert_eq!(as_int, value);
+
+        let float_one = m.f32(1.0f32.to_bits());
+        let float = m.bin(block, Bin::Add, float_one, float_one);
+        let raw = m.cast(block, Cast::Bitcast, float, i32t);
+        let round_trip = m.cast(block, Cast::Bitcast, raw, f32t);
+        assert_eq!(round_trip, float);
+
+        m.call(block, sink, vec![as_int]);
+        m.call(block, sink, vec![raw]);
+        m.terminate(block, Term::Ret);
+        let live = m.live();
+        let V::Inst(unused) = as_float else { unreachable!() };
+        let V::Inst(kept) = raw else { unreachable!() };
+        assert!(!live[unused as usize]);
+        assert!(live[kept as usize]);
         let _ = m.write();
     }
 
