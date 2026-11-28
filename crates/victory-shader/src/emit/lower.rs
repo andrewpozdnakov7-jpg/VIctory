@@ -4001,19 +4001,28 @@ impl<'a> Lower<'a> {
                 (r, None)
             }
             "s_bitset0_b32" | "s_bitset1_b32" => {
-                // Sets (clears) bit src[4:0] of the destination it reads.
                 let old = self.operand(inst, dst.as_ref().ok_or("a missing operand")?)?;
-                let a = src32(self, 0)?;
-                let (k31, one) = (self.s.m.i32(31), self.s.m.i32(1));
-                let a = self.s.m.bin(c, Bin::And, a, k31);
-                let bit = self.s.m.bin(c, Bin::Shl, one, a);
-                if name == "s_bitset1_b32" {
-                    (self.s.m.bin(c, Bin::Or, old, bit), None)
+                let offset = src32(self, 0)?;
+                let set = name == "s_bitset1_b32";
+                let r = if let Some(offset) = self.s.m.int_value(offset) {
+                    let bit = 1u32 << (offset & 31);
+                    let (op, mask) = if set { (Bin::Or, bit) } else { (Bin::And, !bit) };
+                    let mask = self.s.m.i32(mask);
+                    self.s.m.bin(c, op, old, mask)
                 } else {
-                    let ones = self.s.m.i32(u32::MAX);
-                    let nb = self.s.m.bin(c, Bin::Xor, bit, ones);
-                    (self.s.m.bin(c, Bin::And, old, nb), None)
-                }
+                    // Bfi takes the offset from its low five bits.
+                    let width = self.s.m.i32(1);
+                    let bit = self.s.m.i32(u32::from(set));
+                    self.s.op(
+                        c,
+                        "quaternary.i32",
+                        Attr::ReadNone,
+                        self.s.t.i32,
+                        53,
+                        &[width, offset, bit, old],
+                    )
+                };
+                (r, None)
             }
             "s_bfm_b32" => {
                 let (a, b) = (src32(self, 0)?, src32(self, 1)?);

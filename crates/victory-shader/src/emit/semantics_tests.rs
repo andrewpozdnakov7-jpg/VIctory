@@ -2665,6 +2665,75 @@ fn sop1_probe(op: u16, inputs: Vec<[u32; 4]>, f: fn(u32) -> (u32, Option<bool>))
     scalar_out(sop1(op, 20, s(16)), inputs, move |i| f(i[0]))
 }
 
+#[test]
+fn scalar_bitset_changes_only_the_selected_bit() {
+    let inputs: Vec<_> = [0u32, u32::MAX, 0x5a5a_a5a5, 0x8000_0000]
+        .into_iter()
+        .flat_map(|word| {
+            (0..32).flat_map(move |bit| {
+                [0, 32, 0xffff_ffe0].into_iter().flat_map(move |high| {
+                    [0, 1].map(move |condition| [word & !31 | bit, high | bit, condition, 0])
+                })
+            })
+        })
+        .collect();
+
+    let mut probes = Vec::new();
+    for set in [false, true] {
+        let op = if set { 0x1D } else { 0x1B };
+        for (dst, offset) in [(20, s(17)), (16, s(16)), (20, int(31)), (20, int(32))] {
+            let body = [
+                sop1(0x03, 20, s(16)),           // s_mov_b32 s20, s16
+                sopc(0x06, s(18), int(0)),       // s_cmp_eq_u32 s18, 0
+                sop1(op, dst, offset),
+                sop2(0x0A, 21, int(1), int(0)), // s_cselect_b32 s21, 1, 0
+                vop1(0x01, 5, s(dst)),
+                vop1(0x01, 6, s(21)),
+            ];
+            probes.push(scalar(body, inputs.clone(), move |[word, bit, condition, _]| {
+                let offset = if offset == int(31) {
+                    31
+                } else if offset == int(32) {
+                    32
+                } else if dst == 16 {
+                    word
+                } else {
+                    bit
+                };
+                let mask = 1 << (offset & 31);
+                let out = if set { word | mask } else { word & !mask };
+                vec![out, u32::from(condition == 0)]
+            }));
+        }
+    }
+    assert_clean(check(&probes));
+}
+
+#[test]
+fn scalar_abs_scc_survives_a_following_bitset() {
+    let inputs = [0, 1, u32::MAX, 0x8000_0000, 0x7fff_ffff]
+        .into_iter()
+        .flat_map(|word| [0, 1, 31, 32, u32::MAX].map(|offset| [word, offset, 0, 0]))
+        .collect::<Vec<_>>();
+    let probes = [false, true].map(|set| {
+        let op = if set { 0x1d } else { 0x1b };
+        let body = [
+            sop1(0x34, 20, s(16)),           // s_abs_i32 s20, s16
+            sop1(op, 20, s(17)),
+            sop2(0x0A, 21, int(1), int(0)), // s_cselect_b32 s21, 1, 0
+            vop1(0x01, 5, s(20)),
+            vop1(0x01, 6, s(21)),
+        ];
+        scalar(body, inputs.clone(), move |[word, offset, _, _]| {
+            let abs = (word as i32).wrapping_abs() as u32;
+            let mask = 1 << (offset & 31);
+            let out = if set { abs | mask } else { abs & !mask };
+            vec![out, u32::from(abs != 0)]
+        })
+    });
+    assert_clean(check(&probes));
+}
+
 /// Scalar ALU results and SCC (RDNA2 ISA, SOP1/SOP2/SOPC): shift counts
 /// read five bits, `s_bfe` takes its offset from bits 4:0 and its width from
 /// bits 22:16 of the second operand.
