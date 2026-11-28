@@ -1200,16 +1200,17 @@ impl Decoder {
         let sfb = self.bands.sfb_offsets[self.table_idx];
         let [a, b] = &mut self.ch;
         for band in 0..self.num_bands {
-            let range = sfb[band]..sfb[band + 1].min(self.subframe_len);
+            let start = sfb[band].min(self.subframe_len);
+            let end = sfb[band + 1].min(self.subframe_len);
+            let pairs = a.coeffs[start..end].iter_mut().zip(&mut b.coeffs[start..end]);
             if self.transform_band[band] {
-                for y in range {
-                    let (l, r) = (a.coeffs[y], b.coeffs[y]);
-                    (a.coeffs[y], b.coeffs[y]) = (l - r, l + r);
+                for (l, r) in pairs {
+                    (*l, *r) = (*l - *r, *l + *r);
                 }
             } else {
-                for y in range {
-                    a.coeffs[y] *= 181.0 / 128.0;
-                    b.coeffs[y] *= 181.0 / 128.0;
+                for (l, r) in pairs {
+                    *l *= 181.0 / 128.0;
+                    *r *= 181.0 / 128.0;
                 }
             }
         }
