@@ -163,13 +163,27 @@ fn chunk(png: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
     png.extend(crc.to_be_bytes());
 }
 
+// Reflected IEEE CRC-32, used by PNG chunk checksums.
+const CRC32: [u32; 256] = {
+    let mut table = [0; 256];
+    let mut i = 0;
+    while i < table.len() {
+        let mut crc = i as u32;
+        let mut n = 0;
+        while n < 8 {
+            crc = (crc >> 1) ^ (0xedb8_8320 & (crc & 1).wrapping_neg());
+            n += 1;
+        }
+        table[i] = crc;
+        i += 1;
+    }
+    table
+};
+
 fn crc32(bytes: &[u8]) -> u32 {
     let mut crc = !0u32;
-    for &b in bytes {
-        crc ^= u32::from(b);
-        for _ in 0..8 {
-            crc = (crc >> 1) ^ (0xedb8_8320 & (crc & 1).wrapping_neg());
-        }
+    for &byte in bytes {
+        crc = (crc >> 8) ^ CRC32[((crc as u8) ^ byte) as usize];
     }
     !crc
 }
@@ -1337,9 +1351,30 @@ mod frame_png_tests {
 
     fn decode(png: &[u8]) -> (u32, u32, Vec<u8>) {
         let word = |at| u32::from_be_bytes(png[at..at + 4].try_into().unwrap());
-        assert_eq!(&png[12..16], b"IHDR");
-        assert_eq!(&png[37..41], b"IDAT");
-        let raw = miniz_oxide::inflate::decompress_to_vec_zlib(&png[41..41 + word(33) as usize]).unwrap();
+        assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+        let mut start = 8;
+        let mut raw = Vec::new();
+        for kind in [b"IHDR", b"IDAT", b"IEND"] {
+            let len = word(start) as usize;
+            let payload = start + 8;
+            let end = payload + len;
+            assert_eq!(&png[start + 4..payload], kind);
+
+            // Check the checksum independently of the encoder's byte table.
+            let mut crc = !0;
+            for &byte in &png[start + 4..end] {
+                crc ^= u32::from(byte);
+                for _ in 0..8 {
+                    crc = if crc & 1 == 0 { crc >> 1 } else { (crc >> 1) ^ 0xedb8_8320 };
+                }
+            }
+            assert_eq!(!crc, word(end), "CRC for {kind:?}");
+            if kind == b"IDAT" {
+                raw = miniz_oxide::inflate::decompress_to_vec_zlib(&png[payload..end]).unwrap();
+            }
+            start = end + 4;
+        }
+        assert_eq!(start, png.len());
         (word(16), word(20), raw)
     }
 
