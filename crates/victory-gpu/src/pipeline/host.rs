@@ -1032,6 +1032,25 @@ mod tests {
         assert!(state.describe().contains(&format!("{expected:?}")));
     }
 
+    #[test]
+    fn graphics_keys_distinguish_sample_masks() {
+        let mut keys = std::collections::HashSet::new();
+        for mask in [0, 1, 5, u32::MAX] {
+            let mut state = GraphicsState {
+                names: vec![CString::new("POSITION").unwrap()],
+                inputs: vec![element(DXGI_FORMAT_R32_FLOAT, 0)],
+                samples: DXGI_SAMPLE_DESC { Count: 4, Quality: 0 },
+                ..Default::default()
+            };
+            let subobject = [D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK.0 as u32, mask];
+            // SAFETY: the stream fragment contains the kind and its full u32 mask.
+            unsafe { state.read(subobject[0], subobject.as_ptr().cast()) };
+            assert_eq!(state.sample_mask, mask);
+            let key = super::super::library::name("graphics", b"test root", &[], &state.describe());
+            assert!(keys.insert(key), "sample mask {mask:#x} reused a key");
+        }
+    }
+
     fn offsets(inputs: &[D3D12_INPUT_ELEMENT_DESC]) -> Vec<u32> {
         let state = GraphicsState {
             inputs: inputs.to_vec(),
