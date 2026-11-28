@@ -1010,6 +1010,21 @@ mod tests {
         // B8G8R8A8 still swaps to RGBA.
         assert_eq!(super::to_rgba(87, 1, 1, 4, &[1, 2, 3, 4]), Some(vec![3, 2, 1, 255]));
     }
+    #[test]
+    fn narrow_integer_captures_keep_r8_signed_order() {
+        let rows = [i8::MIN, -1, 42, 0, i8::MAX].map(|value| value as u8);
+        let rgba = |grey: [u8; 4]| Some(grey.into_iter().flat_map(|v| [v, v, v, 255]).collect());
+        assert_eq!(super::to_rgba(62, 2, 2, 3, &rows), rgba([128, 255, 0, 127]));
+        assert_eq!(super::to_rgba(64, 2, 2, 3, &rows), rgba([0, 127, 128, 255]));
+    }
+
+    #[test]
+    fn narrow_integer_captures_keep_r16_signed_order() {
+        let rows = [i16::MIN, -1, 42, 0, i16::MAX].map(i16::to_le_bytes).concat();
+        let rgba = |grey: [u8; 4]| Some(grey.into_iter().flat_map(|v| [v, v, v, 255]).collect());
+        assert_eq!(super::to_rgba(57, 2, 2, 6, &rows), rgba([127, 255, 0, 127]));
+        assert_eq!(super::to_rgba(59, 2, 2, 6, &rows), rgba([0, 127, 127, 255]));
+    }
 }
 
 #[cfg(test)]
