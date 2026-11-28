@@ -305,11 +305,19 @@ fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
     }
 }
 
-/// Diagnostics, `VICTORY_GPU_TIMING`: GPU time per kind of command and
-/// pipeline (ms, commands) and lists' wall time against the sum of their
-/// commands' (ms), since the last frame-rate line.
 #[cfg(feature = "diagnostics")]
-type GpuTimes = (std::collections::HashMap<String, (f64, u64)>, f64, f64);
+#[derive(Default)]
+struct GpuCommandTimes {
+    total_ms: f64,
+    max_ms: f64,
+    count: u64,
+}
+
+/// Diagnostics, `VICTORY_GPU_TIMING`: GPU time per kind of command and
+/// pipeline and lists' wall time against the sum of their commands' (ms),
+/// since the last frame-rate line.
+#[cfg(feature = "diagnostics")]
+type GpuTimes = (std::collections::HashMap<String, GpuCommandTimes>, f64, f64);
 #[cfg(feature = "diagnostics")]
 static GPU_TIMES: Mutex<Option<GpuTimes>> = Mutex::new(None);
 
@@ -329,8 +337,10 @@ fn gpu_times(wall: Duration, commands: &[(f64, String)]) {
             Some(at) => format!("{kind} {}", &head[at..]),
             None => kind.to_owned(),
         };
-        let e = by.entry(key).or_default();
-        (e.0, e.1) = (e.0 + ms, e.1 + 1);
+        let entry = by.entry(key).or_default();
+        entry.total_ms += ms;
+        entry.max_ms = entry.max_ms.max(*ms);
+        entry.count += 1;
         *sum += ms;
     }
 }
@@ -347,9 +357,14 @@ fn log_gpu_times(frames: f64) {
         sum / frames
     );
     let mut by: Vec<_> = by.into_iter().collect();
-    by.sort_by(|a, b| b.1.0.total_cmp(&a.1.0));
-    for (key, (ms, n)) in by.iter().take(25) {
-        tracing::info!("  GPU {:.2} ms/frame in {:.1} commands/frame: {key}", ms / frames, *n as f64 / frames);
+    by.sort_by(|a, b| b.1.total_ms.total_cmp(&a.1.total_ms));
+    for (key, times) in by.iter().take(25) {
+        tracing::info!(
+            "  GPU {:.2} ms/frame in {:.1} commands/frame: {key} (max {:.2} ms per command)",
+            times.total_ms / frames,
+            times.count as f64 / frames,
+            times.max_ms,
+        );
     }
 }
 
