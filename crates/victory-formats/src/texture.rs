@@ -632,6 +632,38 @@ impl Layout {
         })
     }
 
+    /// The tiled and linear offsets of the contiguous runs in one row.
+    /// Each block uses one base address and a slice of its column table.
+    #[inline(never)]
+    fn column_runs(&self, m: &Mip, n: usize, bytes: usize) -> Vec<(usize, usize, usize)> {
+        let mut runs = Vec::new();
+        let mut first_linear = 0;
+        let mut first_tiled = self.column(m, 0) as usize;
+        let block_width = self.block[0];
+        let shift = self.alignment.trailing_zeros();
+        let tail_x = m.tail.map_or(0, |tail| tail.x);
+        let mut column = 1;
+        while column < m.width {
+            let x = column + tail_x;
+            let in_block = x % block_width;
+            let count = (m.width - column).min(block_width - in_block);
+            let block = u64::from(x / block_width) << shift;
+            let offsets = &self.pattern[0][in_block as usize..(in_block + count) as usize];
+            for (index, &offset) in offsets.iter().enumerate() {
+                let offset = (block + u64::from(offset)) as usize;
+                let at = (column as usize + index) * n;
+                if offset != first_tiled + (at - first_linear) {
+                    runs.push((first_tiled, first_linear, at - first_linear));
+                    first_tiled = offset;
+                    first_linear = at;
+                }
+            }
+            column += count;
+        }
+        runs.push((first_tiled, first_linear, bytes - first_linear));
+        runs
+    }
+
     /// Visits contiguous runs as (tiled byte offset, linear byte offset, length).
     #[allow(clippy::too_many_arguments)]
     fn walk(
@@ -699,21 +731,11 @@ impl Layout {
         let linear = self.desc.swizzle == Swizzle::LINEAR;
         // The row and depth contribute one common base to every column, so
         // the same contiguous runs repeat on every row, including mip tails.
-        let mut runs = Vec::new();
-        if !linear {
-            let mut first_linear = 0;
-            let mut first_tiled = self.column(m, 0) as usize;
-            for x in 1..m.width {
-                let offset = self.column(m, x) as usize;
-                let at = x as usize * n;
-                if offset != first_tiled + (at - first_linear) {
-                    runs.push((first_tiled, first_linear, at - first_linear));
-                    first_tiled = offset;
-                    first_linear = at;
-                }
-            }
-            runs.push((first_tiled, first_linear, bytes - first_linear));
-        }
+        let runs = if linear {
+            Vec::new()
+        } else {
+            self.column_runs(m, n, bytes)
+        };
         // A mip can end partway through the last run. Check the other runs
         // once so each row can copy them with a compile-time length.
         let (body, last) = runs.split_at(runs.len().saturating_sub(1));
