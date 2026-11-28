@@ -155,6 +155,11 @@ impl Named {
             if want.depth.is_empty() && want.blend.is_empty() {
                 break;
             }
+            let depth_wanted = want.depth.contains(&g.depth_stencil_hash);
+            let blend_wanted = want.blend.contains(&g.blend_hash);
+            if !depth_wanted && !blend_wanted {
+                continue;
+            }
             let (Some(regs), Some(formats)) = (registers(g.packet), g.target_formats()) else {
                 continue;
             };
@@ -162,7 +167,7 @@ impl Named {
                 continue;
             }
             // A register image can also name a state needed by another record.
-            if want.depth.contains(&g.depth_stencil_hash) {
+            if depth_wanted {
                 let _ = depth_from_registers(&regs, |b| {
                     self.try_depth(want, &b);
                     if !want.depth.is_empty() {
@@ -172,7 +177,7 @@ impl Named {
                     }
                 });
             }
-            if want.blend.contains(&g.blend_hash) {
+            if blend_wanted {
                 let _ = blend_from_registers(&regs, &formats, |b| {
                     self.try_blend(want, &b);
                     if !want.blend.is_empty() {
