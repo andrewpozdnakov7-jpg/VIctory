@@ -69,6 +69,16 @@ pub(crate) fn expand_rects_with_corners(
         fourth.copy_from_slice(v(a));
         for &(offset, format) in elements {
             let at = offset as usize;
+            if format == 24 {
+                // The packed color shares one word across all four channels.
+                if stride.saturating_sub(at) >= 4 {
+                    let field = at..at + 4;
+                    let color = |i| u32::from_le_bytes(v(i)[field.clone()].try_into().unwrap());
+                    let corner = packed_unorm_corner(color(a), color(b), color(right));
+                    fourth[field].copy_from_slice(&corner.to_le_bytes());
+                }
+                continue;
+            }
             let Some((n, kind)) = components(format) else {
                 continue;
             };
@@ -82,6 +92,17 @@ pub(crate) fn expand_rects_with_corners(
             }
         }
     }
+}
+
+/// R10G10B10A2_UNORM: interpolate in integer channel units, then clamp per field.
+fn packed_unorm_corner(a: u32, b: u32, right: u32) -> u32 {
+    let mut corner = 0;
+    for (shift, mask) in [(0, 1023), (10, 1023), (20, 1023), (30, 3)] {
+        let channel = |color: u32| (color >> shift) & mask;
+        let value = (channel(a) + channel(b)).saturating_sub(channel(right));
+        corner |= value.min(mask) << shift;
+    }
+    corner
 }
 
 #[derive(Clone, Copy)]
@@ -268,6 +289,40 @@ mod tests {
         assert!(turn(&dst, 0) * turn(&dst, 3) > 0.0, "same winding");
     }
 
+    #[test]
+    fn packed_unorm_uses_the_position_corner_in_each_vertex_order() {
+        let pack = |r: u32, g: u32, b: u32, a: u32| r | g << 10 | b << 20 | a << 30;
+        let vertices = [
+            ([0.0f32, 0.0], pack(60, 150, 300, 0)),
+            ([2.0, 0.0], pack(960, 220, 16, 1)),
+            ([0.0, 1.0], pack(300, 200, 75, 3)),
+        ];
+        let stride = 12;
+        let expected_position = [2.0f32, 1.0].map(f32::to_le_bytes).concat();
+        let expected_color = pack(1023, 270, 0, 3).to_le_bytes();
+        for order in [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [2, 0, 1],
+            [1, 2, 0],
+            [2, 1, 0],
+        ] {
+            let mut source = Vec::new();
+            for index in order {
+                let (position, color) = vertices[index];
+                source.extend(position.map(f32::to_le_bytes).concat());
+                source.extend(color.to_le_bytes());
+            }
+
+            let mut expanded = [0; 6 * 12];
+            expand_rects(&source, &mut expanded, stride, &[(0, 16), (8, 24)]);
+            let fourth = &expanded[5 * stride..];
+            assert_eq!(&fourth[..8], expected_position, "order {order:?}");
+            assert_eq!(&fourth[8..], expected_color, "order {order:?}");
+        }
+    }
+
     /// A rounding that carries out of the mantissa raises the exponent
     /// (the carry used to be or-ed into an odd exponent, halving the value).
     #[test]
@@ -421,5 +476,30 @@ mod tests {
             &dst[11 * 16..12 * 16],
             &v([14.0, 20.0, 1.0], [0.75, 0.5])[..]
         );
+    }
+
+    #[test]
+    fn shared_position_corners_expand_a_separate_packed_color_stream() {
+        let positions = [
+            0.0f32, 0.0, 2.0, 0.0, 0.0, 1.0, // right angle at vertex 0
+            2.0, 0.0, 0.0, 1.0, 0.0, 0.0, // right angle at vertex 2
+        ]
+        .map(f32::to_le_bytes)
+        .concat();
+        let corners = rectangle_corners(&positions, 8, &[(0, 16)]).unwrap();
+        assert_eq!(corners, [0, 2]);
+
+        let pack = |r: u32, g: u32, b: u32, a: u32| r | g << 10 | b << 20 | a << 30;
+        let first = [pack(60, 150, 300, 0), pack(960, 220, 16, 1), pack(300, 200, 75, 3)];
+        let second = [pack(500, 100, 50, 1), pack(600, 70, 100, 1), pack(100, 200, 50, 1)];
+        let colors: Vec<_> = first.into_iter().chain(second).flat_map(u32::to_le_bytes).collect();
+        let mut expanded = [0; 12 * 4];
+        expand_rects_with_corners(&colors, &mut expanded, 4, &[(0, 24)], &corners);
+
+        let expected = [
+            first[0], first[1], first[2], first[2], first[1], pack(1023, 270, 0, 3),
+            second[0], second[1], second[2], second[1], second[0], pack(1000, 0, 100, 1),
+        ].map(u32::to_le_bytes).concat();
+        assert_eq!(expanded.as_slice(), expected);
     }
 }
