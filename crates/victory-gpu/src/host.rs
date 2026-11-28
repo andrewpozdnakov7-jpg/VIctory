@@ -3234,6 +3234,16 @@ impl Host {
         } else {
             planes
         };
+        let resolve = planes.len() == 1 && primary_desc.SampleDesc.Count > 1;
+        if resolve && (primary_desc.Format != format || primary_desc.DepthOrArraySize != 1) {
+            tracing::warn!(
+                source = primary_desc.Format.0,
+                destination = format.0,
+                layers = primary_desc.DepthOrArraySize,
+                "the multisampled presentation texture cannot be resolved directly"
+            );
+            return None;
+        }
         let (mut width, mut height) = (primary_desc.Width as u32, primary_desc.Height);
         for &(tex, _) in &planes[1..] {
             // SAFETY: live resource.
@@ -3288,53 +3298,65 @@ impl Host {
             let (capture, probe) = if planes.len() == 1 {
                 let (texture, state) = planes[0];
                 let state = D3D12_RESOURCE_STATES(state as i32);
-                let mut before = Vec::with_capacity(2);
-                if state != D3D12_RESOURCE_STATE_COPY_SOURCE {
-                    before.push(transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE));
-                }
-                before.push(transition(
-                    &back,
-                    D3D12_RESOURCE_STATE_PRESENT,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                ));
-                list.ResourceBarrier(&before);
-                list.CopyResource(&back, texture);
-                #[cfg(all(test, feature = "diagnostics"))]
-                let capture = {
-                    // Inspect what reached the swap chain, before Present.
-                    list.ResourceBarrier(&[transition(
-                        &back,
-                        D3D12_RESOURCE_STATE_COPY_DEST,
-                        D3D12_RESOURCE_STATE_COPY_SOURCE,
-                    )]);
-                    let readback = crate::capture::read_back(&self.device, list, &back);
-                    list.ResourceBarrier(&[transition(
-                        &back,
-                        D3D12_RESOURCE_STATE_COPY_SOURCE,
-                        D3D12_RESOURCE_STATE_COPY_DEST,
-                    )]);
-                    readback
+                let (source, destination) = if resolve {
+                    (
+                        D3D12_RESOURCE_STATE_RESOLVE_SOURCE,
+                        D3D12_RESOURCE_STATE_RESOLVE_DEST,
+                    )
+                } else {
+                    (D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST)
                 };
-                #[cfg(all(not(test), feature = "diagnostics"))]
-                let capture = crate::capture::wanted(frame)
-                    .then(|| crate::capture::read_back(&self.device, list, texture))
-                    .flatten();
+                let mut before = Vec::with_capacity(2);
+                if state != source {
+                    before.push(transition(texture, state, source));
+                }
+                before.push(transition(&back, D3D12_RESOURCE_STATE_PRESENT, destination));
+                list.ResourceBarrier(&before);
+                if resolve {
+                    list.ResolveSubresource(&back, 0, texture, 0, format);
+                } else {
+                    list.CopyResource(&back, texture);
+                }
                 #[cfg(feature = "diagnostics")]
-                let probe = crate::capture::probe(&self.device, list, texture);
+                let (capture, probe) = {
+                    // Inspect the resolved image, or in tests what reached the
+                    // swap chain. The single-sampled source is already readable.
+                    let read_back_buffer = resolve || cfg!(test);
+                    let read = if read_back_buffer { &back } else { texture };
+                    if read_back_buffer {
+                        list.ResourceBarrier(&[transition(
+                            &back,
+                            destination,
+                            D3D12_RESOURCE_STATE_COPY_SOURCE,
+                        )]);
+                    }
+                    let capture = (cfg!(test) || crate::capture::wanted(frame))
+                        .then(|| crate::capture::read_back(&self.device, list, read))
+                        .flatten();
+                    let probe = crate::capture::probe(
+                        &self.device,
+                        list,
+                        if resolve { &back } else { texture },
+                    );
+                    if read_back_buffer {
+                        list.ResourceBarrier(&[transition(
+                            &back,
+                            D3D12_RESOURCE_STATE_COPY_SOURCE,
+                            destination,
+                        )]);
+                    }
+                    (capture, probe)
+                };
                 #[cfg(not(feature = "diagnostics"))]
                 let (capture, probe) = {
                     let _ = frame;
                     (None::<()>, None::<()>)
                 };
                 let mut after = Vec::with_capacity(2);
-                if state != D3D12_RESOURCE_STATE_COPY_SOURCE {
-                    after.push(transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state));
+                if state != source {
+                    after.push(transition(texture, source, state));
                 }
-                after.push(transition(
-                    &back,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                    D3D12_RESOURCE_STATE_PRESENT,
-                ));
+                after.push(transition(&back, destination, D3D12_RESOURCE_STATE_PRESENT));
                 list.ResourceBarrier(&after);
                 (capture, probe)
             } else {
@@ -4129,5 +4151,122 @@ mod present_plane_tests {
         );
         // Premultiplied half-blue over opaque red.
         assert_eq!(composite, Some((64, 64, [127, 0, 128, 255])));
+    }
+
+    #[test]
+    fn presents_a_multisampled_color_plane() {
+        let Some(host) = host() else {
+            eprintln!("skipping MSAA presentation: no D3D12 device");
+            return;
+        };
+        let rgba8 = [0, 255, 0, 255];
+        let rgb10 = ((1023u32 << 10) | (3u32 << 30)).to_le_bytes();
+        let rgba16 = [0, 0, 0, 0x3c, 0, 0, 0, 0x3c];
+        let cases: [(DXGI_FORMAT, &[u8]); 4] = [
+            (DXGI_FORMAT_R8G8B8A8_UNORM, &rgba8),
+            (DXGI_FORMAT_B8G8R8A8_UNORM, &rgba8),
+            (DXGI_FORMAT_R10G10B10A2_UNORM, &rgb10),
+            (DXGI_FORMAT_R16G16B16A16_FLOAT, &rgba16),
+        ];
+        let mut tested = 0;
+        for (frame, (format, expected)) in cases.into_iter().enumerate() {
+            let mut quality = D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS {
+                Format: format,
+                SampleCount: 4,
+                ..Default::default()
+            };
+            // SAFETY: valid D3D12 device and feature data structure.
+            unsafe {
+                host.device
+                    .CheckFeatureSupport(
+                        D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS,
+                        (&raw mut quality).cast(),
+                        size_of_val(&quality) as u32,
+                    )
+                    .unwrap();
+            }
+            if quality.NumQualityLevels == 0 {
+                continue;
+            }
+
+            let list = host.new_list().unwrap();
+            let mut texture: Option<ID3D12Resource> = None;
+            // SAFETY: the test owns this multisampled render target and open list.
+            unsafe {
+                host.device
+                    .CreateCommittedResource(
+                        &D3D12_HEAP_PROPERTIES {
+                            Type: D3D12_HEAP_TYPE_DEFAULT,
+                            ..Default::default()
+                        },
+                        D3D12_HEAP_FLAG_NONE,
+                        &D3D12_RESOURCE_DESC {
+                            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                            Width: 16,
+                            Height: 16,
+                            DepthOrArraySize: 1,
+                            MipLevels: 1,
+                            Format: format,
+                            SampleDesc: DXGI_SAMPLE_DESC {
+                                Count: 4,
+                                Quality: 0,
+                            },
+                            Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                            ..Default::default()
+                        },
+                        D3D12_RESOURCE_STATE_RENDER_TARGET,
+                        None,
+                        &mut texture,
+                    )
+                    .unwrap();
+                let rtv = host.rtv(texture.as_ref().unwrap(), None);
+                list.list.ClearRenderTargetView(rtv, &[0.0, 1.0, 0.0, 1.0], None);
+            }
+            list.close();
+            host.execute(&[&list]);
+            let texture = texture.unwrap();
+            let mut checked = false;
+            assert_eq!(
+                host.present_with_compositor(
+                    &[(&texture, D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32)],
+                    frame as u64 + 1,
+                    Compositor::new,
+                    |buffer, footprint| {
+                        assert_eq!(
+                            (footprint.Footprint.Width, footprint.Footprint.Height),
+                            (16, 16)
+                        );
+                        assert_eq!(footprint.Footprint.Format, format);
+                        let mut data = std::ptr::null_mut();
+                        // SAFETY: the commands have completed, and the footprint
+                        // describes the mapped allocation for these 16 rows.
+                        unsafe {
+                            buffer.Map(0, None, Some(&mut data)).unwrap();
+                            for y in 0..16 {
+                                let offset = footprint.Offset as usize
+                                    + y * footprint.Footprint.RowPitch as usize;
+                                let row = std::slice::from_raw_parts(
+                                    data.cast::<u8>().add(offset),
+                                    16 * expected.len(),
+                                );
+                                assert!(
+                                    row.chunks_exact(expected.len()).all(|pixel| pixel == expected)
+                                );
+                            }
+                            buffer.Unmap(0, None);
+                        }
+                        checked = true;
+                    },
+                ),
+                Some(false)
+            );
+            assert!(checked);
+            tested += 1;
+        }
+        if tested == 0 {
+            eprintln!("skipping MSAA presentation: no 4x MSAA for the swap formats");
+        } else {
+            println!("verified 4x MSAA in {tested} of 4 swap formats");
+        }
     }
 }
