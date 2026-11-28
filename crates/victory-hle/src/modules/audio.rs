@@ -19,6 +19,7 @@
 use std::alloc::Layout;
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard};
 use std::time::Instant;
 
@@ -310,8 +311,10 @@ pub extern "system" fn AcpHalAllocateShapeContexts(contexts: *mut ShapeContexts)
     }
     *allocated = Some(arrays.map(|p| p as usize));
     let mut xma = XMA.write().unwrap_or_else(|e| e.into_inner());
+    let count = counts[4] as usize;
     xma.array = arrays[4] as usize;
-    xma.voices = (0..counts[4]).map(|_| Mutex::new(None)).collect();
+    xma.voices = (0..count).map(|_| Mutex::new(None)).collect();
+    xma.active = (0..count.div_ceil(64)).map(|_| AtomicU64::new(0)).collect();
     S_OK
 }
 
@@ -362,8 +365,12 @@ const SAMPLES_PER_BLOCK: usize = BLOCK_BYTES / 2;
 const INPUT_INVALID: u32 = 4;
 
 struct Voice {
-    decoder: Option<xma::Decoder>,
+    decoder: Option<Box<xma::Decoder>>,
     pcm: VecDeque<i16>,
+    /// Reusable encoded-frame bytes and decoded-PCM scratch so steady-state
+    /// decoding does not allocate per frame.
+    frame: Vec<u8>,
+    scratch: Vec<i16>,
     /// Samples per channel still to drop (start or loop subframe skips).
     skip: usize,
     ended: bool,
@@ -393,14 +400,19 @@ struct Xma {
     array: usize,
     /// One entry per context, `Some` while enabled. Each has its own lock,
     /// so a command for one voice never waits for others to decode (the
-    /// title sends them from its time-critical mixer thread).
-    voices: Vec<Mutex<Option<Voice>>>,
+    /// title sends them from its time-critical mixer thread). Boxing keeps
+    /// idle slots small and frees per-voice decoder/scratch storage on disable.
+    voices: Vec<Mutex<Option<Box<Voice>>>>,
+    /// Bitset of enabled voice indices (1 bit per slot), updated under the
+    /// matching voice lock so `pump` skips inactive slots without locking them.
+    active: Vec<AtomicU64>,
 }
 
 impl Xma {
     const EMPTY: Xma = Xma {
         array: 0,
         voices: Vec::new(),
+        active: Vec::new(),
     };
 }
 
@@ -451,7 +463,8 @@ impl Xma {
         let Some(context) = self.context(index) else {
             return;
         };
-        let mut slot = lock(&self.voices[index as usize]);
+        let idx = index as usize;
+        let mut slot = lock(&self.voices[idx]);
         context.set_field(2, 26, 6, 0);
         tracing::debug!(
             index,
@@ -460,9 +473,11 @@ impl Xma {
         );
         #[cfg(feature = "diagnostics")]
         dump_input(index, context);
-        *slot = Some(Voice {
+        *slot = Some(Box::new(Voice {
             decoder: None,
             pcm: VecDeque::new(),
+            frame: Vec::new(),
+            scratch: Vec::new(),
             skip: context.field(1, 24, 3) as usize * xma::SUBFRAME_SAMPLES,
             ended: false,
             trace: Trace {
@@ -476,7 +491,8 @@ impl Xma {
                 peak: 0,
                 ended_ms: None,
             },
-        });
+        }));
+        self.active[idx / 64].fetch_or(1u64 << (idx % 64), Ordering::Release);
         drop(slot);
         wake_decoder();
     }
@@ -485,9 +501,13 @@ impl Xma {
         let Some(context) = self.context(index) else {
             return;
         };
-        let Some(voice) = lock(&self.voices[index as usize]).take() else {
+        let idx = index as usize;
+        let mut slot = lock(&self.voices[idx]);
+        let Some(voice) = slot.take() else {
             return;
         };
+        self.active[idx / 64].fetch_and(!(1u64 << (idx % 64)), Ordering::Release);
+        drop(slot);
         let t = &voice.trace;
         tracing::debug!(
             index,
@@ -534,12 +554,18 @@ impl Xma {
     fn pump(&self) {
         let start = Instant::now();
         let mut active = 0;
-        for index in 0..self.voices.len() as u32 {
-            if let (Some(context), Some(voice)) =
-                (self.context(index), &mut *lock(&self.voices[index as usize]))
-            {
-                pump(context, voice);
-                active += 1;
+        for (word_idx, word) in self.active.iter().enumerate() {
+            let mut bits = word.load(Ordering::Acquire);
+            while bits != 0 {
+                let bit = bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                let index = (word_idx * 64 + bit) as u32;
+                if let (Some(context), Some(voice)) =
+                    (self.context(index), &mut *lock(&self.voices[index as usize]))
+                {
+                    pump(context, voice);
+                    active += 1;
+                }
             }
         }
         let took = start.elapsed();
@@ -597,9 +623,9 @@ fn decode(context: Context, voice: &mut Voice) -> bool {
         if valid & (1 << (1 - current)) == 0 {
             // Out of input: the overlap tail, then nothing.
             if let Some(decoder) = &mut voice.decoder {
-                let mut tail = Vec::new();
-                decoder.flush(&mut tail);
-                voice.pcm.extend(tail);
+                voice.scratch.clear();
+                decoder.flush(&mut voice.scratch);
+                voice.pcm.extend(voice.scratch.iter().copied());
             }
             voice.ended = true;
             voice.trace.ended_ms = Some(voice.trace.since.elapsed().as_millis());
@@ -623,24 +649,27 @@ fn decode(context: Context, voice: &mut Voice) -> bool {
     if at < 32 {
         at = 32 + xma::packet(data, 0).map_or(0, |p| p.first_frame_bit as usize);
     }
-    let Some(frame) = xma::read_frame(data, at) else {
+    let Some(frame) = xma::read_frame_into(data, at, &mut voice.frame) else {
         // This input is used up.
         context.set_field(0, 20 + current, 1, 0);
         return true;
     };
     let decoder = voice.decoder.get_or_insert_with(|| {
         const RATES: [u32; 4] = [24_000, 32_000, 44_100, 48_000];
-        xma::Decoder::new(channels, RATES[context.field(1, 27, 2) as usize])
+        Box::new(xma::Decoder::new(
+            channels,
+            RATES[context.field(1, 27, 2) as usize],
+        ))
     });
-    let mut pcm = Vec::with_capacity(xma::FRAME_SAMPLES * channels);
+    voice.scratch.clear();
     voice.trace.frames += 1;
-    if let Err(e) = decoder.decode(&frame.data, frame.bits, &mut pcm) {
+    if let Err(e) = decoder.decode(&voice.frame, frame.bits, &mut voice.scratch) {
         voice.trace.bad_frames += 1;
         if voice.trace.bad_frames <= 2 {
             tracing::debug!(
                 at,
                 bits = frame.bits,
-                head = ?&frame.data[..frame.data.len().min(8)],
+                head = ?&voice.frame[..voice.frame.len().min(8)],
                 %e,
                 "XMA frame did not decode"
             );
@@ -655,7 +684,7 @@ fn decode(context: Context, voice: &mut Voice) -> bool {
     let looping = loops > 0 && ends_loop;
     if looping {
         let keep = (context.field(1, 12, 2) as usize + 1) * xma::SUBFRAME_SAMPLES * channels;
-        pcm.truncate(keep);
+        voice.scratch.truncate(keep);
         next = context.field(3, 0, 26) as usize;
         if loops != 255 {
             context.set_field(0, 12, 8, loops - 1);
@@ -663,9 +692,9 @@ fn decode(context: Context, voice: &mut Voice) -> bool {
     }
     // What is still to skip is this frame's (the stream's first, or a
     // loop's first when it is its last too).
-    let skip = (voice.skip * channels).min(pcm.len());
+    let skip = (voice.skip * channels).min(voice.scratch.len());
     voice.skip -= skip / channels;
-    voice.pcm.extend(&pcm[skip..]);
+    voice.pcm.extend(&voice.scratch[skip..]);
     if looping {
         // The loop's own skip is of its first frame, decoded next: not of
         // this one, its last.
@@ -1328,6 +1357,8 @@ mod tests {
         let mut voice = Voice {
             decoder: None,
             pcm: VecDeque::new(),
+            frame: Vec::new(),
+            scratch: Vec::new(),
             skip: 0,
             ended: false,
             trace: Trace {
@@ -1445,6 +1476,105 @@ mod tests {
         assert_eq!((m.disconnect)(acp), S_OK);
         assert_eq!((m.message_count)(acp), 1, "disconnected");
         (m.release)(acp);
+        assert_eq!(AcpHalReleaseShapeContexts(), S_OK);
+    }
+
+    #[test]
+    fn xma_active_bitset_tracks_words_and_reuses_voice_scratch() {
+        let _serial = lock(&CONTEXT_TESTS);
+        assert!(
+            size_of::<Mutex<Option<Box<Voice>>>>() <= 32,
+            "idle voice slot should stay pointer-sized"
+        );
+        let mut request = ShapeContexts {
+            counts: [0, 0, 0, 0, 512, 0],
+            arrays: [std::ptr::null_mut(); 6],
+            apu: [0; 6],
+        };
+        assert_eq!(AcpHalAllocateShapeContexts(&mut request), S_OK);
+        let (mut input, mut input_apu) = (std::ptr::null_mut(), 0);
+        assert_eq!(ApuAlloc(&mut input, &mut input_apu, 0x1000, 0x800, 1), S_OK);
+        let stream = silent_stream();
+        // SAFETY: two packets were allocated.
+        unsafe { std::ptr::copy_nonoverlapping(stream.as_ptr(), input.cast(), stream.len()) };
+        let (mut output, mut output_apu) = (std::ptr::null_mut(), 0);
+        assert_eq!(
+            ApuAlloc(&mut output, &mut output_apu, 0x1000, 0x100, 2),
+            S_OK
+        );
+
+        // Exercise voice indices spanning multiple 64-bit active words, including the last slot.
+        let indices = [0u32, 63, 64, 511];
+        for (slot, &idx) in indices.iter().enumerate() {
+            let ctx = Context(
+                request.arrays[4]
+                    .cast::<u32>()
+                    .wrapping_add(idx as usize * 16),
+            );
+            ctx.set(0, 2 | (1 << 20) | (4 << 22));
+            ctx.set(1, (1 << 31) | (3 << 27));
+            ctx.set(2, 32);
+            ctx.set(5, input_apu);
+            ctx.set(7, output_apu + (slot as u32) * 0x400);
+            ctx.set(9, 0);
+        }
+
+        let x = xma();
+        assert_eq!(x.active.len(), 8);
+        assert!(x.active.iter().all(|w| w.load(Ordering::Acquire) == 0));
+
+        for &idx in &indices {
+            x.enable(idx);
+            let word = x.active[idx as usize / 64].load(Ordering::Acquire);
+            assert_ne!(word & (1u64 << (idx % 64)), 0, "active bit not set for {idx}");
+        }
+        x.pump();
+
+        // Every enabled voice across all bitset words must have filled its 4-block ring.
+        for &idx in &indices {
+            let slot = lock(&x.voices[idx as usize]);
+            let v = slot.as_ref().expect("voice enabled");
+            assert_eq!(v.trace.produced, 4 * SAMPLES_PER_BLOCK, "voice {idx}");
+            assert!(v.trace.frames >= 1, "voice {idx}");
+        }
+
+        // Subsequent frames on voice 511 reuse both frame and PCM scratch allocations.
+        let (frame_ptr, frame_cap, scratch_ptr, scratch_cap) = {
+            let slot = lock(&x.voices[511]);
+            let v = slot.as_ref().unwrap();
+            (
+                v.frame.as_ptr(),
+                v.frame.capacity(),
+                v.scratch.as_ptr(),
+                v.scratch.capacity(),
+            )
+        };
+        assert!(frame_cap > 0 && scratch_cap >= xma::FRAME_SAMPLES);
+        for _ in 0..4 {
+            x.advance_read(511, 4);
+            x.pump();
+        }
+        {
+            let slot = lock(&x.voices[511]);
+            let v = slot.as_ref().unwrap();
+            assert!(v.trace.frames >= 5);
+            assert_eq!((v.frame.as_ptr(), v.frame.capacity()), (frame_ptr, frame_cap));
+            assert_eq!(
+                (v.scratch.as_ptr(), v.scratch.capacity()),
+                (scratch_ptr, scratch_cap)
+            );
+        }
+
+        for &idx in &indices {
+            x.disable(idx);
+            let word = x.active[idx as usize / 64].load(Ordering::Acquire);
+            assert_eq!(word & (1u64 << (idx % 64)), 0, "active bit not cleared for {idx}");
+        }
+        assert!(x.active.iter().all(|w| w.load(Ordering::Acquire) == 0));
+        drop(x);
+
+        ApuFree(input);
+        ApuFree(output);
         assert_eq!(AcpHalReleaseShapeContexts(), S_OK);
     }
 }
