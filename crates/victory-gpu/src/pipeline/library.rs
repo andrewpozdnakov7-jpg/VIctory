@@ -210,13 +210,13 @@ fn library() -> Option<&'static Shared> {
             let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
             let read = |file| DIR.get().and_then(|d| std::fs::read(d.join(file)).ok());
             let blob = read(LIBRARY_FILE).unwrap_or_default();
-            let tag = tag(&blob);
             let mut library = open(&device, blob);
-            // The pre-build's list, if it was saved with these bytes.
-            if let (Some(l), Some(list)) = (library.as_mut(), read(PREBUILT_FILE))
+            // Fingerprint the accepted bytes only when there is a list to verify.
+            if let Some(l) = library.as_mut()
                 && !l._blob.is_empty()
+                && let Some(list) = read(PREBUILT_FILE)
             {
-                l.prebuilt = listed(&list, &tag);
+                l.prebuilt = listed(&list, &tag(&l._blob));
             }
             if library.is_none() {
                 tracing::warn!("no host pipeline library: pipelines are not kept");
@@ -968,4 +968,3 @@ mod keyed_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
-
