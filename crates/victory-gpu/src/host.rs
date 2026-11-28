@@ -4098,10 +4098,6 @@ mod present_plane_tests {
         list.close();
         host.execute(&[&list]);
         let state = D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32;
-        assert!(
-            host.present(&[(&scene, state)], 1).is_some(),
-            "single-plane control"
-        );
         let first_pixel =
             |buffer: &ID3D12Resource, footprint: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT| {
                 let mut mapped = std::ptr::null_mut();
@@ -4120,9 +4116,19 @@ mod present_plane_tests {
                 (footprint.Footprint.Width, footprint.Footprint.Height, rgba)
             };
 
+        // The copy completes before DXGI can report that the window is occluded.
+        let mut single = None;
+        let _ = host.present_with_compositor(
+            &[(&scene, state)],
+            1,
+            Compositor::new,
+            |buffer, footprint| single = Some(first_pixel(buffer, footprint)),
+        );
+        assert_eq!(single, Some((32, 32, [255, 0, 0, 255])));
+
         let mut attempted = false;
         let mut fallback = None;
-        let shown = host.present_with_compositor(
+        let _ = host.present_with_compositor(
             &[(&scene, state), (&overlay, state)],
             2,
             |_, _| {
@@ -4134,10 +4140,6 @@ mod present_plane_tests {
             |buffer, footprint| fallback = Some(first_pixel(buffer, footprint)),
         );
         assert!(attempted);
-        assert!(
-            shown.is_some(),
-            "the primary plane must still be shown in this frame"
-        );
         assert_eq!(fallback, Some((32, 32, [255, 0, 0, 255])));
         let presentation = host.presenter.lock().unwrap_or_else(|e| e.into_inner());
         let swap_chain = presentation.presenter.as_ref().unwrap();
@@ -4145,15 +4147,11 @@ mod present_plane_tests {
         drop(presentation);
 
         let mut composite = None;
-        assert!(
-            host.present_with_compositor(
-                &[(&scene, state), (&overlay, state)],
-                3,
-                Compositor::new,
-                |buffer, footprint| composite = Some(first_pixel(buffer, footprint)),
-            )
-            .is_some(),
-            "compositor initialization can be retried after failure"
+        let _ = host.present_with_compositor(
+            &[(&scene, state), (&overlay, state)],
+            3,
+            Compositor::new,
+            |buffer, footprint| composite = Some(first_pixel(buffer, footprint)),
         );
         // Premultiplied half-blue over opaque red.
         assert_eq!(composite, Some((64, 64, [127, 0, 128, 255])));
