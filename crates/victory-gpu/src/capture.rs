@@ -60,14 +60,55 @@ pub(crate) fn wanted(n: u64) -> bool {
     folder().is_some() && (n.is_power_of_two() || listed(n))
 }
 
-/// Saves 8-bit RGBA or BGRA rows (`pitch` bytes apart) as frame `n`.
-pub(crate) fn save(n: u64, width: u32, height: u32, pitch: usize, bgra: bool, rows: &[u8]) {
-    save_as(&format!("frame-{n}"), width, height, pitch, bgra, rows);
+/// Byte layout of the four-byte pixels passed to the PNG writer.
+#[derive(Clone, Copy)]
+enum PngPixel {
+    Rgba8,
+    Bgra8,
+    Rgb10A2,
 }
 
-/// Saves 8-bit RGBA or BGRA rows as `<name>.png`, at half size.
-fn save_as(name: &str, width: u32, height: u32, pitch: usize, bgra: bool, rows: &[u8]) {
+impl PngPixel {
+    fn for_present_format(format: DXGI_FORMAT) -> Option<Self> {
+        Some(match format {
+            DXGI_FORMAT_R8G8B8A8_UNORM | DXGI_FORMAT_R8G8B8A8_UNORM_SRGB => Self::Rgba8,
+            DXGI_FORMAT_B8G8R8A8_UNORM | DXGI_FORMAT_B8G8R8A8_UNORM_SRGB => Self::Bgra8,
+            // PNGs show the displayed colors. The presentation copy uses an
+            // UNORM swap chain for these packed bits, including UINT sources.
+            DXGI_FORMAT_R10G10B10A2_TYPELESS
+            | DXGI_FORMAT_R10G10B10A2_UNORM
+            | DXGI_FORMAT_R10G10B10A2_UINT => Self::Rgb10A2,
+            _ => return None,
+        })
+    }
+
+    fn rgb(self, pixel: [u8; 4]) -> [u8; 3] {
+        match self {
+            Self::Rgba8 => [pixel[0], pixel[1], pixel[2]],
+            Self::Bgra8 => [pixel[2], pixel[1], pixel[0]],
+            Self::Rgb10A2 => {
+                let packed = u32::from_le_bytes(pixel);
+                [0, 10, 20].map(|shift| {
+                    let channel = (packed >> shift) & 0x3ff;
+                    ((channel * 255 + 511) / 1023) as u8
+                })
+            }
+        }
+    }
+}
+
+/// Saves four-byte color pixels to an 8-bit RGB PNG at half size.
+fn save_as(name: &str, width: u32, height: u32, pitch: usize, format: PngPixel, rows: &[u8]) {
     let Some(folder) = folder() else { return };
+    let png = encode_rgb_png(width, height, pitch, format, rows);
+    let path = folder.join(format!("{name}.png"));
+    match std::fs::create_dir_all(folder).and_then(|()| std::fs::write(&path, png)) {
+        Ok(()) => tracing::info!(path = %path.display(), "frame saved"),
+        Err(e) => tracing::warn!(error = %e, path = %path.display(), "frame not saved"),
+    }
+}
+
+fn encode_rgb_png(width: u32, height: u32, pitch: usize, format: PngPixel, rows: &[u8]) -> Vec<u8> {
     let (w, h) = ((width / 2).max(1), (height / 2).max(1));
     // Filter byte 0 per row, then RGB of every other pixel of every other row.
     let mut raw = Vec::with_capacity((w as usize * 3 + 1) * h as usize);
@@ -75,12 +116,8 @@ fn save_as(name: &str, width: u32, height: u32, pitch: usize, bgra: bool, rows: 
         raw.push(0);
         let row = &rows[(2 * y).min(height as usize - 1) * pitch..];
         for x in 0..w as usize {
-            let p = &row[(2 * x).min(width as usize - 1) * 4..][..3];
-            if bgra {
-                raw.extend([p[2], p[1], p[0]]);
-            } else {
-                raw.extend_from_slice(p);
-            }
+            let p = &row[(2 * x).min(width as usize - 1) * 4..][..4];
+            raw.extend(format.rgb(p.try_into().unwrap()));
         }
     }
     let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
@@ -95,11 +132,7 @@ fn save_as(name: &str, width: u32, height: u32, pitch: usize, bgra: bool, rows: 
         &miniz_oxide::deflate::compress_to_vec_zlib(&raw, 3),
     );
     chunk(&mut png, b"IEND", &[]);
-    let path = folder.join(format!("{name}.png"));
-    match std::fs::create_dir_all(folder).and_then(|()| std::fs::write(&path, png)) {
-        Ok(()) => tracing::info!(path = %path.display(), "frame saved"),
-        Err(e) => tracing::warn!(error = %e, path = %path.display(), "frame not saved"),
-    }
+    png
 }
 
 fn chunk(png: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
@@ -195,20 +228,19 @@ pub(crate) fn read_back(
     }
 }
 
-/// Saves a frame read back by [`read_back`] (8-bit color only).
+/// Saves a frame read back from a four-byte color format.
 pub(crate) fn save_read_back(
     frame: u64,
     buffer: &ID3D12Resource,
     footprint: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
 ) {
     let f = footprint.Footprint;
-    let bgra = match f.Format {
-        DXGI_FORMAT_R8G8B8A8_UNORM | DXGI_FORMAT_R8G8B8A8_UNORM_SRGB => false,
-        DXGI_FORMAT_B8G8R8A8_UNORM | DXGI_FORMAT_B8G8R8A8_UNORM_SRGB => true,
-        other => {
-            tracing::warn!(format = other.0, "frame not saved: not 8-bit color");
-            return;
-        }
+    let Some(format) = PngPixel::for_present_format(f.Format) else {
+        tracing::warn!(
+            format = f.Format.0,
+            "frame not saved: unsupported color format"
+        );
+        return;
     };
     let mut data = std::ptr::null_mut();
     // SAFETY: the copy finished (every submission is waited for); the
@@ -217,9 +249,15 @@ pub(crate) fn save_read_back(
         if buffer.Map(0, None, Some(&mut data)).is_err() {
             return;
         }
-        let len = f.RowPitch as usize * f.Height as usize;
-        let rows = std::slice::from_raw_parts(data.cast::<u8>(), len);
-        save(frame, f.Width, f.Height, f.RowPitch as usize, bgra, rows);
+        let rows = std::slice::from_raw_parts(data.cast::<u8>(), buffer.GetDesc().Width as usize);
+        save_as(
+            &format!("frame-{frame}"),
+            f.Width,
+            f.Height,
+            f.RowPitch as usize,
+            format,
+            rows,
+        );
         buffer.Unmap(0, None);
     }
 }
@@ -580,7 +618,14 @@ fn dump_one(
             if rgba.chunks(4).all(|p| p[..3] == [0, 0, 0]) {
                 name.push_str("-black");
             }
-            save_as(&name, f.Width, f.Height, f.Width as usize * 4, false, &rgba);
+            save_as(
+                &name,
+                f.Width,
+                f.Height,
+                f.Width as usize * 4,
+                PngPixel::Rgba8,
+                &rgba,
+            );
         } else {
             tracing::info!(format = f.Format.0, ?resource, "target not dumped: format");
         }
@@ -1157,6 +1202,57 @@ mod tests {
             }
         });
     }
+    #[test]
+    fn packed_10_bit_frames_are_saved_as_rgb_pngs() {
+        use super::*;
+
+        let rgba8 = [
+            [255, 128, 0, 0],
+            [0, 64, 255, 255],
+            [7, 8, 16, 42],
+            [128, 128, 128, 127],
+        ];
+        let bgra8 = rgba8.map(|[r, g, b, a]| [b, g, r, a]);
+        let rgb10 = [
+            1023 | 512 << 10,
+            256 << 10 | 1023 << 20 | 3 << 30,
+            30 | 31 << 10 | 64 << 20 | 1 << 30,
+            512 | 512 << 10 | 512 << 20 | 2 << 30,
+        ]
+        .map(u32::to_le_bytes);
+
+        const PITCH: usize = 20;
+        for (format, pixels) in [
+            (DXGI_FORMAT_R8G8B8A8_UNORM, rgba8),
+            (DXGI_FORMAT_B8G8R8A8_UNORM, bgra8),
+            (DXGI_FORMAT_R10G10B10A2_UNORM, rgb10),
+            (DXGI_FORMAT_R10G10B10A2_TYPELESS, rgb10),
+            (DXGI_FORMAT_R10G10B10A2_UINT, rgb10),
+        ] {
+            // Only the sampled pixels have meaningful colors. Intervening
+            // rows, columns, and pitch padding must not affect the PNG.
+            let mut rows = [0xcc; 4 * PITCH];
+            for (offset, color) in [0, 8, 2 * PITCH, 2 * PITCH + 8].into_iter().zip(pixels) {
+                rows[offset..offset + 4].copy_from_slice(&color);
+            }
+            let pixel = PngPixel::for_present_format(format).unwrap();
+            let png = encode_rgb_png(4, 4, PITCH, pixel, &rows);
+            let word = |at| u32::from_be_bytes(png[at..at + 4].try_into().unwrap());
+            assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+            assert_eq!([word(16), word(20)], [2, 2]);
+            assert_eq!(&png[24..26], &[8, 2]);
+            assert_eq!(&png[37..41], b"IDAT");
+            let data =
+                miniz_oxide::inflate::decompress_to_vec_zlib(&png[41..41 + word(33) as usize])
+                    .unwrap();
+            assert_eq!(
+                data,
+                [0, 255, 128, 0, 0, 64, 255, 0, 7, 8, 16, 128, 128, 128],
+                "{format:?}"
+            );
+        }
+    }
+
 }
 
 #[cfg(test)]
