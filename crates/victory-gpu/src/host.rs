@@ -3096,6 +3096,7 @@ struct Meter {
     report_frames: u64,
     drawn: u64,
     logged: std::time::Instant,
+    report_drawn: u64,
     /// The caption the window had, once read.
     caption: Option<Vec<u16>>,
 }
@@ -3103,12 +3104,14 @@ struct Meter {
 impl Meter {
     fn new() -> Self {
         let now = std::time::Instant::now();
+        let drawn = crate::draw::drawn();
         Meter {
             since: now,
             frames: 0,
             report_frames: 0,
-            drawn: crate::draw::drawn(),
+            drawn,
             logged: now,
+            report_drawn: drawn,
             caption: None,
         }
     }
@@ -3122,7 +3125,8 @@ impl Meter {
         #[cfg(feature = "diagnostics")]
         crate::watch::frame_done();
         self.report_frames += 1;
-        let elapsed = self.since.elapsed();
+        let now = std::time::Instant::now();
+        let elapsed = now - self.since;
         if elapsed < std::time::Duration::from_secs(1) {
             return;
         }
@@ -3131,12 +3135,14 @@ impl Meter {
         let fps = frames / elapsed.as_secs_f64();
         let ms = elapsed.as_secs_f64() * 1000.0 / frames;
         let draws = (drawn - self.drawn) as f64 / frames;
-        (self.since, self.frames, self.drawn) = (std::time::Instant::now(), 0, drawn);
-        // The counters are read in the five-second block, where `GPU timing`
-        // is logged, so both lines cover the same frames.
-        if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
-            self.logged = std::time::Instant::now();
+        (self.since, self.frames, self.drawn) = (now, 0, drawn);
+        let report_elapsed = now - self.logged;
+        if report_elapsed >= std::time::Duration::from_secs(5) {
             let report_frames = std::mem::take(&mut self.report_frames) as f64;
+            let draws = (drawn - self.report_drawn) as f64 / report_frames;
+            (self.logged, self.report_drawn) = (now, drawn);
+            let fps = report_frames / report_elapsed.as_secs_f64();
+            let ms = report_elapsed.as_secs_f64() * 1_000.0 / report_frames;
             // Of a frame, ms preparing submissions and ms waiting for the GPU.
             let [cpu, gpu] = [0, 1].map(|i| {
                 SUBMISSION_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / report_frames
