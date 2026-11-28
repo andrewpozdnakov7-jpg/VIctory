@@ -314,10 +314,15 @@ struct GpuCommandTimes {
 }
 
 /// Diagnostics, `VICTORY_GPU_TIMING`: GPU time per kind of command and
-/// pipeline and lists' wall time against the sum of their commands' (ms),
-/// since the last frame-rate line.
+/// pipeline, list wall time, and notes beyond the timestamp budget.
 #[cfg(feature = "diagnostics")]
-type GpuTimes = (std::collections::HashMap<String, GpuCommandTimes>, f64, f64);
+#[derive(Default)]
+struct GpuTimes {
+    by_pipeline: std::collections::HashMap<String, GpuCommandTimes>,
+    wall_ms: f64,
+    command_ms: f64,
+    beyond_limit: usize,
+}
 #[cfg(feature = "diagnostics")]
 static GPU_TIMES: Mutex<Option<GpuTimes>> = Mutex::new(None);
 
@@ -325,10 +330,11 @@ static GPU_TIMES: Mutex<Option<GpuTimes>> = Mutex::new(None);
 /// by the command's kind and pipeline: its note before the first ` | `,
 /// without counts and addresses.
 #[cfg(feature = "diagnostics")]
-fn gpu_times(wall: Duration, commands: &[(f64, String)]) {
+fn gpu_times(wall: Duration, commands: &[(f64, String)], beyond_limit: usize) {
     let mut times = GPU_TIMES.lock().unwrap_or_else(|e| e.into_inner());
-    let (by, wall_ms, sum) = times.get_or_insert_with(Default::default);
-    *wall_ms += wall.as_secs_f64() * 1e3;
+    let times = times.get_or_insert_with(Default::default);
+    times.wall_ms += wall.as_secs_f64() * 1e3;
+    times.beyond_limit += beyond_limit;
     for (ms, note) in commands {
         // "draw 3x1 [mesh 1f.., pixel 2e..] | ...": the kind and the pipeline.
         let head = note.split(" | ").next().unwrap_or_default();
@@ -337,26 +343,32 @@ fn gpu_times(wall: Duration, commands: &[(f64, String)]) {
             Some(at) => format!("{kind} {}", &head[at..]),
             None => kind.to_owned(),
         };
-        let entry = by.entry(key).or_default();
+        let entry = times.by_pipeline.entry(key).or_default();
         entry.total_ms += ms;
         entry.max_ms = entry.max_ms.max(*ms);
         entry.count += 1;
-        *sum += ms;
+        times.command_ms += ms;
     }
 }
 
 /// Logs [`GPU_TIMES`] per frame over `frames` frames: the 25 costliest.
 #[cfg(feature = "diagnostics")]
 fn log_gpu_times(frames: f64) {
-    let Some((by, wall, sum)) = GPU_TIMES.lock().unwrap_or_else(|e| e.into_inner()).take() else {
+    let Some(times) = GPU_TIMES.lock().unwrap_or_else(|e| e.into_inner()).take() else {
         return;
     };
     tracing::info!(
         "GPU timing: lists {:.1} ms/frame of wall time, their commands {:.1} ms/frame",
-        wall / frames,
-        sum / frames
+        times.wall_ms / frames,
+        times.command_ms / frames
     );
-    let mut by: Vec<_> = by.into_iter().collect();
+    if times.beyond_limit != 0 {
+        tracing::info!(
+            "GPU timing coverage: {} command notes beyond the per-list timestamp limit of {MAX_TIMED_COMMANDS}",
+            times.beyond_limit,
+        );
+    }
+    let mut by: Vec<_> = times.by_pipeline.into_iter().collect();
     by.sort_by(|a, b| b.1.total_ms.total_cmp(&a.1.total_ms));
     for (key, times) in by.iter().take(25) {
         tracing::info!(
@@ -869,6 +881,8 @@ pub(crate) fn warn_depth_bounds() {
 /// Timestamps per list (diagnostics); commands past them are not timed.
 #[cfg(feature = "diagnostics")]
 const STAMPS: u32 = 4096;
+#[cfg(feature = "diagnostics")]
+const MAX_TIMED_COMMANDS: usize = STAMPS as usize - 1;
 
 /// A marker's text and the host range its command reads (diagnostics).
 #[cfg(feature = "diagnostics")]
@@ -1312,7 +1326,9 @@ impl Host {
             if groups.len() > 1 {
                 // SAFETY: a plain query.
                 let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
-                gpu_times(started.elapsed(), &runs[i].slowest(frequency, usize::MAX));
+                let wall = started.elapsed();
+                let (commands, beyond_limit) = runs[i].slowest(frequency, usize::MAX);
+                gpu_times(wall, &commands, beyond_limit);
             }
             #[cfg(feature = "diagnostics")]
             if groups.len() > 1 && started.elapsed() > std::time::Duration::from_millis(50) {
@@ -1320,7 +1336,7 @@ impl Host {
                 let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
                 let commands = runs[i].notes.lock().unwrap_or_else(|e| e.into_inner()).len();
                 tracing::warn!(ms = started.elapsed().as_millis(), commands, "slow host list");
-                for (ms, op) in runs[i].slowest(frequency, 6) {
+                for (ms, op) in runs[i].slowest(frequency, 6).0 {
                     tracing::warn!("slow list command, {ms:.1} ms: {op}");
                 }
             }
@@ -1729,20 +1745,22 @@ impl HostList {
             .as_ref()
     }
 
-    /// The noted commands that took longest on the GPU, longest first, as
-    /// (milliseconds, text) (diagnostics, timing on, after the list ran).
+    /// The longest noted GPU commands (milliseconds, text), and how many
+    /// notes were beyond the timestamp budget. Read after the list ran.
     #[cfg(feature = "diagnostics")]
-    fn slowest(&self, frequency: u64, n: usize) -> Vec<(f64, String)> {
+    fn slowest(&self, frequency: u64, n: usize) -> (Vec<(f64, String)>, usize) {
         let notes = self.notes.lock().unwrap_or_else(|e| e.into_inner());
-        let (Some((_, back)), count) = (self.stamps(), notes.len().min(STAMPS as usize - 1)) else {
-            return Vec::new();
+        let count = notes.len().min(MAX_TIMED_COMMANDS);
+        let beyond_limit = notes.len() - count;
+        let Some((_, back)) = self.stamps() else {
+            return (Vec::new(), beyond_limit);
         };
         let mut data = std::ptr::null_mut();
         let range = D3D12_RANGE { Begin: 0, End: (count + 1) * 8 };
         // SAFETY: a read-back buffer the finished list resolved into.
         let stamps: Vec<u64> = unsafe {
             if back.Map(0, Some(&range), Some(&mut data)).is_err() {
-                return Vec::new();
+                return (Vec::new(), beyond_limit);
             }
             let s = std::slice::from_raw_parts(data.cast::<u64>(), count + 1).to_vec();
             back.Unmap(0, None);
@@ -1756,7 +1774,7 @@ impl HostList {
             .collect();
         times.sort_by(|a, b| b.0.total_cmp(&a.0));
         times.truncate(n);
-        times
+        (times, beyond_limit)
     }
 
     /// Whether `node` of the device-removed data (its breadcrumbs) is this
