@@ -579,6 +579,62 @@ fn a_sampler_chosen_by_a_uniform_branch_samples_as_chosen() {
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
 }
+/// A static sampler with MIN_LOD 2 and MAX_LOD 0 samples level 2 at LOD 0:
+/// RDNA2's minimum wins the inverted range, while D3D12's order reads level 0.
+#[test]
+fn an_inverted_static_lod_range_samples_min_lod() {
+    // s0: the texture table. s2: the raw UAV table. The sampler is immediate.
+    let words = [
+        0xBE84_0300, 0xBE85_0380, // s[4:5] = s0, 0
+        0xF40C_0202, 0xFA00_0000, // s_load_dwordx8 s[8:15], s[4:5], 0
+        0xBE86_0302, 0xBE87_0380, // s[6:7] = s2, 0
+        0xF408_0403, 0xFA00_0000, // s_load_dwordx4 s[16:19], s[6:7], 0
+        0xBE94_03FF, 0x0000_0092, // sampler word 0: clamp x, y, z
+        0xBE95_03FF, 0x0000_0200, // word 1: MIN_LOD 2.0, MAX_LOD 0.0
+        0xBE96_03FF, 0x0400_0000, // word 2: point mip filter
+        0xBE97_0380, // word 3: 0
+        0x7E00_02FF, 0x3F00_0000, // v_mov_b32 v0, 0.5
+        0x7E02_02FF, 0x3F00_0000, // v_mov_b32 v1, 0.5
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xF09C_0108, 0x00A2_0200, // image_sample_lz v2, v[0:1], s[8:15], s[20:23]
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0x7E06_0280, // v_mov_b32 v3, 0
+        0xE070_1000, 0x8004_0203, // buffer_store_dword v2, v3, s[16:19], 0 offen
+        0xBF81_0000, // s_endpgm
+    ];
+    let shader = build(
+        &words,
+        vec![param(RootType::Table, 0), param(RootType::Table, 2)],
+        vec![entry(ResourceType::Srv, 8, 0), entry(ResourceType::Uav, 4, 2)],
+        1,
+    );
+    assert_eq!(shader.samplers.len(), 1);
+    let views = [View::Levels(8, 4), View::RawUav(1)];
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else { continue };
+        let (root, pso) = host.compute_pipeline(&shader).unwrap_or_else(|e| panic!("{label}: {e}"));
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            ud[u.index as usize] = match (u.root, u.slot) {
+                (RootType::Table, 0) => 0,
+                (RootType::Table, 2) => 32,
+                other => panic!("unexpected user data {other:?}"),
+            };
+        }
+        let out = host.dispatch(&root, &pso, &Dispatch {
+            roots: vec![(0, Root::Constants(ud))],
+            views: &views,
+            samplers: &[],
+            groups: [1, 1, 1],
+        }).unwrap_or_else(|e| panic!("{label}: {e}"));
+        assert_eq!(f32::from_bits(out[0][0]), 2.0, "{label}");
+        ran += 1;
+    }
+    assert!(ran > 0);
+}
+
 /// User data: s0 a table with a typed buffer UAV, s1 a table with a raw
 /// buffer of 2 dwords a lane, s2 a table with a raw UAV. Each lane stores
 /// its 4 halves to element `lane` of the typed view (`_d16`), loads them

@@ -64,11 +64,14 @@ impl StaticSampler {
             (min & 1) << 4 | (mag & 1) << 2 | u32::from(mip == 2) | reduction << 7
         };
         let lod = |v: u32| v as f32 / 256.0;
-        // Without a mip filter the base level is sampled.
+        // Without a mip filter the base level is sampled. With one, RDNA2
+        // applies the minimum after the maximum, so the minimum wins an
+        // inverted range; D3D12's order would choose the maximum instead.
         let (min_lod, max_lod) = if mip == 0 {
             (0.0, 0.0)
         } else {
-            (lod(bits(w[1], 0, 12)), lod(bits(w[1], 12, 12)))
+            let min = lod(bits(w[1], 0, 12));
+            (min, lod(bits(w[1], 12, 12)).max(min))
         };
         StaticSampler {
             filter,
@@ -169,6 +172,14 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn an_inverted_lod_range_keeps_min_lod() {
+        // Point mips, MIN_LOD 2.0 and MAX_LOD 0.0 in unsigned 4.8 fixed
+        // point. RDNA2's minimum wins the inverted range; D3D12's would not.
+        let s = StaticSampler::from_words([0x92, 0x200, 1 << 26, 0]);
+        assert_eq!((s.min_lod, s.max_lod), (2.0, 2.0));
     }
 
     #[test]

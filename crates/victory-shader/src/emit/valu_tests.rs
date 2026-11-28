@@ -1908,6 +1908,61 @@ fn image_addresses_of_16_bits_and_clamps() {
     }
 }
 
+/// A heap sampler locked to one LOD reads that mip of an explicit-LOD sample.
+#[test]
+fn heap_sampler_lod_bounds_choose_the_mip() {
+    use windows::Win32::Graphics::Direct3D12::*;
+    // s[8:15]: texture at view heap index 0; s[20:23]: raw UAV at index 1;
+    // s[16:19]: sampler at sampler heap index 0.
+    let mut words = vec![s_mov_b32(5, 0x80), s_mov_b32(7, 0x80)];
+    for (op, dst, base, offset) in [(3u32, 8u32, 4u32, 0u32), (2, 20, 4, 0x20), (2, 16, 6, 0)] {
+        words.extend([0x3D << 26 | op << 18 | dst << 6 | base >> 1, 125 << 25 | offset]);
+    }
+    words.extend([
+        vop1(0x001, 0, 255), 0x3F00_0000, // v_mov_b32 v0, 0.5
+        vop1(0x001, 1, 255), 0x3F00_0000, // v_mov_b32 v1, 0.5
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xF09C_0108, 0x0082_0200, // image_sample_lz v2, v[0:1], s[8:15], s[16:19]
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+    ]);
+    words.extend(buffer_store_dword(2, 20, 0));
+    words.push(S_ENDPGM);
+    let used = [
+        (4, ResourceType::Srv, 0, 8),
+        (4, ResourceType::Uav, 8, 4),
+        (6, ResourceType::Sampler, 0, 4),
+    ];
+    let shader = lower_cs32(&words, &used, true);
+    let views = [View::Levels(8, 4), View::RawUav(1)];
+    let sampler = |lod| D3D12_SAMPLER_DESC {
+        Filter: D3D12_FILTER_MIN_MAG_MIP_POINT,
+        AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        MaxAnisotropy: 1,
+        MinLOD: lod,
+        MaxLOD: lod,
+        ..Default::default()
+    };
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else { continue };
+        let (root, pso) = host.compute_pipeline(&shader).unwrap_or_else(|e| panic!("{label}: {e}"));
+        for (lod, want) in [(2.0, 2.0), (0.0, 0.0)] {
+            let out = host.dispatch(&root, &pso, &Dispatch {
+                roots: vec![(0, Root::Constants(user_data_cs32(&shader, 0)))],
+                views: &views,
+                samplers: &[sampler(lod)],
+                groups: [1, 1, 1],
+            }).unwrap_or_else(|e| panic!("{label}: {e}"));
+            assert_eq!(f32::from_bits(out[0][0]), want, "{label}, LOD {lod}");
+        }
+        ran += 1;
+    }
+    assert!(ran > 0);
+}
+
 /// MIMG `image_atomic_<op> vdata, v[vaddr:vaddr+1], s[srsrc:srsrc+7]
 /// dmask dim:2D unorm` (glc returns the old value).
 const fn image_atomic(op: u32, vdata: u8, vaddr: u8, srsrc: u8, dmask: u32, glc: bool) -> [u32; 2] {
