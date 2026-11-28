@@ -763,27 +763,32 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
         64 => (1, Box::new(move |b| [f32::from(b[0] as i8); 3])),
         _ => return None,
     };
-    let values: Vec<[f32; 3]> = (0..h)
-        .flat_map(|y| (0..w).map(move |x| (x, y)))
-        .map(|(x, y)| decode(px(x, y, n)))
-        .collect();
     let grey = matches!(format, 19..=22 | 39..=41 | 44..=47 | 53..=65);
-    let finite = values.iter().flatten().copied().filter(|v| v.is_finite());
-    let (low, max) = if grey {
-        finite.fold((f32::MAX, f32::MIN), |(l, h), v| (l.min(v), h.max(v)))
-    } else {
-        (0.0, finite.fold(0.0f32, f32::max))
-    };
-    // Colour scaled by the 99th percentile of the non-zero values, so a few
-    // hot pixels do not hide the rest; how many are not zero, and the median.
-    let mut set: Vec<f32> = values
-        .iter()
-        .flatten()
-        .copied()
-        .filter(|v| v.is_finite() && *v != 0.0)
-        .map(f32::abs)
-        .collect();
+    let (mut low, mut max) = if grey { (f32::MAX, f32::MIN) } else { (0.0, 0.0) };
+    let mut values = Vec::with_capacity(w * h);
+    let mut set = Vec::new();
+    let mut not_finite = 0;
+    for y in 0..h {
+        for x in 0..w {
+            let channels = decode(px(x, y, n));
+            for value in channels {
+                if !value.is_finite() {
+                    not_finite += 1;
+                    continue;
+                }
+                if grey {
+                    low = low.min(value);
+                }
+                max = max.max(value);
+                if value != 0.0 {
+                    set.push(value.abs());
+                }
+            }
+            values.push(channels);
+        }
+    }
     let nonzero = set.len() as f64 / (values.len() * 3).max(1) as f64;
+    // Scale colour by the 99th percentile so a few hot pixels do not hide the rest.
     let mut at = |q: f64| -> f32 {
         if set.is_empty() {
             return 0.0;
@@ -792,7 +797,6 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
         *set.select_nth_unstable_by(k, f32::total_cmp).1
     };
     let (p50, p99) = (at(0.5), at(0.99));
-    let not_finite = values.iter().flatten().filter(|v| !v.is_finite()).count();
     let high = if grey || p99 == 0.0 { max } else { p99 };
     let range = (high - low).max(1e-20);
     tracing::info!(format, low, high = max, p50, p99, nonzero, not_finite, "target values");
