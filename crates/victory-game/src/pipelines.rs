@@ -82,13 +82,27 @@ impl Named {
             ..Named::default()
         };
         for e in databases.iter().flat_map(|db| &db.effects) {
-            e.depth_stencils
-                .iter()
-                .for_each(|b| named.try_depth(&mut want, b));
-            e.rasterizers
-                .iter()
-                .for_each(|b| named.try_raster(&mut want, b));
-            e.blends.iter().for_each(|b| named.try_blend(&mut want, b));
+            if want.depth.is_empty() && want.raster.is_empty() && want.blend.is_empty() {
+                break;
+            }
+            for b in &e.depth_stencils {
+                if want.depth.is_empty() {
+                    break;
+                }
+                named.try_depth(&mut want, b);
+            }
+            for b in &e.rasterizers {
+                if want.raster.is_empty() {
+                    break;
+                }
+                named.try_raster(&mut want, b);
+            }
+            for b in &e.blends {
+                if want.blend.is_empty() {
+                    break;
+                }
+                named.try_blend(&mut want, b);
+            }
         }
         named.finding = "registers";
         if !want.depth.is_empty() || !want.blend.is_empty() {
