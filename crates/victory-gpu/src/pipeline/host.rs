@@ -587,8 +587,9 @@ impl HostPipeline {
             });
         let (root, root_blob) = match root_signature(&host.device, &params, &samplers, compute.is_some()) {
             Ok(root) => root,
-            Err(e) => {
-                tracing::warn!(error = %e, ?shaders, "host root signature refused");
+            Err((phase, e)) => {
+                tracing::warn!(error = %e, phase, ?shaders, "host root signature refused");
+                host.log_messages();
                 return None;
             }
         };
@@ -883,7 +884,7 @@ fn root_signature(
     params: &[D3D12_ROOT_PARAMETER1],
     samplers: &[D3D12_STATIC_SAMPLER_DESC],
     compute: bool,
-) -> windows::core::Result<(ID3D12RootSignature, Vec<u8>)> {
+) -> Result<(ID3D12RootSignature, Vec<u8>), (&'static str, windows::core::Error)> {
     let input = if compute {
         D3D12_ROOT_SIGNATURE_FLAG_NONE
     } else {
@@ -916,12 +917,13 @@ fn root_signature(
                 );
                 tracing::warn!("root signature: {}", String::from_utf8_lossy(text));
             }
-            return Err(e);
+            return Err(("serialization", e));
         }
-        let blob = blob.ok_or_else(windows::core::Error::empty)?;
+        let blob = blob.ok_or_else(|| ("serialization", windows::core::Error::empty()))?;
         let bytes =
             std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
-        Ok((device.CreateRootSignature(0, bytes)?, bytes.to_vec()))
+        let root = device.CreateRootSignature(0, bytes).map_err(|e| ("device creation", e))?;
+        Ok((root, bytes.to_vec()))
     }
 }
 
