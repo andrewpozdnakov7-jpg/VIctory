@@ -15,7 +15,7 @@
 //! All library calls are serialised: the interface does not promise that
 //! stores, loads and serialising may overlap.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc};
@@ -280,14 +280,7 @@ fn perform_save(dir: &Path, buf: &mut Vec<u8>) {
     let Some(library) = library() else { return };
     let serialized = serialize_library(library, buf);
     let used_snapshot = if USED_CHANGED.swap(false, Ordering::AcqRel) {
-        let keys: Vec<String> = USED
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .flatten()
-            .cloned()
-            .collect();
-        Some(keys)
+        used().as_ref().map(Used::list)
     } else {
         None
     };
@@ -397,49 +390,81 @@ fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Title pipeline keys drawn or dispatched with (this run and the last).
-static USED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+/// Title pipeline keys drawn or dispatched with: in earlier runs (the
+/// list as loaded), and in this one.
+#[derive(Default)]
+struct Used {
+    /// Each earlier key with its place in the list as loaded: the list is
+    /// kept most recent run first, so a lower place is a more recent run.
+    before: HashMap<String, usize>,
+    /// This run's retained keys and their order of first use.
+    now: HashMap<String, usize>,
+}
+
+impl Used {
+    /// The list as saved: one key a line, most recent run first (a list
+    /// in no order, as earlier builds saved it, reads as well).
+    fn read(listed: &str) -> Used {
+        let mut before = HashMap::new();
+        for (place, key) in listed.lines().filter(|l| !l.is_empty()).take(EARLY_MAX).enumerate() {
+            before.entry(key.to_owned()).or_insert(place);
+        }
+        Used { before, now: HashMap::new() }
+    }
+
+    /// Keeps the earliest uses in this run so the next run can warm them.
+    fn note(&mut self, key: &str) -> bool {
+        let place = self.now.len();
+        if place == EARLY_MAX || self.now.contains_key(key) {
+            return false;
+        }
+        self.now.insert(key.to_owned(), place);
+        true
+    }
+
+    /// The list to keep: first uses in this run, then earlier runs' other
+    /// keys, most recent run first, at most `EARLY_MAX`.
+    fn list(&self) -> Vec<String> {
+        let mut retained = vec![String::new(); self.now.len()];
+        for (key, &place) in &self.now {
+            retained[place] = key.clone();
+        }
+        if retained.len() == EARLY_MAX {
+            return retained;
+        }
+
+        let mut earlier: Vec<_> = self.before.iter().filter(|(k, _)| !self.now.contains_key(*k)).collect();
+        earlier.sort_unstable_by_key(|&(_, &place)| place);
+        retained.extend(earlier.into_iter().take(EARLY_MAX - retained.len()).map(|(k, _)| k.clone()));
+        retained
+    }
+}
+
+static USED: Mutex<Option<Used>> = Mutex::new(None);
 static USED_CHANGED: AtomicBool = AtomicBool::new(false);
 
-fn used() -> std::sync::MutexGuard<'static, Option<HashSet<String>>> {
+fn used() -> std::sync::MutexGuard<'static, Option<Used>> {
     let mut used = USED.lock().unwrap_or_else(|e| e.into_inner());
     if used.is_none() {
         let listed = DIR
             .get()
             .and_then(|d| std::fs::read_to_string(d.join(EARLY_FILE)).ok())
             .unwrap_or_default();
-        let set: HashSet<String> = listed
-            .lines()
-            .filter(|l| !l.is_empty())
-            .take(EARLY_MAX)
-            .map(str::to_owned)
-            .collect();
-        tracing::info!(pipelines = set.len(), "title pipelines to start early");
-        *used = Some(set);
+        let read = Used::read(&listed);
+        tracing::info!(pipelines = read.before.len(), "title pipelines to start early");
+        *used = Some(read);
     }
     used
 }
 
-/// Whether the title pipeline with `key` was drawn with in an earlier run.
+/// Whether the title pipeline with `key` has been used in this or an earlier run.
 pub(crate) fn wanted_early(key: &str) -> bool {
-    used().as_ref().is_some_and(|s| s.contains(key))
-}
-
-/// Inserts `key` into `set` if below [`EARLY_MAX`], returning `true` if newly
-/// added.
-fn record_used(set: &mut HashSet<String>, key: &str) -> bool {
-    if set.len() < EARLY_MAX && !set.contains(key) {
-        set.insert(key.to_owned())
-    } else {
-        false
-    }
+    used().as_ref().is_some_and(|u| u.before.contains_key(key) || u.now.contains_key(key))
 }
 
 /// The title pipeline with `key` was drawn or dispatched with.
 pub(crate) fn note_used(key: &str) {
-    let mut used = used();
-    let set = used.get_or_insert_with(HashSet::new);
-    if record_used(set, key) {
+    if used().get_or_insert_with(Used::default).note(key) {
         USED_CHANGED.store(true, Ordering::Relaxed);
     }
 }
@@ -476,25 +501,35 @@ mod tests {
     #[test]
     fn early_list_records_and_deduplicates_above_old_8192_cap() {
         const { assert!(EARLY_MAX >= 65_536) };
-        let mut set = HashSet::new();
-        // Insert 10,000 distinct keys (exceeding the legacy 8,192 cap).
-        for i in 0..10_000usize {
+        let mut used = Used::default();
+        for i in (0..EARLY_MAX).rev() {
             let key = format!("{i:032x}");
-            assert!(record_used(&mut set, &key));
-            assert!(!record_used(&mut set, &key), "duplicates are deduplicated");
+            assert!(used.note(&key));
+            assert!(!used.note(&key), "duplicates are deduplicated");
         }
-        assert_eq!(set.len(), 10_000);
+        assert!(!used.note("late"));
+        let saved = used.list();
+        assert_eq!(saved.len(), EARLY_MAX);
+        let expected: Vec<_> = (0..EARLY_MAX).rev().map(|i| format!("{i:032x}")).collect();
+        assert_eq!(saved, expected);
+    }
 
-        // Fill up to EARLY_MAX and confirm the cap is enforced cleanly.
-        for i in 10_000..EARLY_MAX {
-            assert!(record_used(&mut set, &format!("{i:032x}")));
-        }
-        assert_eq!(set.len(), EARLY_MAX);
-        assert!(
-            !record_used(&mut set, "ffffffffffffffffffffffffffffffff"),
-            "keys beyond EARLY_MAX are ignored"
-        );
-        assert_eq!(set.len(), EARLY_MAX);
+    #[test]
+    fn fresh_pipeline_uses_can_displace_keys_from_a_full_previous_run() {
+        let key = |i: usize| format!("{i:032x}");
+        let older: Vec<_> = (0..EARLY_MAX).map(key).collect();
+        let mut used = Used::read(&older.join("\n"));
+        let fresh = key(EARLY_MAX);
+        assert!(used.note(&fresh));
+        assert!(used.note(&older[2]));
+
+        let saved = used.list();
+        assert_eq!(saved.len(), EARLY_MAX);
+        assert_eq!(&saved[..4], &[fresh.clone(), older[2].clone(), older[0].clone(), older[1].clone()]);
+        assert!(!saved.contains(&older[EARLY_MAX - 1]));
+        let restored = Used::read(&saved.join("\n"));
+        assert_eq!(restored.before[&fresh], 0);
+        assert_eq!(restored.before[&older[2]], 1);
     }
 
     #[test]
